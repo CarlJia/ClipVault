@@ -424,7 +424,8 @@ impl Storage {
                 params![id],
                 |row| row.get::<_, Option<Vec<u8>>>(0),
             )
-            .or(Ok(None))
+            .optional()
+            .map(Option::flatten)
         })
         .await
     }

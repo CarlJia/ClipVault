@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 pub struct Entry {
     /// Primary key.
     pub id: i64,
-    /// SHA-256 fingerprint of the raw content (first 12 bytes as hex).
+    /// SHA-256 fingerprint of the raw content (first 8 bytes as hex, 16 chars).
     /// For vault entries this is `hash(random_salt || cid)` — U9 territory.
     pub content_hash: String,
     /// Raw text content.
