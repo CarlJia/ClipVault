@@ -205,11 +205,23 @@ pub fn paste_entry(id: i64) -> Result<String, String> {
     Ok("unimplemented:U8".to_string())
 }
 
-/// U7 完成：切换置顶并按 `pinned_at DESC` 重排。U4 仅占位。
+/// U7 完成：切换 `id` 条目的置顶状态，返回刷新后的 [`EntryDto`]。
+///
+/// - 置顶写 `is_pinned = 1` + `pinned_at = now`；取消写 `is_pinned = 0` +
+///   `pinned_at = NULL`（见 [`crate::pin`] 的 `pinned_at` 语义说明）。
+/// - 排序（Pin 优先，R17）由 U5 的查询负责；前端拿到 DTO 后重新拉取当前
+///   tab，使服务端的置顶优先顺序成为权威（AE8）。
 #[tauri::command]
-pub fn toggle_pin(id: i64) -> Result<String, String> {
-    let _ = id;
-    Ok("unimplemented:U7".to_string())
+pub async fn toggle_pin(id: i64, state: State<'_, AppState>) -> Result<EntryDto, String> {
+    let entry = crate::pin::toggle_pin(&state.storage, id)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    to_dtos(&state, vec![entry])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "无法构建 EntryDto".to_string())
 }
 
 /// U6 完成：写入备注 + 标签，返回刷新后的 [`EntryDto`] 供前端重绘该行。

@@ -209,9 +209,20 @@ body {
   font-size: 11px;
 }
 
+/* Pin 徽标（U7）：pin.fill 风格内联 SVG，13×13。
+   颜色经 CSS 自定义属性 --pin-color 承接：非选中行 muted、选中行 accent。 */
 .pin {
-  color: var(--accent);
+  --pin-color: var(--muted);
+  color: var(--pin-color);
+  display: inline-block;
+  width: 13px;
+  height: 13px;
   margin-right: 6px;
+  vertical-align: -2px;
+  flex-shrink: 0;
+}
+.row.selected .pin {
+  --pin-color: var(--accent);
 }
 .note-dot {
   color: var(--muted);

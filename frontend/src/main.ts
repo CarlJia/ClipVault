@@ -185,8 +185,22 @@ function editNote(): void {
 async function togglePin(): Promise<void> {
   const e = currentEntry();
   if (!e) return;
-  await invoke<string>("toggle_pin", { id: e.id }).catch(() => "");
-  toast("置顶将在 U7 接入");
+  const toggledId = e.id;
+  try {
+    // 切换置顶。后端返回刷新后的 DTO，但真正的「Pin 优先」顺序以服务端为准，
+    // 故直接重新拉取当前 tab，让服务端排序权威地反映新顺序（R17 / AE8）。
+    await invoke<EntryDto>("toggle_pin", { id: toggledId });
+    await load();
+    // 若被切换的条目仍在可见列表内，保持选中它。
+    const idx = entries.findIndex((x) => x.id === toggledId);
+    if (idx >= 0) {
+      selected = idx;
+      paintEntries();
+      scrollToSelected();
+    }
+  } catch (err) {
+    toast(`置顶失败：${String(err)}`);
+  }
 }
 
 function moveSelection(delta: number): void {

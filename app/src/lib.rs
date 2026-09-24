@@ -9,6 +9,7 @@
 pub mod classify;
 pub mod commands;
 pub mod hotkey;
+pub mod pin;
 pub mod search;
 pub mod storage;
 pub mod tray;
@@ -16,6 +17,8 @@ pub mod watcher;
 
 #[cfg(test)]
 mod notes_test;
+#[cfg(test)]
+mod pin_test;
 #[cfg(test)]
 mod search_test;
 #[cfg(test)]

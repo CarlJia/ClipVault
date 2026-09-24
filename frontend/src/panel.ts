@@ -57,6 +57,22 @@ export function formatTime(unixSecs: number): string {
   return `${mm}-${dd}`;
 }
 
+/**
+ * Pin 徽标：SF Symbol `pin.fill` 在 WebView 中无法直接渲染，故用一个
+ * 内联 SVG 近似（倾斜图钉，对应 SF `pin.fill` 的斜置形态），13×13px，
+ * 通过 `fill="currentColor"` 承接 CSS 颜色——选中行取 `--accent`、
+ * 非选中行取 `--muted`（见 styles.css `.pin` / `.row.selected .pin`）。
+ */
+const PIN_SVG =
+  '<svg class="pin" viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">' +
+  "<title>已置顶</title>" +
+  '<path fill="currentColor" d="M9.828.722a.5.5 0 0 1 .354.146l4.95 4.95a.5.5 0 0 1 0 ' +
+  ".707c-.48.48-1.072.588-1.503.588-.177 0-.335-.018-.46-.039l-3.134 3.134a5.927 5.927 0 " +
+  "0 1 .16 1.013c.046.702-.032 1.687-.72 2.375a.5.5 0 0 1-.707 0l-2.829-2.828-3.182 " +
+  "3.182c-.195.195-1.219.902-1.414.707-.195-.195.512-1.22.707-1.414l3.182-3.182-2.828-2.829a" +
+  ".5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72.343.023.692.077 1.013.16l3.134-3.133a2.772 " +
+  '2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 0 1 .353-.146z"/></svg>';
+
 /** 渲染平铺记录列表。`selected` 为高亮行索引。 */
 export function renderEntries(
   container: HTMLElement,
@@ -69,7 +85,7 @@ export function renderEntries(
   }
   container.innerHTML = entries
     .map((e, i) => {
-      const pin = e.is_pinned ? `<span class="pin" title="已置顶">􀎧</span>` : "";
+      const pin = e.is_pinned ? PIN_SVG : "";
       const cat = `<span class="chip chip-cat">${escapeHtml(e.auto_category)}</span>`;
       const tags = e.tags
         .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
