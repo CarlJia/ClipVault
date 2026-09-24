@@ -1,0 +1,49 @@
+/* ClipVault — Raycast-inspired dark panel styles (U1 scaffold) */
+
+:root {
+  --bg: rgba(28, 28, 32, 0.92);
+  --surface: rgba(44, 44, 46, 0.85);
+  --border: rgba(255, 255, 255, 0.1);
+  --text: #ffffff;
+  --muted: #8e8e93;
+  --accent: #0a84ff;
+  --font: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", monospace;
+  --radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body {
+  height: 100%;
+  background: transparent;
+  font-family: var(--font);
+  font-size: 13pt;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+#app {
+  height: 100%;
+}
+
+.panel {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  background: var(--bg);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+}
+
+.placeholder {
+  color: var(--muted);
+  font-size: 14pt;
+  letter-spacing: 0.02em;
+}

@@ -1,0 +1,14 @@
+[workspace]
+members = ["clipvault-core", "app"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["ClipVault Team"]
+
+# Pinned dependency comments for future units (U2/U3/U8/U9)
+# objc2 = "*"        # U3/U4: NSPasteboard / Carbon hotkey
+# rusqlite = { version = "*", features = ["bundled"] }  # U2: SQLite + FTS5
+# aes-gcm = "*"      # U9: AES-256-GCM encryption
+# security-framework = "*"  # U9: Keychain key management

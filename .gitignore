@@ -1,0 +1,8 @@
+target/
+.DS_Store
+node_modules/
+dist/
+*.pdb
+*.lock
+.env
+.env.local
