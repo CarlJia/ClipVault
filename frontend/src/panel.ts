@@ -41,9 +41,9 @@ export function escapeHtml(s: string): string {
 }
 
 /** 把多行内容压成单行预览。 */
-function previewOf(content: string): string {
+function previewOf(content: string, maxLen = 120): string {
   const oneLine = content.replace(/\s+/g, " ").trim();
-  return oneLine.length > 120 ? `${oneLine.slice(0, 120)}…` : oneLine;
+  return oneLine.length > maxLen ? `${oneLine.slice(0, maxLen)}…` : oneLine;
 }
 
 /** 相对时间格式化。 */
@@ -92,9 +92,6 @@ export function renderEntries(
       const tags = e.tags
         .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
         .join("");
-      const note = e.note
-        ? `<span class="note-dot" title="有备注">􀈬</span>`
-        : "";
       // 加密区徽标（U9）：普通面板通常不含 vault 条目（已被后端排除），
       // 但若出现则显式标注，且不可解密时给出「无法解密」警示。
       const vault = e.is_vault
@@ -104,11 +101,21 @@ export function renderEntries(
         e.is_vault && !e.is_decryptable
           ? `<span class="chip chip-undec" title="密钥缺失，无法解密">⚠ 无法解密</span>`
           : "";
+      // 有备注时：备注作主标题（📝 前缀），实际内容降为副标题缩略显示；
+      // 无备注时：内容仍作主标题，无副标题。
+      const hasNote = Boolean(e.note);
+      const primary = hasNote
+        ? `<div class="row-content row-note-title" title="${escapeHtml(e.note)}">${pin}📝 ${escapeHtml(previewOf(e.note, 80))}</div>`
+        : `<div class="row-content">${pin}${escapeHtml(previewOf(e.content))}</div>`;
+      const subtitle = hasNote
+        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.content, 80))}</div>`
+        : "";
       return `
       <div class="row${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}">
         <div class="row-main">
-          <div class="row-content">${pin}${escapeHtml(previewOf(e.content))}</div>
-          <div class="row-meta">${cat}${tags}${vault}${undec}${note}</div>
+          ${primary}
+          ${subtitle}
+          <div class="row-meta">${cat}${tags}${vault}${undec}</div>
         </div>
         <div class="row-time">${formatTime(e.created_at)}</div>
       </div>`;
