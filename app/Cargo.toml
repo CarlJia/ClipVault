@@ -11,8 +11,15 @@ tauri = { version = "2", features = [] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clipvault-core = { path = "../clipvault-core" }
-tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+
+# macOS 原生绑定：NSPasteboard 轮询（KTD2）。仅在 macOS 目标上编译。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
 
 [features]
 default = ["custom-protocol"]
