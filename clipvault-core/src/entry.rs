@@ -58,4 +58,26 @@ impl Entry {
             created_at,
         }
     }
+
+    /// 从一行 SQLite 查询结果构造 `Entry`。
+    ///
+    /// 列顺序须与 `SELECT` 保持一致：
+    /// `id, content_hash, content, note, auto_category, is_pinned,
+    ///  pinned_at, is_vault, is_decryptable, created_at`。
+    /// bool 列（`is_pinned` / `is_vault` / `is_decryptable`）沿用
+    /// [`Entry::from_row`] 的「非 0 即真」coercion。
+    pub fn from_sqlite_row(row: &rusqlite::Row) -> rusqlite::Result<Entry> {
+        Ok(Entry::from_row(
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+            row.get(7)?,
+            row.get(8)?,
+            row.get(9)?,
+        ))
+    }
 }

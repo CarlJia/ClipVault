@@ -16,6 +16,16 @@ use tokio::sync::Mutex;
 /// 触发前端保存状态机的 `error` 分支。按 Unicode 标量（`char`）计数。
 pub const MAX_NOTE_CHARS: usize = 2000;
 
+/// entries 表的标准列清单（顺序须与 [`Entry::from_sqlite_row`] 对齐）。
+/// 通过 `format!` 内联进各 `SELECT`，与 `search.rs` 的 `SELECT_COLS` 同理。
+const ENTRY_COLS: &str = "id, content_hash, content, note, auto_category, \
+     is_pinned, pinned_at, is_vault, is_decryptable, created_at";
+
+/// `is_vault` 三态标记的原始整数值：明文 / 已加密 / 加密中（pending）。
+const VAULT_PLAINTEXT: i32 = 0;
+const VAULT_ENCRYPTED: i32 = 1;
+const VAULT_PENDING: i32 = 2;
+
 /// Default database file location.
 pub fn default_db_path() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set on macOS");
@@ -91,25 +101,11 @@ impl Storage {
     /// Fetch a single entry by id.
     pub async fn get_by_id(&self, id: i64) -> SqliteResult<Option<Entry>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash, content, note, auto_category,
-                        is_pinned, pinned_at, is_vault, is_decryptable, created_at
-                 FROM entries WHERE id = ?1",
-            )?;
+            let mut stmt =
+                conn.prepare(&format!("SELECT {ENTRY_COLS} FROM entries WHERE id = ?1"))?;
             let mut rows = stmt.query(params![id])?;
             if let Some(row) = rows.next()? {
-                Ok(Some(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                )))
+                Ok(Some(Entry::from_sqlite_row(row)?))
             } else {
                 Ok(None)
             }
@@ -120,30 +116,11 @@ impl Storage {
     /// Return the most recent `limit` entries, ordered by `created_at DESC`.
     pub async fn list_recent(&self, limit: u32) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash, content, note, auto_category,
-                        is_pinned, pinned_at, is_vault, is_decryptable, created_at
-                 FROM entries
-                 ORDER BY is_pinned DESC,
-                          CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
-                          pinned_at DESC,
-                          created_at DESC
-                 LIMIT ?1",
-            )?;
-            let rows = stmt.query_map(params![limit], |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ENTRY_COLS} FROM entries e ORDER BY {order} LIMIT ?1",
+                order = crate::search::PIN_ORDER,
+            ))?;
+            let rows = stmt.query_map(params![limit], Entry::from_sqlite_row)?;
             rows.collect()
         })
         .await
@@ -214,116 +191,6 @@ impl Storage {
         .await
     }
 
-    /// Full-text search using FTS5.
-    ///
-    /// Short queries (< 3 chars) fall back to a LIKE scan on `content`.
-    ///
-    /// **Note:** This is the U2 placeholder.  U5 will complete the
-    /// multi-tab and fuzzy-search logic.
-    pub async fn search(&self, query: &str, _tab: &str, limit: u32) -> SqliteResult<Vec<Entry>> {
-        self.with_conn(|conn| {
-            if query.is_empty() {
-                return Self::list_recent_sync(conn, limit);
-            }
-
-            if query.len() < 3 {
-                return Self::search_like(conn, query, limit);
-            }
-
-            // Sanitise query by stripping control characters.
-            let safe_query: String = query.chars().filter(|c| !c.is_control()).collect();
-            let fts_query = format!("\"{safe_query}\"*");
-
-            let mut stmt = conn.prepare(
-                "SELECT e.id, e.content_hash, e.content, e.note, e.auto_category,
-                        e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at
-                 FROM entries e
-                 WHERE e.is_vault = 0
-                   AND e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?1)
-                 ORDER BY is_pinned DESC,
-                          CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
-                          pinned_at DESC,
-                          created_at DESC
-                 LIMIT ?2",
-            )?;
-
-            let rows = stmt.query_map(params![fts_query, limit], |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
-            rows.collect()
-        })
-        .await
-    }
-
-    fn list_recent_sync(conn: &mut Connection, limit: u32) -> SqliteResult<Vec<Entry>> {
-        let mut stmt = conn.prepare(
-            "SELECT id, content_hash, content, note, auto_category,
-                    is_pinned, pinned_at, is_vault, is_decryptable, created_at
-             FROM entries
-             ORDER BY is_pinned DESC,
-                      CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
-                      pinned_at DESC,
-                      created_at DESC
-             LIMIT ?1",
-        )?;
-        let rows = stmt.query_map(params![limit], |row| {
-            Ok(Entry::from_row(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })?;
-        rows.collect()
-    }
-
-    fn search_like(conn: &mut Connection, query: &str, limit: u32) -> SqliteResult<Vec<Entry>> {
-        let pattern = format!("%{query}%");
-        let mut stmt = conn.prepare(
-            "SELECT id, content_hash, content, note, auto_category,
-                    is_pinned, pinned_at, is_vault, is_decryptable, created_at
-             FROM entries
-             WHERE is_vault = 0 AND (content LIKE ?1 OR note LIKE ?1)
-             ORDER BY is_pinned DESC,
-                      CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
-                      pinned_at DESC,
-                      created_at DESC
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![pattern, limit], |row| {
-            Ok(Entry::from_row(
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
-                row.get(9)?,
-            ))
-        })?;
-        rows.collect()
-    }
-
     /// Return all distinct tag strings in the database.
     pub async fn get_all_tags(&self) -> SqliteResult<Vec<String>> {
         self.with_conn(|conn| {
@@ -337,30 +204,13 @@ impl Storage {
     /// Return entries filtered by `auto_category`.
     pub async fn get_by_category(&self, category: &str) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash, content, note, auto_category,
-                        is_pinned, pinned_at, is_vault, is_decryptable, created_at
-                 FROM entries
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ENTRY_COLS} FROM entries e
                  WHERE is_vault = 0 AND auto_category = ?1
-                 ORDER BY is_pinned DESC,
-                          CASE WHEN pinned_at IS NULL THEN 1 ELSE 0 END ASC,
-                          pinned_at DESC,
-                          created_at DESC",
-            )?;
-            let rows = stmt.query_map(params![category], |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
+                 ORDER BY {order}",
+                order = crate::search::PIN_ORDER,
+            ))?;
+            let rows = stmt.query_map(params![category], Entry::from_sqlite_row)?;
             rows.collect()
         })
         .await
@@ -377,20 +227,10 @@ impl Storage {
     ) -> SqliteResult<Vec<Entry>> {
         self.with_conn(move |conn| {
             let mut stmt = conn.prepare(&plan.sql)?;
-            let rows = stmt.query_map(rusqlite::params_from_iter(plan.params.iter()), |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
+            let rows = stmt.query_map(
+                rusqlite::params_from_iter(plan.params.iter()),
+                Entry::from_sqlite_row,
+            )?;
             rows.collect()
         })
         .await
@@ -520,14 +360,14 @@ impl Storage {
                 Some(e) if !e.is_vault => e,
                 _ => continue, // 不存在或已在 vault：跳过。
             };
-            self.set_vault_flag(id, 2)
+            self.set_vault_flag(id, VAULT_PENDING)
                 .await
                 .map_err(VaultError::Sqlite)?;
             match self.encrypt_into_vault(id, &entry.content, encryptor).await {
                 Ok(()) => report.succeeded.push(id),
                 Err(e) => {
                     // 回退到明文态（is_vault=0），触发器会把内容重新放回 FTS。
-                    self.set_vault_flag(id, 0)
+                    self.set_vault_flag(id, VAULT_PLAINTEXT)
                         .await
                         .map_err(VaultError::Sqlite)?;
                     report.failed.push(id);
@@ -553,10 +393,10 @@ impl Storage {
         self.with_conn(move |conn| {
             conn.execute(
                 "UPDATE entries
-                 SET content = ?1, nonce = ?2, is_vault = 1,
-                     is_decryptable = 1, content_hash = ?3
-                 WHERE id = ?4",
-                params![enc.content_b64, nonce, new_hash, id],
+                 SET content = ?1, nonce = ?2, is_vault = ?3,
+                     is_decryptable = 1, content_hash = ?4
+                 WHERE id = ?5",
+                params![enc.content_b64, nonce, VAULT_ENCRYPTED, new_hash, id],
             )?;
             Ok(())
         })
@@ -593,27 +433,12 @@ impl Storage {
     /// 密文不解密：返回的 `content` 是 base64 密文，UI 只按元数据展示。
     pub async fn list_vault_entries(&self) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT id, content_hash, content, note, auto_category,
-                        is_pinned, pinned_at, is_vault, is_decryptable, created_at
-                 FROM entries
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {ENTRY_COLS} FROM entries
                  WHERE is_vault = 1
-                 ORDER BY is_decryptable ASC, created_at DESC",
-            )?;
-            let rows = stmt.query_map([], |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
+                 ORDER BY is_decryptable ASC, created_at DESC"
+            ))?;
+            let rows = stmt.query_map([], Entry::from_sqlite_row)?;
             rows.collect()
         })
         .await
@@ -626,15 +451,17 @@ impl Storage {
         &self,
         decryptor: &dyn crate::crypto::Decryptor,
     ) -> SqliteResult<VerifyReport> {
-        let rows: Vec<(i64, String, Option<Vec<u8>>)> = self
+        let rows: Vec<(i64, String, Option<Vec<u8>>, bool)> = self
             .with_conn(|conn| {
-                let mut stmt =
-                    conn.prepare("SELECT id, content, nonce FROM entries WHERE is_vault = 1")?;
+                let mut stmt = conn.prepare(
+                    "SELECT id, content, nonce, is_decryptable FROM entries WHERE is_vault = 1",
+                )?;
                 let rows = stmt.query_map([], |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(3)? != 0,
                     ))
                 })?;
                 rows.collect()
@@ -642,7 +469,10 @@ impl Storage {
             .await?;
 
         let mut report = VerifyReport::default();
-        for (id, content, nonce) in rows {
+        // 仅收集 `is_decryptable` 实际发生变化的行；稳态（全部可解密且未变）下
+        // 不产生任何写入，且所有更新合并进单个事务。
+        let mut pending: Vec<(i64, bool)> = Vec::new();
+        for (id, content, nonce, stored) in rows {
             report.checked += 1;
             let ok = match nonce {
                 Some(n) => decryptor.decrypt(&content, &n).is_ok(),
@@ -651,11 +481,22 @@ impl Storage {
             if !ok {
                 report.undecryptable += 1;
             }
+            if ok != stored {
+                pending.push((id, ok));
+            }
+        }
+
+        if !pending.is_empty() {
             self.with_conn(move |conn| {
-                conn.execute(
-                    "UPDATE entries SET is_decryptable = ?1 WHERE id = ?2",
-                    params![ok as i32, id],
-                )?;
+                let tx = conn.transaction()?;
+                {
+                    let mut stmt =
+                        tx.prepare("UPDATE entries SET is_decryptable = ?1 WHERE id = ?2")?;
+                    for (id, ok) in &pending {
+                        stmt.execute(params![*ok as i32, id])?;
+                    }
+                }
+                tx.commit()?;
                 Ok(())
             })
             .await?;
@@ -845,7 +686,14 @@ mod tests {
             .await
             .unwrap();
 
-        let results = db.search("webhook", "all", 10).await.unwrap();
+        let results = db
+            .search_entries(crate::search::build_search_query(
+                "webhook",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
         assert!(
             !results.is_empty(),
             "expected FTS5 to find 'webhook' in content"
@@ -861,7 +709,14 @@ mod tests {
             .unwrap();
 
         // "us" is < 3 chars, should use LIKE fallback.
-        let results = db.search("us", "all", 10).await.unwrap();
+        let results = db
+            .search_entries(crate::search::build_search_query(
+                "us",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
         assert!(
             !results.is_empty(),
             "expected LIKE fallback to find 'us' in content"
@@ -916,7 +771,14 @@ mod tests {
         db.insert_entry("u1", "hello world trigram test", "plain")
             .await
             .unwrap();
-        let results = db.search("trigram", "all", 10).await.unwrap();
+        let results = db
+            .search_entries(crate::search::build_search_query(
+                "trigram",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
         assert!(
             !results.is_empty(),
             "FTS5 with unicode61 should find 'trigram' in content"

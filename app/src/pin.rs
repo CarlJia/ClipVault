@@ -23,7 +23,7 @@ use rusqlite::{Result as SqliteResult, params};
 
 use crate::storage::Storage;
 
-/// 读回整行 entry 的列清单（顺序须与 [`Entry::from_row`] 对齐）。
+/// 读回整行 entry 的列清单（顺序须与 [`Entry::from_sqlite_row`] 对齐）。
 const SELECT_ONE: &str = "SELECT id, content_hash, content, note, auto_category, \
      is_pinned, pinned_at, is_vault, is_decryptable, created_at \
      FROM entries WHERE id = ?1";
@@ -61,20 +61,7 @@ pub async fn toggle_pin(storage: &Storage, id: i64) -> SqliteResult<Entry> {
                 params![new_pinned as i32, pinned_at, id],
             )?;
 
-            let entry = tx.query_row(SELECT_ONE, params![id], |row| {
-                Ok(Entry::from_row(
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                ))
-            })?;
+            let entry = tx.query_row(SELECT_ONE, params![id], Entry::from_sqlite_row)?;
 
             tx.commit()?;
             Ok(entry)

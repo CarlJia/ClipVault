@@ -178,7 +178,7 @@ function paintEntries(): void {
   }
 }
 
-async function load(): Promise<void> {
+async function load(preferId?: number): Promise<void> {
   showProgress(true);
   try {
     if (currentTab === "tag" && selectedTag === null) {
@@ -199,6 +199,12 @@ async function load(): Promise<void> {
       });
       if (selected >= entries.length) selected = entries.length - 1;
       if (selected < 0 && entries.length > 0) selected = 0;
+      // 若指定了 preferId（如刚被切换置顶的条目）且仍可见，则优先选中它，
+      // 在唯一一次重绘前就定好选中项，避免二次 paint。
+      if (preferId !== undefined) {
+        const idx = entries.findIndex((x) => x.id === preferId);
+        if (idx >= 0) selected = idx;
+      }
       paintEntries();
       scrollToSelected();
     }
@@ -263,15 +269,9 @@ async function togglePin(): Promise<void> {
   try {
     // 切换置顶。后端返回刷新后的 DTO，但真正的「Pin 优先」顺序以服务端为准，
     // 故直接重新拉取当前 tab，让服务端排序权威地反映新顺序（R17 / AE8）。
+    // 把被切换的条目 id 交给 load()，在唯一一次重绘前定好选中项。
     await invoke<EntryDto>("toggle_pin", { id: toggledId });
-    await load();
-    // 若被切换的条目仍在可见列表内，保持选中它。
-    const idx = entries.findIndex((x) => x.id === toggledId);
-    if (idx >= 0) {
-      selected = idx;
-      paintEntries();
-      scrollToSelected();
-    }
+    await load(toggledId);
   } catch (err) {
     toast(`置顶失败：${String(err)}`);
   }

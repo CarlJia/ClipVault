@@ -70,7 +70,14 @@ async fn note_search_hit_after_update() {
         .await
         .unwrap();
 
-    let results = db.search("Q3", "all", 10).await.unwrap();
+    let results = db
+        .search_entries(crate::search::build_search_query(
+            "Q3",
+            &crate::search::parse_tab("all"),
+            10,
+        ))
+        .await
+        .unwrap();
     assert!(
         results.iter().any(|e| e.id == id),
         "搜索 'Q3' 应命中备注被更新的条目（AE2）"

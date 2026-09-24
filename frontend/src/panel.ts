@@ -116,12 +116,8 @@ export function renderEntries(
     .join("");
 }
 
-/** 渲染「标签」聚合列表。可点击筛选；`active` 为当前选中的标签名。 */
-export function renderTags(
-  container: HTMLElement,
-  tags: TagInfo[],
-  active: string | null = null,
-): void {
+/** 渲染「标签」聚合列表。可点击筛选。 */
+export function renderTags(container: HTMLElement, tags: TagInfo[]): void {
   if (tags.length === 0) {
     container.innerHTML = `<div class="empty">还没有标签</div>`;
     return;
@@ -129,7 +125,7 @@ export function renderTags(
   container.innerHTML = tags
     .map(
       (t, i) => `
-      <div class="agg-row${t.tag === active ? " selected" : ""}" data-index="${i}" data-kind="tag">
+      <div class="agg-row" data-index="${i}" data-kind="tag">
         <span class="chip chip-tag">${escapeHtml(t.tag)}</span>
         <span class="agg-count">${t.count}</span>
       </div>`,
@@ -137,11 +133,10 @@ export function renderTags(
     .join("");
 }
 
-/** 渲染「类别」聚合列表。可点击筛选；`active` 为当前选中的类别名。 */
+/** 渲染「类别」聚合列表。可点击筛选。 */
 export function renderCategories(
   container: HTMLElement,
   cats: CategoryInfo[],
-  active: string | null = null,
 ): void {
   if (cats.length === 0) {
     container.innerHTML = `<div class="empty">还没有记录</div>`;
@@ -150,7 +145,7 @@ export function renderCategories(
   container.innerHTML = cats
     .map(
       (c, i) => `
-      <div class="agg-row${c.category === active ? " selected" : ""}" data-index="${i}" data-kind="category">
+      <div class="agg-row" data-index="${i}" data-kind="category">
         <span class="chip chip-cat">${escapeHtml(c.category)}</span>
         <span class="agg-count">${c.count}</span>
       </div>`,

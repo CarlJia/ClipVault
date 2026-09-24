@@ -183,14 +183,28 @@ async fn vault_excluded_from_fts() {
         .await
         .unwrap();
     // 加密前可被 FTS 命中。
-    let hits_before = db.search("webhook", "all", 10).await.unwrap();
+    let hits_before = db
+        .search_entries(crate::search::build_search_query(
+            "webhook",
+            &crate::search::parse_tab("all"),
+            10,
+        ))
+        .await
+        .unwrap();
     assert!(hits_before.iter().any(|e| e.id == id));
 
     let cipher = VaultCipher::new(MockKeyProvider::fixed());
     db.move_to_vault(id, &cipher).await.unwrap();
 
     // 加密后不再被全文搜索命中。
-    let hits_after = db.search("webhook", "all", 10).await.unwrap();
+    let hits_after = db
+        .search_entries(crate::search::build_search_query(
+            "webhook",
+            &crate::search::parse_tab("all"),
+            10,
+        ))
+        .await
+        .unwrap();
     assert!(
         !hits_after.iter().any(|e| e.id == id),
         "vault 条目不应出现在全文搜索结果中"

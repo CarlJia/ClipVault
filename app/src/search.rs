@@ -48,7 +48,7 @@ const SELECT_COLS: &str = "e.id, e.content_hash, e.content, e.note, e.auto_categ
      e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at";
 
 /// Pin 优先 + 时间倒序（R17）。`pinned_at` nulls-last 手工兜底。
-const PIN_ORDER: &str = "e.is_pinned DESC, \
+pub(crate) const PIN_ORDER: &str = "e.is_pinned DESC, \
      CASE WHEN e.pinned_at IS NULL THEN 1 ELSE 0 END ASC, \
      e.pinned_at DESC, e.created_at DESC";
 

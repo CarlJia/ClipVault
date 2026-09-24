@@ -1,16 +1,9 @@
-//! Tauri IPC 命令层（U4）。
+//! Tauri IPC 命令层。
 //!
 //! 这里定义前端浮层调用的 `#[tauri::command]` 函数与它们返回的 DTO。
-//! U4 只需要“薄”实现：把查询委托给 [`Storage`] 的公开 API，
-//! 返回 serde 可序列化的结构。真正的排序 / 检索细化留给后续单元：
-//!
-//! - `search_results` 的 FTS 排序细化 → U5
-//! - `toggle_pin` 的置顶排序 → U7
-//! - `update_entry` 的备注/标签编辑 → U6
-//! - `paste_entry` 的 CGEvent 回贴注入 → U8
-//! - `set_guest_mode` / `set_skip_next` 的持久化 → U10
-//!
-//! U4 只保证类型化的 IPC “接缝”存在并能编译、调用。
+//! 命令保持"薄"实现：把查询委托给 [`Storage`] 的公开 API 与 `search` /
+//! `pin` / `pasteback` / `privacy` 等模块，返回 serde 可序列化的结构。
+//! 各命令具体落地的单元见其函数上的 "Ux 完成" 说明。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,19 +63,30 @@ pub struct CategoryInfo {
 // ----------------------------------------------------------------
 
 /// 为一批 entry id 批量拉取标签。返回 `id -> tags` 映射（无标签的 id 不入表）。
+///
+/// 用单条 `IN (...)` 分组查询替代逐 id 查询，避免 N+1；`ORDER BY entry_id, tag`
+/// 保证每个 id 的标签仍按 tag 升序（与旧的逐 id `ORDER BY tag` 一致）。
 async fn load_tags(state: &AppState, ids: &[i64]) -> SqliteResult<HashMap<i64, Vec<String>>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
     let ids = ids.to_vec();
     state
         .storage
         .with_conn(move |conn| {
+            let placeholders = vec!["?"; ids.len()].join(", ");
+            let sql = format!(
+                "SELECT entry_id, tag FROM tags WHERE entry_id IN ({placeholders}) \
+                 ORDER BY entry_id, tag"
+            );
+            let mut stmt = conn.prepare(&sql)?;
             let mut map: HashMap<i64, Vec<String>> = HashMap::new();
-            let mut stmt = conn.prepare("SELECT tag FROM tags WHERE entry_id = ?1 ORDER BY tag")?;
-            for id in ids {
-                let rows = stmt.query_map([id], |r| r.get::<_, String>(0))?;
-                let tags: Vec<String> = rows.collect::<SqliteResult<_>>()?;
-                if !tags.is_empty() {
-                    map.insert(id, tags);
-                }
+            let rows = stmt.query_map(rusqlite::params_from_iter(ids.iter()), |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })?;
+            for row in rows {
+                let (id, tag) = row?;
+                map.entry(id).or_default().push(tag);
             }
             Ok(map)
         })
