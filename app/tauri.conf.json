@@ -4,6 +4,8 @@
   "identifier": "com.clipvault.app",
   "version": "0.1.0",
   "build": {
+    "beforeDevCommand": "npm --prefix ../frontend run dev",
+    "beforeBuildCommand": "npm --prefix ../frontend run build",
     "frontendDist": "../frontend/dist",
     "devUrl": "http://localhost:1420"
   },

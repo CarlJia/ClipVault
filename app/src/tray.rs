@@ -97,8 +97,19 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
         .on_menu_event(on_menu_event)
         .on_tray_icon_event(on_tray_icon_event);
 
-    if let Some(icon) = app.default_window_icon() {
-        builder = builder.icon(icon.clone()).icon_as_template(true);
+    // 菜单栏专用单色模板图标（黑 + alpha，macOS 随明暗自动反色）。
+    // 编译期内嵌 `app/icons/tray-template.png`，避免依赖运行时路径与
+    // 之前复用近乎透明的 default_window_icon 导致「菜单栏无图标」的问题。
+    match tauri::image::Image::from_bytes(include_bytes!("../icons/tray-template.png")) {
+        Ok(icon) => {
+            builder = builder.icon(icon).icon_as_template(true);
+        }
+        Err(e) => {
+            eprintln!("clipvault: 托盘模板图标加载失败，回退窗口图标：{e}");
+            if let Some(icon) = app.default_window_icon() {
+                builder = builder.icon(icon.clone()).icon_as_template(true);
+            }
+        }
     }
 
     builder.build(app)?;
