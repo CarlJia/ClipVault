@@ -1,7 +1,8 @@
-// ClipVault 设置 / 权限层（U4 建横幅槽位；U8 补全首启引导与授权后复检）。
+// ClipVault 设置 / 权限层（U4 建横幅槽位；U8 补全首启引导与授权后复检；
+// U10 补全访客模式 / 「本次不记录」开关的持久化对接）。
 //
-// 负责 Accessibility 权限横幅（AE7）的完整首启引导 + 访客模式 / 「本次不记录」桩。
-// U10 会补上访客 / skip 开关的持久化。
+// 负责 Accessibility 权限横幅（AE7）的完整首启引导 + 访客模式 / 「本次不记录」开关。
+// 访客模式经后端持久化到 settings 表并同步共享原子 / 托盘；skip-once 为纯运行时。
 
 import { invoke } from "@tauri-apps/api/core";
 import type { EntryDto } from "./panel";
@@ -102,22 +103,30 @@ export async function refreshAccessibilityBanner(
     });
 }
 
-/** 「本次不记录」桩：置位一次性 skip flag（R11；watcher 消费）。 */
+/** 「本次不记录」：置位一次性 skip flag（R11；watcher 消费后复位，永不持久化）。 */
 export async function skipNextCopy(): Promise<void> {
-  try {
-    await invoke("set_skip_next");
-  } catch {
-    /* 忽略：U10 前为尽力而为的桩。 */
-  }
+  await invoke("set_skip_next");
 }
 
-/** 切换访客模式桩（R10；U10 完成持久化）。返回最终状态。 */
+/**
+ * 切换访客模式（R10）。后端持久化到 settings 表并同步共享原子 / 托盘（U10）。
+ * 返回最终状态：成功即为传入值，失败则回退为原值以便 UI 保持一致。
+ */
 export async function setGuestMode(enabled: boolean): Promise<boolean> {
   try {
     await invoke("set_guest_mode", { enabled });
     return enabled;
   } catch {
     return !enabled;
+  }
+}
+
+/** 读取当前访客模式（以后端运行时状态为准，已与持久化对齐）。 */
+export async function getGuestMode(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("get_guest_mode");
+  } catch {
+    return false;
   }
 }
 

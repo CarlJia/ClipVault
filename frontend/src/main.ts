@@ -21,10 +21,13 @@ import {
 import {
   type PasteResult,
   clearUndecryptable,
+  getGuestMode,
   listVault,
   moveToVault,
   refreshAccessibilityBanner,
   refreshKeychainBanner,
+  setGuestMode,
+  skipNextCopy,
 } from "./settings";
 import {
   isEditorOpen,
@@ -53,12 +56,15 @@ let selectedCategory: string | null = null;
 let selected = 0;
 let searchTimer: number | undefined;
 let toastTimer: number | undefined;
+// 访客模式当前状态（以后端为准，通过 getGuestMode 同步；U10）。
+let guestMode = false;
 
 const searchEl = document.querySelector<HTMLInputElement>("#search")!;
 const tabsEl = document.querySelector<HTMLDivElement>("#tabs")!;
 const listEl = document.querySelector<HTMLDivElement>("#list")!;
 const bannerEl = document.querySelector<HTMLDivElement>("#banner")!;
 const vaultBannerEl = document.querySelector<HTMLDivElement>("#vault-banner")!;
+const guestNoticeEl = document.querySelector<HTMLDivElement>("#guest-notice")!;
 const progressEl = document.querySelector<HTMLDivElement>("#progress")!;
 const toastEl = document.querySelector<HTMLDivElement>("#toast")!;
 
@@ -101,6 +107,46 @@ function toast(msg: string): void {
   toastTimer = window.setTimeout(() => {
     toastEl.classList.add("hidden");
   }, 1600);
+}
+
+/**
+ * 刷新访客模式提示条（U10 / R10）：开启时在面板顶部显示一条常驻提示，
+ * 说明「不记录新条目、已有条目只读可访问」，从而在「最近」等视图里对
+ * 缺失的新条目做出解释（计划：已有条目保留可访问，只是不出现新条目）。
+ * 同步内部 `guestMode` 状态。
+ */
+async function refreshGuestNotice(): Promise<void> {
+  guestMode = await getGuestMode();
+  if (guestMode) {
+    guestNoticeEl.classList.remove("hidden");
+    guestNoticeEl.innerHTML = `
+      <span class="banner-icon">􀩦</span>
+      <div class="banner-body">
+        <div class="banner-title">访客模式 · 不记录新条目</div>
+        <div class="banner-sub">新复制的内容不会入库；已有条目仍只读可访问。⌘⇧G 关闭。</div>
+      </div>`;
+  } else {
+    guestNoticeEl.classList.add("hidden");
+    guestNoticeEl.innerHTML = "";
+  }
+}
+
+/** 切换访客模式（⌘⇧G / 或托盘菜单）。后端持久化并同步托盘，前端刷新提示。 */
+async function toggleGuestMode(): Promise<void> {
+  const next = await setGuestMode(!guestMode);
+  guestMode = next;
+  await refreshGuestNotice();
+  toast(next ? "已开启访客模式 · 不记录新条目" : "已关闭访客模式");
+}
+
+/** 触发「本次不记录」（⌘⇧N / 或托盘菜单）：下一次复制不入库，一次性。 */
+async function triggerSkipOnce(): Promise<void> {
+  try {
+    await skipNextCopy();
+    toast("下一次复制将不被记录");
+  } catch (err) {
+    toast(`操作失败：${String(err)}`);
+  }
 }
 
 function renderTabs(): void {
@@ -398,6 +444,18 @@ document.addEventListener("keydown", (ev) => {
     void openVault();
     return;
   }
+  // ⌘⇧G：切换访客模式（U10 / R10）。
+  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "g" || ev.key === "G")) {
+    ev.preventDefault();
+    void toggleGuestMode();
+    return;
+  }
+  // ⌘⇧N：本次不记录（U10 / R11），一次性。
+  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "n" || ev.key === "N")) {
+    ev.preventDefault();
+    void triggerSkipOnce();
+    return;
+  }
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
     ev.preventDefault();
     editNote();
@@ -421,6 +479,7 @@ window.addEventListener("focus", () => {
   searchEl.select();
   void refreshAccessibilityBanner(bannerEl);
   void refreshKeychainBanner(vaultBannerEl);
+  void refreshGuestNotice();
   void load();
 });
 
@@ -436,4 +495,5 @@ setEditorCloseHandler(() => {
 });
 void refreshAccessibilityBanner(bannerEl);
 void refreshKeychainBanner(vaultBannerEl);
+void refreshGuestNotice();
 void load();

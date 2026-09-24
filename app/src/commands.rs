@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clipvault_core::Entry;
 use rusqlite::Result as SqliteResult;
 use serde::Serialize;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::storage::Storage;
 use crate::tray::{self, TrayState};
@@ -402,29 +402,44 @@ pub async fn update_entry(
         .ok_or_else(|| "无法构建 EntryDto".to_string())
 }
 
-/// 设置访客模式开关。写入与 watcher 共享的原子布尔，并刷新托盘状态。
-/// U10 负责把该状态持久化到 `settings` 表。
+/// 设置访客模式开关（U10 / R10）。
+///
+/// 写路径经 [`crate::privacy::set_guest_mode`]：先更新与 watcher 共享的原子
+/// （即时生效），再持久化到 `settings` 表（跨重启保留）。随后同步托盘图标状态
+/// 与菜单栏 CheckMenuItem 的勾选态，使原子 / 库 / 托盘 / 前端四者一致。
 #[tauri::command]
-pub fn set_guest_mode(enabled: bool, app: AppHandle, state: State<'_, AppState>) {
-    state.guest_mode.store(enabled, Ordering::SeqCst);
+pub async fn set_guest_mode(
+    enabled: bool,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    crate::privacy::set_guest_mode(&state.storage, &state.guest_mode, enabled)
+        .await
+        .map_err(|e| e.to_string())?;
+
     let next = if enabled {
         TrayState::Guest
     } else {
         TrayState::Monitoring
     };
     tray::set_state(&app, next);
+    // 前端触发的切换也反映到托盘 CheckMenuItem 勾选态（若托盘已构建）。
+    if let Some(item) = app.try_state::<tray::GuestMenuItem>() {
+        let _ = item.0.set_checked(enabled);
+    }
+    Ok(())
 }
 
-/// 读取当前访客模式状态。
+/// 读取当前访客模式状态。以运行时共享原子为准（启动时已与 `settings` 表对齐）。
 #[tauri::command]
 pub fn get_guest_mode(state: State<'_, AppState>) -> bool {
     state.guest_mode.load(Ordering::SeqCst)
 }
 
-/// 「本次不记录」：置位一次性 skip flag，watcher 消费后复位（R11）。
+/// 「本次不记录」：置位一次性 skip flag，watcher 消费后复位（R11）。纯运行时，不持久化。
 #[tauri::command]
 pub fn set_skip_next(state: State<'_, AppState>) {
-    state.skip_next.store(true, Ordering::SeqCst);
+    crate::privacy::set_skip_next(&state.skip_next);
 }
 
 // ----------------------------------------------------------------

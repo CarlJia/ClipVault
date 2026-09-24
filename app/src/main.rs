@@ -31,9 +31,16 @@ fn main() {
             // 1. 打开存储。
             let storage = Arc::new(Storage::open(&default_db_path())?);
 
-            // 2. 共享开关（U10 完成持久化）。
+            // 2. 共享开关。guest_mode 持久化于 settings 表；skip_next 纯运行时。
             let guest_mode = Arc::new(AtomicBool::new(false));
             let skip_next = Arc::new(AtomicBool::new(false));
+
+            // 2.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
+            //     使重启后 watcher / 托盘 / 前端与上次状态一致。
+            let initial_guest = tauri::async_runtime::block_on(
+                clipvault::privacy::boot_load_guest_mode(&storage, &guest_mode),
+            )
+            .unwrap_or(false);
 
             // 3. 注册 IPC 共享状态。
             app.manage(AppState {
@@ -68,8 +75,8 @@ fn main() {
             let watcher = Watcher::new(storage, guest_mode, skip_next);
             tauri::async_runtime::spawn(watcher.run());
 
-            // 5. 菜单栏托盘。
-            tray::build_tray(app.handle())?;
+            // 5. 菜单栏托盘（反映启动时加载到的访客模式状态）。
+            tray::build_tray(app.handle(), initial_guest)?;
 
             // 6. Carbon 全局热键 ⌥⌘V。
             hotkey::register(app.handle());

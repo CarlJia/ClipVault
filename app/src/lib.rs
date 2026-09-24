@@ -12,6 +12,7 @@ pub mod crypto;
 pub mod hotkey;
 pub mod pasteback;
 pub mod pin;
+pub mod privacy;
 pub mod search;
 pub mod storage;
 pub mod tray;
@@ -25,6 +26,8 @@ mod notes_test;
 mod pasteback_test;
 #[cfg(test)]
 mod pin_test;
+#[cfg(test)]
+mod privacy_test;
 #[cfg(test)]
 mod search_test;
 #[cfg(test)]

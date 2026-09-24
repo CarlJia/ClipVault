@@ -7,7 +7,7 @@
 
 use clipvault_core::Entry;
 use clipvault_core::schema;
-use rusqlite::{Connection, Result as SqliteResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -437,6 +437,39 @@ impl Storage {
             conn.execute(
                 "INSERT OR IGNORE INTO tags (entry_id, tag) VALUES (?1, ?2)",
                 params![entry_id, tag],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    // ----------------------------------------------------------------
+    // Settings k/v（U2 建表，U10 暴露读写）
+    // ----------------------------------------------------------------
+
+    /// 读取 `settings` 表中某个键的值。键不存在返回 `None`（U10）。
+    pub async fn get_setting(&self, key: &str) -> SqliteResult<Option<String>> {
+        let key = key.to_string();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT value FROM settings WHERE key = ?1",
+                params![key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+        })
+        .await
+    }
+
+    /// 写入（或覆盖）`settings` 表中的一个键值对（U10）。
+    pub async fn set_setting(&self, key: &str, value: &str) -> SqliteResult<()> {
+        let key = key.to_string();
+        let value = value.to_string();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES (?1, ?2)
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![key, value],
             )?;
             Ok(())
         })

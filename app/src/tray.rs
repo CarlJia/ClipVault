@@ -21,6 +21,12 @@ use crate::commands::AppState;
 /// 托盘的稳定 id，供 [`set_state`] 通过 `app.tray_by_id` 找回。
 const TRAY_ID: &str = "clipvault-tray";
 
+/// 被 Tauri `manage` 的访客模式 CheckMenuItem 句柄。
+///
+/// 让前端触发的 `set_guest_mode` 命令也能把菜单栏勾选态同步过来
+/// （托盘自身点击由 muda 原生翻转勾选态，命令路径则需显式设置），U10。
+pub struct GuestMenuItem(pub CheckMenuItem<tauri::Wry>);
+
 /// 托盘状态变体（对应 plan 中的四态）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayState {
@@ -58,22 +64,34 @@ impl TrayState {
 }
 
 /// 构建并注册托盘图标 + 菜单。应在 Tauri `setup` 中调用一次。
-pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+///
+/// `guest_mode` 为启动时从 `settings` 表加载到的持久化状态（U10）：据此设置
+/// 访客模式 CheckMenuItem 的初始勾选态与托盘图标初始变体，使重启后 UI 与库一致。
+pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "open", "打开主面板", true, None::<&str>)?;
     let skip = MenuItem::with_id(app, "skip_once", "本次不记录", true, None::<&str>)?;
-    let guest = CheckMenuItem::with_id(app, "guest", "访客模式", true, false, None::<&str>)?;
+    let guest = CheckMenuItem::with_id(app, "guest", "访客模式", true, guest_mode, None::<&str>)?;
     let vault = MenuItem::with_id(app, "vault", "加密区", true, None::<&str>)?;
     let about = MenuItem::with_id(app, "about", "关于 ClipVault", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+
+    // 存下 CheckMenuItem 句柄，供命令路径（前端开关）同步勾选态。
+    app.manage(GuestMenuItem(guest.clone()));
 
     let menu = Menu::with_items(
         app,
         &[&open, &skip, &guest, &vault, &sep, &about, &sep, &quit],
     )?;
 
+    let initial = if guest_mode {
+        TrayState::Guest
+    } else {
+        TrayState::Monitoring
+    };
+
     let mut builder = TrayIconBuilder::with_id(TRAY_ID)
-        .tooltip(TrayState::Monitoring.tooltip())
+        .tooltip(initial.tooltip())
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(on_menu_event)
@@ -84,6 +102,8 @@ pub fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     }
 
     builder.build(app)?;
+    // 图标构建完成后再落初始状态字形（set_title 需已存在的托盘对象）。
+    set_state(app, initial);
     Ok(())
 }
 
@@ -113,13 +133,14 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         "open" => show_panel(app),
         "skip_once" => {
             if let Some(state) = app.try_state::<AppState>() {
-                state.skip_next.store(true, Ordering::SeqCst);
+                crate::privacy::set_skip_next(&state.skip_next);
             }
         }
         "guest" => {
             if let Some(state) = app.try_state::<AppState>() {
+                // 运行时即时生效：以共享原子为准取反。
                 let new = !state.guest_mode.load(Ordering::SeqCst);
-                state.guest_mode.store(new, Ordering::SeqCst);
+                crate::privacy::apply_guest_mode(&state.guest_mode, new);
                 set_state(
                     app,
                     if new {
@@ -128,6 +149,17 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                         TrayState::Monitoring
                     },
                 );
+                // CheckMenuItem 原生已翻转勾选态；显式对齐一次，避免与命令路径漂移。
+                if let Some(item) = app.try_state::<GuestMenuItem>() {
+                    let _ = item.0.set_checked(new);
+                }
+                // 持久化到 settings 表（运行时已生效，落库为 best-effort）。
+                let storage = state.storage.clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(e) = crate::privacy::persist_guest_mode(&storage, new).await {
+                        eprintln!("clipvault: 访客模式持久化失败：{e}");
+                    }
+                });
             }
         }
         // 加密区（U9）/ 关于面板（后续）暂先打开主面板占位。
