@@ -10,6 +10,7 @@
   "app": {
     "windows": [
       {
+        "label": "main",
         "title": "ClipVault",
         "width": 560,
         "height": 420,
@@ -18,8 +19,9 @@
         "alwaysOnTop": true,
         "transparent": true,
         "center": true,
-        "visible": true,
-        "focus": true
+        "visible": false,
+        "focus": true,
+        "skipTaskbar": true
       }
     ],
     "security": {

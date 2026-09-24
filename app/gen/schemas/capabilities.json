@@ -1,1 +1,1 @@
-{}
+{"default":{"identifier":"default","description":"ClipVault 主面板默认能力：核心默认权限 + 面板显示/隐藏/聚焦/拖拽。自定义 IPC 命令无需在此声明。","local":true,"windows":["main"],"permissions":["core:default","core:window:allow-show","core:window:allow-hide","core:window:allow-set-focus","core:window:allow-start-dragging"]}}

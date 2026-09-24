@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
@@ -8,7 +8,24 @@
   <body>
     <div id="app">
       <div class="panel">
-        <div class="placeholder">ClipVault &middot; U1 scaffold</div>
+        <div id="progress" class="progress"></div>
+        <div id="banner" class="banner hidden"></div>
+        <div class="search-row">
+          <span class="search-icon">􀊫</span>
+          <input
+            id="search"
+            type="text"
+            placeholder="搜索剪贴板内容、备注、标签…"
+            autocomplete="off"
+            autocorrect="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+        </div>
+        <div id="tabs" class="tabs"></div>
+        <div id="list" class="list"></div>
+        <div class="hint">↩ 粘贴 · ⌘E 备注 · ⌘P 置顶 · esc 关闭</div>
+        <div id="toast" class="toast hidden"></div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>
