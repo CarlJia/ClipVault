@@ -415,9 +415,12 @@ listEl.addEventListener("click", (ev) => {
 });
 
 listEl.addEventListener("dblclick", (ev) => {
+  // 注意:单击处理器已在此之前重绘过列表(paintEntries 替换 innerHTML),
+  // 故 ev.target 可能已是脱离文档的旧节点,不能再靠 closest(".row") 取行。
+  // 单击已把 selected 指向被双击的行,这里直接回贴当前选中项即可。
   const row = (ev.target as HTMLElement).closest<HTMLElement>(".row");
-  if (!row) return;
-  selected = Number(row.dataset.index);
+  if (row) selected = Number(row.dataset.index);
+  ev.preventDefault();
   void activate();
 });
 
