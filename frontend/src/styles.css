@@ -240,14 +240,32 @@ body {
   justify-content: space-between;
   padding: 8px 12px;
   border-radius: 8px;
+  cursor: pointer;
 }
 .agg-row:hover {
   background: var(--surface);
+}
+.agg-row.selected {
+  background: var(--accent);
 }
 .agg-count {
   color: var(--muted);
   font-size: 12px;
   font-family: var(--font-mono);
+}
+/* 标签/类别筛选态下的「‹ 返回」条 */
+.agg-row.filter-back {
+  justify-content: flex-start;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin-bottom: 4px;
+}
+.agg-row.filter-back .back-arrow {
+  font-size: 16px;
+  line-height: 1;
 }
 
 /* 底部提示行 */

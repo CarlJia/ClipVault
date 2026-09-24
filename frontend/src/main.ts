@@ -14,6 +14,7 @@ import {
   type TagInfo,
   renderCategories,
   renderEntries,
+  renderFilterHeader,
   renderTags,
 } from "./panel";
 import { refreshAccessibilityBanner } from "./settings";
@@ -31,6 +32,11 @@ const TABS: { id: TabId; label: string }[] = [
 
 let currentTab: TabId = "recent";
 let entries: EntryDto[] = [];
+let tagList: TagInfo[] = [];
+let catList: CategoryInfo[] = [];
+// 「标签」/「类别」tab 下已选中的筛选项；null 表示仍在展示聚合列表。
+let selectedTag: string | null = null;
+let selectedCategory: string | null = null;
 let selected = 0;
 let searchTimer: number | undefined;
 let toastTimer: number | undefined;
@@ -42,9 +48,24 @@ const bannerEl = document.querySelector<HTMLDivElement>("#banner")!;
 const progressEl = document.querySelector<HTMLDivElement>("#progress")!;
 const toastEl = document.querySelector<HTMLDivElement>("#toast")!;
 
-const isEntryTab = () => currentTab === "recent" || currentTab === "all";
+// 当前视图是否在展示「条目列表」（可键盘导航 / 回贴）：
+// recent、all，或 标签/类别 已选中筛选项时。
+const showingEntries = (): boolean =>
+  currentTab === "recent" ||
+  currentTab === "all" ||
+  (currentTab === "tag" && selectedTag !== null) ||
+  (currentTab === "category" && selectedCategory !== null);
+
 const currentEntry = (): EntryDto | undefined =>
   selected >= 0 ? entries[selected] : undefined;
+
+/** 传给 `search_results` 的 tab 参数：筛选态编码为 `tag:<name>` / `category:<name>`。 */
+function tabArg(): string {
+  if (currentTab === "tag" && selectedTag !== null) return `tag:${selectedTag}`;
+  if (currentTab === "category" && selectedCategory !== null)
+    return `category:${selectedCategory}`;
+  return currentTab; // recent | all
+}
 
 function showProgress(active: boolean): void {
   progressEl.classList.toggle("active", active);
@@ -72,27 +93,44 @@ function scrollToSelected(): void {
   });
 }
 
+/** 渲染条目列表；筛选态下在顶部补一行「‹ 返回」条。 */
+function paintEntries(): void {
+  renderEntries(listEl, entries, selected);
+  if (currentTab === "tag" && selectedTag !== null) {
+    listEl.insertAdjacentHTML(
+      "afterbegin",
+      renderFilterHeader("tag", selectedTag),
+    );
+  } else if (currentTab === "category" && selectedCategory !== null) {
+    listEl.insertAdjacentHTML(
+      "afterbegin",
+      renderFilterHeader("category", selectedCategory),
+    );
+  }
+}
+
 async function load(): Promise<void> {
   showProgress(true);
   try {
-    if (currentTab === "tag") {
-      const tags = await invoke<TagInfo[]>("get_all_tags");
-      renderTags(listEl, tags);
+    if (currentTab === "tag" && selectedTag === null) {
+      tagList = await invoke<TagInfo[]>("get_all_tags");
+      renderTags(listEl, tagList);
       selected = -1;
-    } else if (currentTab === "category") {
-      const cats = await invoke<CategoryInfo[]>("get_categories");
-      renderCategories(listEl, cats);
+    } else if (currentTab === "category" && selectedCategory === null) {
+      catList = await invoke<CategoryInfo[]>("get_categories");
+      renderCategories(listEl, catList);
       selected = -1;
     } else {
+      // 条目列表：recent / all / 已选标签 / 已选类别。
       const query = searchEl.value.trim();
       entries = await invoke<EntryDto[]>("search_results", {
         query,
-        tab: currentTab,
+        tab: tabArg(),
         limit: LIMIT,
       });
       if (selected >= entries.length) selected = entries.length - 1;
       if (selected < 0 && entries.length > 0) selected = 0;
-      renderEntries(listEl, entries, selected);
+      paintEntries();
       scrollToSelected();
     }
   } catch (e) {
@@ -140,9 +178,9 @@ async function togglePin(): Promise<void> {
 }
 
 function moveSelection(delta: number): void {
-  if (!isEntryTab() || entries.length === 0) return;
+  if (!showingEntries() || entries.length === 0) return;
   selected = Math.min(Math.max(selected + delta, 0), entries.length - 1);
-  renderEntries(listEl, entries, selected);
+  paintEntries();
   scrollToSelected();
 }
 
@@ -162,16 +200,46 @@ tabsEl.addEventListener("click", (ev) => {
   const btn = (ev.target as HTMLElement).closest<HTMLElement>(".tab");
   if (!btn) return;
   currentTab = btn.dataset.tab as TabId;
+  // 切 tab 时清空标签/类别筛选，回到聚合列表。
+  selectedTag = null;
+  selectedCategory = null;
   selected = 0;
   renderTabs();
   void load();
 });
 
 listEl.addEventListener("click", (ev) => {
-  const row = (ev.target as HTMLElement).closest<HTMLElement>(".row");
+  const target = ev.target as HTMLElement;
+
+  // 聚合列表 / 返回条（标签、类别 tab）。
+  const agg = target.closest<HTMLElement>(".agg-row");
+  if (agg) {
+    const kind = agg.dataset.kind;
+    if (kind === "back") {
+      selectedTag = null;
+      selectedCategory = null;
+      selected = 0;
+      void load();
+      return;
+    }
+    const idx = Number(agg.dataset.index);
+    if (kind === "tag" && tagList[idx]) {
+      selectedTag = tagList[idx].tag;
+      selected = 0;
+      void load();
+    } else if (kind === "category" && catList[idx]) {
+      selectedCategory = catList[idx].category;
+      selected = 0;
+      void load();
+    }
+    return;
+  }
+
+  // 条目行选中。
+  const row = target.closest<HTMLElement>(".row");
   if (!row) return;
   selected = Number(row.dataset.index);
-  renderEntries(listEl, entries, selected);
+  paintEntries();
 });
 
 listEl.addEventListener("dblclick", (ev) => {

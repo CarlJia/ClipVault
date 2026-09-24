@@ -9,9 +9,12 @@
 pub mod classify;
 pub mod commands;
 pub mod hotkey;
+pub mod search;
 pub mod storage;
 pub mod tray;
 pub mod watcher;
 
+#[cfg(test)]
+mod search_test;
 #[cfg(test)]
 mod watcher_test;

@@ -352,6 +352,70 @@ impl Storage {
         .await
     }
 
+    /// Execute a [`crate::search::SearchPlan`] built by U5's `search` module.
+    ///
+    /// SQL-building lives in `search.rs`; this method only binds the plan's
+    /// string params and materialises `Entry` rows.  The plan already
+    /// excludes vault entries and applies pin-first ordering.
+    pub async fn search_entries(
+        &self,
+        plan: crate::search::SearchPlan,
+    ) -> SqliteResult<Vec<Entry>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&plan.sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(plan.params.iter()), |row| {
+                Ok(Entry::from_row(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Tag names with their entry counts, excluding vault rows (R6).
+    ///
+    /// Ordered by count DESC, then tag name ASC for a stable listing.
+    pub async fn tag_counts(&self) -> SqliteResult<Vec<(String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT t.tag, COUNT(*) AS c
+                 FROM tags t JOIN entries e ON e.id = t.entry_id
+                 WHERE e.is_vault = 0
+                 GROUP BY t.tag
+                 ORDER BY c DESC, t.tag ASC",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// Auto-category names with their entry counts, excluding vault rows (R6).
+    pub async fn category_counts(&self) -> SqliteResult<Vec<(String, i64)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT auto_category, COUNT(*) AS c
+                 FROM entries
+                 WHERE is_vault = 0
+                 GROUP BY auto_category
+                 ORDER BY c DESC, auto_category ASC",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            rows.collect()
+        })
+        .await
+    }
+
     /// Add a tag to an entry (idempotent per tag value).
     #[allow(dead_code)]
     pub async fn add_tag(&self, entry_id: i64, tag: &str) -> SqliteResult<()> {

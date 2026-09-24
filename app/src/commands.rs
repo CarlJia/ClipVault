@@ -114,9 +114,14 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
 // 查询类命令（委托存储层；U5 细化 FTS 排序）
 // ----------------------------------------------------------------
 
-/// 主检索命令。`tab` 取 `recent` / `all` / `tag` / `category`。
+/// 主检索命令。`tab` 取值：
+/// - `recent` / `all`：条目列表（Pin 优先 + 时间倒序，尊重 `query`）。
+/// - `tag:<name>` / `category:<name>`：筛选到某标签 / 类别的条目列表。
 ///
-/// U4 里 `search` 已处理空 query（退化为最近列表），tab 维度的精细过滤留待 U5。
+/// SQL 构建委托给 [`crate::search::build_search_query`]，执行委托给
+/// [`Storage::search_entries`]；加密区条目在所有分支被排除，`recent`
+/// 固定 30 条上限（R6/R17）。裸 `tag` / `category` 的「列表 + 计数」
+/// 由 [`get_all_tags`] / [`get_categories`] 负责，不走此命令。
 #[tauri::command]
 pub async fn search_results(
     query: String,
@@ -124,12 +129,12 @@ pub async fn search_results(
     limit: u32,
     state: State<'_, AppState>,
 ) -> Result<Vec<EntryDto>, String> {
-    let entries = if tab == "recent" && query.is_empty() {
-        state.storage.list_recent(limit).await
-    } else {
-        state.storage.search(&query, &tab, limit).await
-    }
-    .map_err(|e| e.to_string())?;
+    let plan = crate::search::build_search_query(&query, &crate::search::parse_tab(&tab), limit);
+    let entries = state
+        .storage
+        .search_entries(plan)
+        .await
+        .map_err(|e| e.to_string())?;
     to_dtos(&state, entries).await
 }
 
@@ -144,48 +149,32 @@ pub async fn list_recent(limit: u32, state: State<'_, AppState>) -> Result<Vec<E
     to_dtos(&state, entries).await
 }
 
-/// 「标签」tab：所有标签 + 条目数。
+/// 「标签」tab：所有标签 + 条目数（排除加密区条目，R6）。
 #[tauri::command]
 pub async fn get_all_tags(state: State<'_, AppState>) -> Result<Vec<TagInfo>, String> {
-    state
+    let rows = state
         .storage
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT tag, COUNT(*) AS c FROM tags GROUP BY tag ORDER BY c DESC, tag ASC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(TagInfo {
-                    tag: r.get(0)?,
-                    count: r.get(1)?,
-                })
-            })?;
-            rows.collect()
-        })
+        .tag_counts()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(tag, count)| TagInfo { tag, count })
+        .collect())
 }
 
-/// 「类别」tab：所有 auto_category + 条目数（仅统计非加密条目）。
+/// 「类别」tab：所有 auto_category + 条目数（仅统计非加密条目，R6）。
 #[tauri::command]
 pub async fn get_categories(state: State<'_, AppState>) -> Result<Vec<CategoryInfo>, String> {
-    state
+    let rows = state
         .storage
-        .with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT auto_category, COUNT(*) AS c FROM entries
-                 WHERE is_vault = 0
-                 GROUP BY auto_category ORDER BY c DESC, auto_category ASC",
-            )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(CategoryInfo {
-                    category: r.get(0)?,
-                    count: r.get(1)?,
-                })
-            })?;
-            rows.collect()
-        })
+        .category_counts()
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .map(|(category, count)| CategoryInfo { category, count })
+        .collect())
 }
 
 // ----------------------------------------------------------------

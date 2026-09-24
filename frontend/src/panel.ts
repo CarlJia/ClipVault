@@ -89,16 +89,20 @@ export function renderEntries(
     .join("");
 }
 
-/** 渲染「标签」聚合列表。 */
-export function renderTags(container: HTMLElement, tags: TagInfo[]): void {
+/** 渲染「标签」聚合列表。可点击筛选；`active` 为当前选中的标签名。 */
+export function renderTags(
+  container: HTMLElement,
+  tags: TagInfo[],
+  active: string | null = null,
+): void {
   if (tags.length === 0) {
     container.innerHTML = `<div class="empty">还没有标签</div>`;
     return;
   }
   container.innerHTML = tags
     .map(
-      (t) => `
-      <div class="agg-row">
+      (t, i) => `
+      <div class="agg-row${t.tag === active ? " selected" : ""}" data-index="${i}" data-kind="tag">
         <span class="chip chip-tag">${escapeHtml(t.tag)}</span>
         <span class="agg-count">${t.count}</span>
       </div>`,
@@ -106,10 +110,11 @@ export function renderTags(container: HTMLElement, tags: TagInfo[]): void {
     .join("");
 }
 
-/** 渲染「类别」聚合列表。 */
+/** 渲染「类别」聚合列表。可点击筛选；`active` 为当前选中的类别名。 */
 export function renderCategories(
   container: HTMLElement,
   cats: CategoryInfo[],
+  active: string | null = null,
 ): void {
   if (cats.length === 0) {
     container.innerHTML = `<div class="empty">还没有记录</div>`;
@@ -117,11 +122,21 @@ export function renderCategories(
   }
   container.innerHTML = cats
     .map(
-      (c) => `
-      <div class="agg-row">
+      (c, i) => `
+      <div class="agg-row${c.category === active ? " selected" : ""}" data-index="${i}" data-kind="category">
         <span class="chip chip-cat">${escapeHtml(c.category)}</span>
         <span class="agg-count">${c.count}</span>
       </div>`,
     )
     .join("");
+}
+
+/** 在筛选后的条目列表顶部渲染一行「‹ 返回」的返回条。 */
+export function renderFilterHeader(kind: "tag" | "category", name: string): string {
+  const label = kind === "tag" ? "标签" : "类别";
+  return `
+    <div class="agg-row filter-back" data-kind="back">
+      <span class="back-arrow">‹</span>
+      <span>${label}：${escapeHtml(name)}</span>
+    </div>`;
 }
