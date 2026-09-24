@@ -2,29 +2,18 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
-    <key>CFBundleExecutable</key>
-    <string>$(EXECUTABLE_NAME)</string>
-    <key>CFBundleIdentifier</key>
-    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
-    <key>CFBundleInfoDictionaryVersion</key>
-    <string>6.0</string>
-    <key>CFBundleName</key>
-    <string>ClipVault</string>
-    <key>CFBundlePackageType</key>
-    <string>APPL</string>
-    <key>CFBundleShortVersionString</key>
-    <string>$(MARKETING_VERSION)</string>
-    <key>CFBundleVersion</key>
-    <string>1</string>
-    <key>LSMinimumSystemVersion</key>
-    <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
+    <!--
+      仅保留 Tauri 打包器不会自动生成的键。
+      CFBundleExecutable / CFBundleIdentifier / CFBundleShortVersionString /
+      LSMinimumSystemVersion / CFBundleName 等由 Tauri 从 tauri.conf.json 生成，
+      不能在此用 Xcode 风格的 $(…) 变量占位——否则会原样合并进最终 bundle 的
+      Info.plist，导致 CFBundleExecutable=$(EXECUTABLE_NAME)，应用无法启动。
+    -->
+    <!-- 菜单栏常驻应用：无 Dock 图标、不进 App 切换器。 -->
     <key>LSUIElement</key>
     <true/>
+    <!-- U8 回贴：模拟 ⌘V 需要发送 Apple events / Accessibility。 -->
     <key>NSAppleEventsUsageDescription</key>
     <string>ClipVault needs to send Apple events to simulate paste operations. This is required for the auto-paste feature.</string>
-    <key>NSHumanReadableCopyright</key>
-    <string>Copyright 2026 ClipVault Team. All rights reserved.</string>
 </dict>
 </plist>
