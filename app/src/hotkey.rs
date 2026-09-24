@@ -15,6 +15,7 @@
 #[cfg(target_os = "macos")]
 mod imp {
     use std::ffi::c_void;
+    use std::sync::Mutex;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -83,13 +84,22 @@ mod imp {
     static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
     /// 已注册热键的指针（存为 usize 以便跨线程持有 / 卸载）。
     static HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
+    /// 热键触发（面板显示）前捕获的前台应用 bundle id（U8 回贴目标）。
+    /// 在主线程 run loop 回调中写入,回贴命令读取并与回贴后的前台应用比对。
+    static PREV_FRONTMOST: Mutex<Option<String>> = Mutex::new(None);
 
     /// Carbon 热键回调：显示并聚焦主面板（F2）。
+    ///
+    /// 显示面板**前**先捕获当前前台应用(U8):面板一旦聚焦,ClipVault 自身会
+    /// 成为前台应用,故必须在此刻记录真正的目标应用,供回贴时把 ⌘V 落回它。
     extern "C" fn hotkey_handler(
         _call: EventHandlerCallRef,
         _event: EventRef,
         _user: *mut c_void,
     ) -> OsStatus {
+        if let Ok(mut guard) = PREV_FRONTMOST.lock() {
+            *guard = crate::pasteback::capture_frontmost();
+        }
         if let Some(app) = APP_HANDLE.get()
             && let Some(window) = app.get_webview_window("main")
         {
@@ -171,10 +181,15 @@ mod imp {
     pub fn check_accessibility() -> bool {
         unsafe { AXIsProcessTrusted() != 0 }
     }
+
+    /// 读取热键触发时捕获的前台应用 bundle id（U8 回贴目标）。
+    pub fn last_frontmost() -> Option<String> {
+        PREV_FRONTMOST.lock().ok().and_then(|g| g.clone())
+    }
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{check_accessibility, register, unregister};
+pub use imp::{check_accessibility, last_frontmost, register, unregister};
 
 // ---- 非 macOS：no-op 降级，保证跨平台可编译 ----
 
@@ -190,4 +205,10 @@ pub fn unregister() {}
 #[cfg(not(target_os = "macos"))]
 pub fn check_accessibility() -> bool {
     true
+}
+
+/// 非 macOS 平台：无前台应用捕获能力。
+#[cfg(not(target_os = "macos"))]
+pub fn last_frontmost() -> Option<String> {
+    None
 }

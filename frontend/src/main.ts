@@ -17,7 +17,7 @@ import {
   renderFilterHeader,
   renderTags,
 } from "./panel";
-import { refreshAccessibilityBanner } from "./settings";
+import { type PasteResult, refreshAccessibilityBanner } from "./settings";
 import {
   isEditorOpen,
   openEditor,
@@ -157,14 +157,24 @@ async function activate(): Promise<void> {
   const e = currentEntry();
   if (!e) return;
   try {
-    const r = await invoke<string>("paste_entry", { id: e.id });
-    if (r.startsWith("unimplemented")) {
-      toast("回贴功能将在 U8 接入");
-    } else {
+    const r = await invoke<PasteResult>("paste_entry", { id: e.id });
+    if (r.status === "pasted") {
+      // 回贴成功:后端已隐藏面板并把 ⌘V 落到目标应用,无需额外提示。
       await invoke("hide_panel");
+    } else {
+      // window_switched / clipboard_only:内容已在剪贴板,后端已重新显示面板,
+      // 展示固定提示引导用户手动 ⌘V。
+      toast(r.message);
     }
   } catch (err) {
-    toast(`回贴失败：${String(err)}`);
+    const msg = String(err);
+    if (msg.includes("missing-accessibility")) {
+      // AE7:未授权 —— 展示 Accessibility 横幅,不隐藏面板。
+      await refreshAccessibilityBanner(bannerEl);
+      toast("需要「辅助功能」授权才能自动回贴");
+    } else {
+      toast(`回贴失败:${msg}`);
+    }
   }
 }
 

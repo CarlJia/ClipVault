@@ -1,25 +1,56 @@
-// ClipVault 设置 / 权限层（U4）。
+// ClipVault 设置 / 权限层（U4 建横幅槽位；U8 补全首启引导与授权后复检）。
 //
-// 负责 Accessibility 权限横幅（AE7）与访客模式 / 「本次不记录」的 UI 桩。
-// U8 会补上「打开系统设置」深链与授权后自动复检；U10 会补上开关持久化。
+// 负责 Accessibility 权限横幅（AE7）的完整首启引导 + 访客模式 / 「本次不记录」桩。
+// U10 会补上访客 / skip 开关的持久化。
 
 import { invoke } from "@tauri-apps/api/core";
 
+/** `paste_entry` 的返回体：区分回贴成功分支与对应固定 toast 文案。 */
+export interface PasteResult {
+  /** `pasted` | `window_switched` | `clipboard_only`。 */
+  status: string;
+  /** 需要展示的提示（空串表示无需提示）。 */
+  message: string;
+}
+
+/** 打开「系统设置 → 隐私与安全性 → 辅助功能」的深链。 */
+const ACCESSIBILITY_PREF_URL =
+  "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+
+/** 点击深链后自动复检授权的延时（give the user time to grant）。 */
+const RECHECK_DELAY_MS = 15_000;
+
+let recheckTimer: number | undefined;
+
+/** 查询后端 `check_accessibility()`（即 `AXIsProcessTrusted()`）。 */
+async function isTrusted(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("check_accessibility");
+  } catch {
+    // 检测失败时不打扰用户，视为已授权。
+    return true;
+  }
+}
+
 /**
- * 刷新 Accessibility 横幅：未授权时展示提示，已授权时隐藏。
- * `check_accessibility` 返回 `AXIsProcessTrusted()`（AE7）。
+ * 刷新 Accessibility 横幅：未授权时展示首启引导，已授权时隐藏并清空。
+ *
+ * 引导内容（计划 U8）：
+ * - 主按钮「打开系统设置」→ 深链;点击后 15s 自动复检并在授权后清横幅。
+ * - 次按钮「暂时只写到剪贴板」→ 让用户知道可退化为手动 ⌘V(实际回贴时若仍
+ *   未授权,`paste_entry` 会返回 `missing-accessibility`,内容仍写入剪贴板)。
+ * - 「重新检查」→ 立即复检。
  */
 export async function refreshAccessibilityBanner(
   banner: HTMLElement,
 ): Promise<void> {
-  let trusted = true;
-  try {
-    trusted = await invoke<boolean>("check_accessibility");
-  } catch {
-    trusted = true; // 检测失败时不打扰用户。
-  }
+  const trusted = await isTrusted();
 
   if (trusted) {
+    if (recheckTimer !== undefined) {
+      window.clearTimeout(recheckTimer);
+      recheckTimer = undefined;
+    }
     banner.classList.add("hidden");
     banner.innerHTML = "";
     return;
@@ -28,12 +59,46 @@ export async function refreshAccessibilityBanner(
   banner.classList.remove("hidden");
   banner.innerHTML = `
     <span class="banner-icon">􀇾</span>
-    <span class="banner-text">需要「系统设置 → 隐私与安全性 → 辅助功能」授权才能自动回贴</span>
-    <button id="banner-recheck" class="banner-btn">重新检查</button>`;
-  const btn = banner.querySelector<HTMLButtonElement>("#banner-recheck");
-  btn?.addEventListener("click", () => {
-    void refreshAccessibilityBanner(banner);
-  });
+    <div class="banner-body">
+      <div class="banner-title">需要「辅助功能」权限才能自动回贴</div>
+      <div class="banner-sub">ClipVault 通过模拟 ⌘V 把条目粘到目标应用,需在系统设置中授权。</div>
+    </div>
+    <div class="banner-actions">
+      <button id="banner-open" class="banner-btn banner-btn-primary">打开系统设置</button>
+      <button id="banner-clip" class="banner-btn">暂时只写到剪贴板</button>
+      <button id="banner-recheck" class="banner-btn">重新检查</button>
+    </div>`;
+
+  banner
+    .querySelector<HTMLButtonElement>("#banner-open")
+    ?.addEventListener("click", () => {
+      void invoke("open_accessibility_settings").catch(() => {
+        // 深链打开失败时退回到 window.open（同一 URL scheme）。
+        window.open(ACCESSIBILITY_PREF_URL);
+      });
+      // 授权是异步的用户操作:延时自动复检,授权后自动清横幅。
+      if (recheckTimer !== undefined) window.clearTimeout(recheckTimer);
+      recheckTimer = window.setTimeout(() => {
+        void refreshAccessibilityBanner(banner);
+      }, RECHECK_DELAY_MS);
+    });
+
+  banner
+    .querySelector<HTMLButtonElement>("#banner-clip")
+    ?.addEventListener("click", () => {
+      // 仅提示用户当前处于「只写剪贴板」的退化模式;真正的写入发生在回贴时。
+      const sub = banner.querySelector<HTMLElement>(".banner-sub");
+      if (sub) {
+        sub.textContent =
+          "已切换为「只写剪贴板」:回贴时内容仅写入剪贴板,请在目标应用手动 ⌘V。";
+      }
+    });
+
+  banner
+    .querySelector<HTMLButtonElement>("#banner-recheck")
+    ?.addEventListener("click", () => {
+      void refreshAccessibilityBanner(banner);
+    });
 }
 
 /** 「本次不记录」桩：置位一次性 skip flag（R11；watcher 消费）。 */

@@ -194,15 +194,116 @@ pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
     window.hide().map_err(|e| e.to_string())
 }
 
+/// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
+///
+/// 用 `open(1)` 打开 `x-apple.systempreferences:` URL scheme;非 macOS 为 no-op。
+#[tauri::command]
+pub fn open_accessibility_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        const URL: &str =
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+        std::process::Command::new("open")
+            .arg(URL)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("仅支持 macOS".to_string())
+    }
+}
+
 // ----------------------------------------------------------------
 // 后续单元的类型化接缝（U6 / U7 / U8 / U10）
 // ----------------------------------------------------------------
 
-/// U8 完成：CGEvent 模拟 ⌘V 回贴。U4 仅占位。
+/// U8 完成：CGEvent 模拟 ⌘V 回贴。
+///
+/// 返回体 [`PasteResult`]:`status` 区分成功分支(`pasted` / `window_switched`
+/// / `clipboard_only`),`message` 为对应固定 toast(成功时为空)。
+/// 错误以 `Err(String)` 返回:`missing-accessibility` 让前端展示 Accessibility
+/// 横幅(AE7),加密区条目返回 U9 seam 文案。
+#[derive(Debug, Clone, Serialize)]
+pub struct PasteResult {
+    /// `pasted` | `window_switched` | `clipboard_only`。
+    pub status: String,
+    /// 需要展示的 toast(空串表示无需提示)。
+    pub message: String,
+}
+
+/// 错误码:未授权。前端据此展示 Accessibility 横幅而非普通 toast(AE7)。
+pub const ERR_MISSING_ACCESSIBILITY: &str = "missing-accessibility";
+
+/// U8 完成:Accessibility 门控 + NSPasteboard 写入 + CGEvent ⌘V 回贴。
+///
+/// 流程:读条目 → [`crate::pasteback::perform_paste`](每调用重校验授权 →
+/// vault 接缝 → 写剪贴板 → 隐藏面板 → 模拟 ⌘V → 失焦比对)。真实 CGEvent
+/// 注入放在 `spawn_blocking`,避免 ~200ms 的按键 + 焦点等待阻塞 async executor。
 #[tauri::command]
-pub fn paste_entry(id: i64) -> Result<String, String> {
-    let _ = id;
-    Ok("unimplemented:U8".to_string())
+pub async fn paste_entry(
+    id: i64,
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<PasteResult, String> {
+    let entry = state
+        .storage
+        .get_by_id(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("entry {id} 不存在"))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        use crate::pasteback::{
+            CGEVENT_FAIL_MSG, MacosBackend, PasteError, PasteOutcome, RealAccessibilityChecker,
+            VAULT_SEAM_MSG, WINDOW_SWITCHED_MSG, perform_paste,
+        };
+
+        let prev = crate::hotkey::last_frontmost();
+        let win = window.clone();
+        let outcome = tauri::async_runtime::spawn_blocking(move || {
+            let checker = RealAccessibilityChecker;
+            let backend = MacosBackend::new(win);
+            perform_paste(&checker, &backend, &entry, prev.as_deref())
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+
+        match outcome {
+            Ok(PasteOutcome::Pasted) => Ok(PasteResult {
+                status: "pasted".to_string(),
+                message: String::new(),
+            }),
+            Ok(PasteOutcome::WindowSwitched) => {
+                // 面板已被隐藏;重新显示以便用户看到手动 ⌘V 的提示。
+                let _ = window.show();
+                let _ = window.set_focus();
+                Ok(PasteResult {
+                    status: "window_switched".to_string(),
+                    message: WINDOW_SWITCHED_MSG.to_string(),
+                })
+            }
+            Ok(PasteOutcome::ClipboardOnly) => {
+                let _ = window.show();
+                let _ = window.set_focus();
+                Ok(PasteResult {
+                    status: "clipboard_only".to_string(),
+                    message: CGEVENT_FAIL_MSG.to_string(),
+                })
+            }
+            Err(PasteError::MissingAccessibility) => Err(ERR_MISSING_ACCESSIBILITY.to_string()),
+            Err(PasteError::VaultDecryptUnimplemented) => Err(VAULT_SEAM_MSG.to_string()),
+            Err(PasteError::UnsupportedPlatform) => Err("回贴仅支持 macOS".to_string()),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (&entry, &window);
+        Err("回贴仅支持 macOS".to_string())
+    }
 }
 
 /// U7 完成：切换 `id` 条目的置顶状态，返回刷新后的 [`EntryDto`]。

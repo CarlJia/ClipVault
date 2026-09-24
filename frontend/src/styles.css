@@ -75,12 +75,12 @@ body {
     opacity 0.1s ease;
 }
 
-/* Accessibility 横幅（AE7） */
+/* Accessibility 横幅（AE7 / U8 首启引导） */
 .banner {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
-  padding: 8px 14px;
+  padding: 10px 14px;
   background: var(--warn);
   border-bottom: 1px solid var(--border);
   font-size: 12px;
@@ -91,9 +91,29 @@ body {
 }
 .banner-icon {
   color: #ffd60a;
+  line-height: 1.4;
 }
 .banner-text {
   flex: 1;
+}
+.banner-body {
+  flex: 1;
+  min-width: 0;
+}
+.banner-title {
+  font-weight: 600;
+}
+.banner-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.banner-actions {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
 }
 .banner-btn {
   border: 1px solid var(--border);
@@ -103,9 +123,17 @@ body {
   padding: 3px 10px;
   font-size: 12px;
   cursor: pointer;
+  white-space: nowrap;
 }
 .banner-btn:hover {
   background: var(--surface-hover);
+}
+.banner-btn-primary {
+  border-color: var(--accent);
+  background: rgba(10, 132, 255, 0.18);
+}
+.banner-btn-primary:hover {
+  background: rgba(10, 132, 255, 0.28);
 }
 
 /* 搜索框 */

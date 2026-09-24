@@ -61,6 +61,7 @@ fn main() {
             commands::get_categories,
             commands::check_accessibility,
             commands::hide_panel,
+            commands::open_accessibility_settings,
             commands::paste_entry,
             commands::toggle_pin,
             commands::update_entry,

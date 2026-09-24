@@ -15,11 +15,27 @@ tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
 
-# macOS 原生绑定：NSPasteboard 轮询（KTD2）。仅在 macOS 目标上编译。
+# macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
+# - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。
+# - NSWorkspace / NSRunningApplication：U8 前台应用捕获与失焦比对。
+# - objc2-core-graphics：U8 CGEvent 模拟 ⌘V（CGEventCreateKeyboardEvent /
+#   CGEventPost / CGEventSetFlags 对应 new_keyboard_event / post / set_flags）。
+#   选用 objc2-core-graphics 而非 core-graphics crate，以与既有 objc2 0.6 家族
+#   （objc2-foundation / objc2-app-kit 0.3）保持同一绑定栈、避免混用两套 FFI。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString"] }
-objc2-app-kit = { version = "0.3", features = ["NSPasteboard"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSWorkspace",
+    "NSRunningApplication",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGEvent",
+    "CGEventTypes",
+    "CGEventSource",
+    "CGRemoteOperation",
+] }
 
 [features]
 default = ["custom-protocol"]
