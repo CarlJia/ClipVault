@@ -1,7 +1,8 @@
 //! Schema definitions and migration runner for ClipVault SQLite database.
 //!
 //! Schema version managed via `PRAGMA user_version`.
-//! Currently ships SCHEMA_V1 only.
+//! - V1 (U2): entries / tags / settings + FTS5 `entries_fts` with sync triggers.
+//! - V2 (U9): adds `entries.nonce BLOB` for AES-GCM vault ciphertext nonces.
 
 use rusqlite::{Connection, Result};
 
@@ -102,17 +103,36 @@ BEGIN
 END;
 "#;
 
+/// DDL for schema version 2 (U9).
+///
+/// Adds the `nonce` column holding the 12-byte AES-GCM nonce for vault
+/// entries.  `NULL` for non-vault rows.  Additive migration: existing V1
+/// databases upgrade in place, no data rewrite.  The ciphertext itself is
+/// stored base64-encoded in the existing `content` TEXT column so that
+/// `Entry.content` stays valid UTF-8 for every read path.
+pub const MIGRATION_V2: &str = r#"
+ALTER TABLE entries ADD COLUMN nonce BLOB;
+"#;
+
 /// Run all schema migrations, bringing the database from whatever
 /// `user_version` it currently has up to date.
 ///
-/// Currently handles 0 → 1 only.
+/// Handles 0 → 1 (V1 base schema) and 1 → 2 (add `nonce`).
 pub fn run_migrations(conn: &Connection) -> Result<()> {
-    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    let mut user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
     if user_version == 0 {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(SCHEMA_V1)?;
         tx.execute("PRAGMA user_version = 1", [])?;
+        tx.commit()?;
+        user_version = 1;
+    }
+
+    if user_version == 1 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_V2)?;
+        tx.execute("PRAGMA user_version = 2", [])?;
         tx.commit()?;
     }
 
@@ -147,7 +167,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
     }
 
     #[test]
@@ -186,7 +206,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
     }
 
     #[test]
@@ -200,7 +220,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn
@@ -214,5 +234,41 @@ mod tests {
                 .unwrap();
             assert_eq!(cnt, 1, "table '{table}' should exist after migration");
         }
+    }
+
+    #[test]
+    fn migration_one_to_two_adds_nonce() {
+        // Simulate a V1 DB (schema applied, user_version=1, no nonce column).
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA_V1).unwrap();
+        conn.execute("PRAGMA user_version = 1", []).unwrap();
+
+        // Pre-migration: nonce column must not exist yet.
+        let has_nonce_before = column_exists(&conn, "entries", "nonce");
+        assert!(!has_nonce_before, "V1 must not have the nonce column");
+
+        run_migrations(&conn).unwrap();
+
+        let uv: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, 2, "should be at V2 after migration");
+        assert!(
+            column_exists(&conn, "entries", "nonce"),
+            "V2 must add the nonce column"
+        );
+    }
+
+    /// Helper: does `table` have a column named `col`?
+    fn column_exists(conn: &Connection, table: &str, col: &str) -> bool {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        names.iter().any(|n| n == col)
     }
 }

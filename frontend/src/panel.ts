@@ -13,6 +13,8 @@ export interface EntryDto {
   is_pinned: boolean;
   pinned_at: number | null;
   is_vault: boolean;
+  /** 加密区条目是否可解密；`false` → 显示「无法解密」徽标（U9）。 */
+  is_decryptable: boolean;
   created_at: number;
 }
 
@@ -93,11 +95,20 @@ export function renderEntries(
       const note = e.note
         ? `<span class="note-dot" title="有备注">􀈬</span>`
         : "";
+      // 加密区徽标（U9）：普通面板通常不含 vault 条目（已被后端排除），
+      // 但若出现则显式标注，且不可解密时给出「无法解密」警示。
+      const vault = e.is_vault
+        ? `<span class="chip chip-vault" title="加密区条目">🔒 加密</span>`
+        : "";
+      const undec =
+        e.is_vault && !e.is_decryptable
+          ? `<span class="chip chip-undec" title="密钥缺失，无法解密">⚠ 无法解密</span>`
+          : "";
       return `
       <div class="row${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}">
         <div class="row-main">
           <div class="row-content">${pin}${escapeHtml(previewOf(e.content))}</div>
-          <div class="row-meta">${cat}${tags}${note}</div>
+          <div class="row-meta">${cat}${tags}${vault}${undec}${note}</div>
         </div>
         <div class="row-time">${formatTime(e.created_at)}</div>
       </div>`;
@@ -155,4 +166,40 @@ export function renderFilterHeader(kind: "tag" | "category", name: string): stri
       <span class="back-arrow">‹</span>
       <span>${label}：${escapeHtml(name)}</span>
     </div>`;
+}
+
+/**
+ * 渲染「加密区管理」列表（U9）。密文不下发，只展示元数据：类别、标签、备注、
+ * 时间，以及是否可解密。不可解密的条目高亮警示，供用户「清除不可解密条目」。
+ */
+export function renderVaultList(
+  container: HTMLElement,
+  entries: EntryDto[],
+): void {
+  if (entries.length === 0) {
+    container.innerHTML = `<div class="empty">加密区暂无条目</div>`;
+    return;
+  }
+  container.innerHTML = entries
+    .map((e) => {
+      const cat = `<span class="chip chip-cat">${escapeHtml(e.auto_category)}</span>`;
+      const tags = e.tags
+        .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
+        .join("");
+      const status = e.is_decryptable
+        ? `<span class="chip chip-vault">🔒 已加密</span>`
+        : `<span class="chip chip-undec">⚠ 无法解密</span>`;
+      const noteLine = e.note
+        ? `<div class="vault-note">${escapeHtml(e.note)}</div>`
+        : "";
+      return `
+      <div class="vault-row${e.is_decryptable ? "" : " undecryptable"}" data-id="${e.id}">
+        <div class="row-main">
+          <div class="row-meta">${status}${cat}${tags}</div>
+          ${noteLine}
+        </div>
+        <div class="row-time">${formatTime(e.created_at)}</div>
+      </div>`;
+    })
+    .join("");
 }

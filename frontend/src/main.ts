@@ -16,8 +16,16 @@ import {
   renderEntries,
   renderFilterHeader,
   renderTags,
+  renderVaultList,
 } from "./panel";
-import { type PasteResult, refreshAccessibilityBanner } from "./settings";
+import {
+  type PasteResult,
+  clearUndecryptable,
+  listVault,
+  moveToVault,
+  refreshAccessibilityBanner,
+  refreshKeychainBanner,
+} from "./settings";
 import {
   isEditorOpen,
   openEditor,
@@ -50,8 +58,18 @@ const searchEl = document.querySelector<HTMLInputElement>("#search")!;
 const tabsEl = document.querySelector<HTMLDivElement>("#tabs")!;
 const listEl = document.querySelector<HTMLDivElement>("#list")!;
 const bannerEl = document.querySelector<HTMLDivElement>("#banner")!;
+const vaultBannerEl = document.querySelector<HTMLDivElement>("#vault-banner")!;
 const progressEl = document.querySelector<HTMLDivElement>("#progress")!;
 const toastEl = document.querySelector<HTMLDivElement>("#toast")!;
+
+// 加密区管理模态元素（U9）。
+const vaultEl = document.querySelector<HTMLDivElement>("#vault")!;
+const vaultListEl = document.querySelector<HTMLDivElement>("#vault-list")!;
+const vaultSubEl = document.querySelector<HTMLDivElement>("#vault-sub")!;
+const vaultCloseEl = document.querySelector<HTMLButtonElement>("#vault-close")!;
+const vaultClearEl = document.querySelector<HTMLButtonElement>("#vault-clear")!;
+
+const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 
 // 当前视图是否在展示「条目列表」（可键盘导航 / 回贴）：
 // recent、all，或 标签/类别 已选中筛选项时。
@@ -221,6 +239,64 @@ function moveSelection(delta: number): void {
 }
 
 // ----------------------------------------------------------------
+// 加密区（U9）：移入加密区 + 加密区管理模态
+// ----------------------------------------------------------------
+
+/** 把当前选中条目移入加密区（⌘L）。Keychain 不可用时提示并刷新横幅。 */
+async function moveCurrentToVault(): Promise<void> {
+  const e = currentEntry();
+  if (!e) return;
+  if (e.is_vault) {
+    toast("该条目已在加密区");
+    return;
+  }
+  try {
+    await moveToVault(e.id);
+    toast("已移入加密区 🔒");
+    await load(); // vault 条目已退出普通列表。
+  } catch (err) {
+    // 多为 Keychain 不可用：条目保持明文未加密。
+    await refreshKeychainBanner(vaultBannerEl);
+    toast(`移入加密区失败：${String(err)}`);
+  }
+}
+
+/** 打开加密区管理模态（⌘⇧V）：列出 vault 条目、按需暴露「清除不可解密」。 */
+async function openVault(): Promise<void> {
+  vaultEl.classList.remove("hidden");
+  try {
+    const items = await listVault();
+    renderVaultList(vaultListEl, items);
+    const undec = items.filter((x) => !x.is_decryptable).length;
+    vaultSubEl.textContent =
+      items.length === 0
+        ? "把敏感条目移入加密区（列表中按 ⌘L）后，内容以 AES-256-GCM 加密存储。"
+        : `共 ${items.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
+    vaultClearEl.classList.toggle("hidden", undec === 0);
+  } catch (err) {
+    vaultListEl.innerHTML = `<div class="empty">加载加密区失败：${String(err)}</div>`;
+  }
+}
+
+function closeVault(): void {
+  vaultEl.classList.add("hidden");
+  searchEl.focus();
+}
+
+vaultCloseEl.addEventListener("click", closeVault);
+vaultClearEl.addEventListener("click", () => {
+  void (async () => {
+    try {
+      const n = await clearUndecryptable();
+      toast(`已清除 ${n} 条不可解密条目`);
+      await openVault(); // 重新渲染。
+    } catch (err) {
+      toast(`清除失败：${String(err)}`);
+    }
+  })();
+});
+
+// ----------------------------------------------------------------
 // 事件接线
 // ----------------------------------------------------------------
 
@@ -288,6 +364,14 @@ listEl.addEventListener("dblclick", (ev) => {
 document.addEventListener("keydown", (ev) => {
   // 编辑器打开时，列表快捷键让位给编辑器（其 Esc / ⌘S 已在 editor.ts 处理）。
   if (isEditorOpen()) return;
+  // 加密区模态打开时，仅处理 Esc 关闭。
+  if (isVaultOpen()) {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeVault();
+    }
+    return;
+  }
   if (ev.key === "Escape") {
     ev.preventDefault();
     void invoke("hide_panel");
@@ -308,6 +392,12 @@ document.addEventListener("keydown", (ev) => {
     void activate();
     return;
   }
+  // ⌘⇧V：打开加密区管理（放在 ⌘E 之前判断，避免与其它组合冲突）。
+  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
+    ev.preventDefault();
+    void openVault();
+    return;
+  }
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
     ev.preventDefault();
     editNote();
@@ -316,6 +406,12 @@ document.addEventListener("keydown", (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "p" || ev.key === "P")) {
     ev.preventDefault();
     void togglePin();
+    return;
+  }
+  // ⌘L：把当前条目移入加密区。
+  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && (ev.key === "l" || ev.key === "L")) {
+    ev.preventDefault();
+    void moveCurrentToVault();
   }
 });
 
@@ -324,6 +420,7 @@ window.addEventListener("focus", () => {
   searchEl.focus();
   searchEl.select();
   void refreshAccessibilityBanner(bannerEl);
+  void refreshKeychainBanner(vaultBannerEl);
   void load();
 });
 
@@ -338,4 +435,5 @@ setEditorCloseHandler(() => {
   searchEl.focus();
 });
 void refreshAccessibilityBanner(bannerEl);
+void refreshKeychainBanner(vaultBannerEl);
 void load();

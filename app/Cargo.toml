@@ -14,6 +14,10 @@ clipvault-core = { path = "../clipvault-core" }
 tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 sha2 = "0.10"
+# U9：加密区条目的密文以 base64 存进 TEXT 列（content），nonce 存 BLOB 列。
+base64 = "0.22"
+# U9：move_to_vault 的每条随机 salt（salted content_hash，避免明文指纹）。
+rand = "0.8"
 
 # macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
 # - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。
@@ -36,6 +40,8 @@ objc2-core-graphics = { version = "0.3", features = [
     "CGEventSource",
     "CGRemoteOperation",
 ] }
+# U9：Keychain 托管数据密钥（service = com.clipvault.data_key）。
+security-framework = "3"
 
 [features]
 default = ["custom-protocol"]

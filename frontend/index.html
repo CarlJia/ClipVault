@@ -10,6 +10,7 @@
       <div class="panel">
         <div id="progress" class="progress"></div>
         <div id="banner" class="banner hidden"></div>
+        <div id="vault-banner" class="banner banner-vault hidden"></div>
         <div class="search-row">
           <span class="search-icon">􀊫</span>
           <input
@@ -24,7 +25,7 @@
         </div>
         <div id="tabs" class="tabs"></div>
         <div id="list" class="list"></div>
-        <div class="hint">↩ 粘贴 · ⌘E 备注 · ⌘P 置顶 · esc 关闭</div>
+        <div class="hint">↩ 粘贴 · ⌘E 备注 · ⌘P 置顶 · ⌘L 移入加密区 · ⌘⇧V 加密区 · esc 关闭</div>
         <div id="toast" class="toast hidden"></div>
 
         <!-- 备注 / 标签编辑器（U6）。默认隐藏，⌘E 唤出。 -->
@@ -65,6 +66,22 @@
             <div class="editor-foot">
               <span class="editor-hint">⌘S 保存 · esc 关闭</span>
               <button id="editor-retry" class="editor-retry hidden">重试</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- 加密区管理（U9）。默认隐藏，⌘⇧V 唤出。 -->
+        <div id="vault" class="editor hidden">
+          <div class="editor-card vault-card">
+            <div class="editor-head">
+              <span class="editor-title">加密区管理</span>
+              <button id="vault-close" class="banner-btn">关闭</button>
+            </div>
+            <div class="vault-sub" id="vault-sub"></div>
+            <div class="vault-list" id="vault-list"></div>
+            <div class="editor-foot">
+              <span class="editor-hint">🔒 内容以 AES-256-GCM 加密 · esc 关闭</span>
+              <button id="vault-clear" class="editor-retry hidden">清除不可解密条目</button>
             </div>
           </div>
         </div>

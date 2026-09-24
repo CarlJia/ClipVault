@@ -442,6 +442,246 @@ impl Storage {
         })
         .await
     }
+
+    // ----------------------------------------------------------------
+    // Vault / 加密区（U9）
+    // ----------------------------------------------------------------
+
+    /// 把 `id` 条目移入加密区：明文经 AES-GCM 加密（`encryptor`），密文 base64
+    /// 写回 `content`、nonce 写 `nonce`、`is_vault=1`、`is_decryptable=1`，并把
+    /// `content_hash` 替换为 salted 变体（不再是明文指纹，KTD4）。
+    ///
+    /// # Errors
+    /// - [`VaultError::Crypto`]：Keychain 不可用 → **拒绝加密**，条目保持
+    ///   `is_vault=0` 的明文不变（plan U9：不静默写明文进 vault）。
+    /// - [`VaultError::Sqlite`]：数据库错误。
+    ///
+    /// 已在 vault（`is_vault != 0`）的条目为幂等 no-op。
+    pub async fn move_to_vault(
+        &self,
+        id: i64,
+        encryptor: &dyn crate::crypto::Encryptor,
+    ) -> Result<(), VaultError> {
+        let entry = self
+            .get_by_id(id)
+            .await
+            .map_err(VaultError::Sqlite)?
+            .ok_or_else(|| VaultError::Sqlite(rusqlite::Error::QueryReturnedNoRows))?;
+        if entry.is_vault {
+            return Ok(());
+        }
+        self.encrypt_into_vault(id, &entry.content, encryptor).await
+    }
+
+    /// 批量移入加密区。每条先置 `is_vault=2`（pending，退出 FTS、UI 显示「加密中」），
+    /// 成功后置 1；失败回退到 `is_vault=0`（明文保持可搜索）并计入 `failed`（plan U9）。
+    pub async fn move_to_vault_bulk(
+        &self,
+        ids: &[i64],
+        encryptor: &dyn crate::crypto::Encryptor,
+    ) -> Result<BulkVaultReport, VaultError> {
+        let mut report = BulkVaultReport::default();
+        for &id in ids {
+            // 读取明文（pending 标记前，避免依赖 pending 后的行状态）。
+            let entry = match self.get_by_id(id).await.map_err(VaultError::Sqlite)? {
+                Some(e) if !e.is_vault => e,
+                _ => continue, // 不存在或已在 vault：跳过。
+            };
+            self.set_vault_flag(id, 2)
+                .await
+                .map_err(VaultError::Sqlite)?;
+            match self.encrypt_into_vault(id, &entry.content, encryptor).await {
+                Ok(()) => report.succeeded.push(id),
+                Err(e) => {
+                    // 回退到明文态（is_vault=0），触发器会把内容重新放回 FTS。
+                    self.set_vault_flag(id, 0)
+                        .await
+                        .map_err(VaultError::Sqlite)?;
+                    report.failed.push(id);
+                    // Keychain 不可用会让整批失败：记录首个原因后继续标记其余为 failed。
+                    report.last_error.get_or_insert_with(|| e.to_string());
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    /// 内部：读取的明文 → 加密 → 落盘为 vault 密文。不改动其它列。
+    async fn encrypt_into_vault(
+        &self,
+        id: i64,
+        plaintext: &str,
+        encryptor: &dyn crate::crypto::Encryptor,
+    ) -> Result<(), VaultError> {
+        // 加密在 SQLite 锁外完成；Keychain 不可用时在此直接返回，DB 不变。
+        let enc = encryptor.encrypt(plaintext).map_err(VaultError::Crypto)?;
+        let new_hash = crate::crypto::salted_content_hash(id);
+        let nonce = enc.nonce.to_vec();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries
+                 SET content = ?1, nonce = ?2, is_vault = 1,
+                     is_decryptable = 1, content_hash = ?3
+                 WHERE id = ?4",
+                params![enc.content_b64, nonce, new_hash, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .map_err(VaultError::Sqlite)
+    }
+
+    /// 设置某条目的 `is_vault` 原始标记（0=明文 / 1=已加密 / 2=加密中）。
+    async fn set_vault_flag(&self, id: i64, flag: i32) -> SqliteResult<()> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries SET is_vault = ?1 WHERE id = ?2",
+                params![flag, id],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// 读取某加密区条目的 nonce（回贴解密用）。非 vault 或未设置返回 `None`。
+    pub async fn get_vault_nonce(&self, id: i64) -> SqliteResult<Option<Vec<u8>>> {
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT nonce FROM entries WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, Option<Vec<u8>>>(0),
+            )
+            .or(Ok(None))
+        })
+        .await
+    }
+
+    /// 列出所有加密区条目（`is_vault=1`），供 Settings「加密区管理」UI 使用。
+    /// 密文不解密：返回的 `content` 是 base64 密文，UI 只按元数据展示。
+    pub async fn list_vault_entries(&self) -> SqliteResult<Vec<Entry>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, content_hash, content, note, auto_category,
+                        is_pinned, pinned_at, is_vault, is_decryptable, created_at
+                 FROM entries
+                 WHERE is_vault = 1
+                 ORDER BY is_decryptable ASC, created_at DESC",
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(Entry::from_row(
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                ))
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// 启动时校验所有 `is_vault=1` 条目能否用当前 Keychain 密钥解密，据此刷新
+    /// `is_decryptable`（plan U9）。仅在 Keychain 密钥可用时调用；否则应跳过、
+    /// 改由横幅提示（不要误把可解密条目标成 0）。
+    pub async fn verify_decryptable_on_startup(
+        &self,
+        decryptor: &dyn crate::crypto::Decryptor,
+    ) -> SqliteResult<VerifyReport> {
+        let rows: Vec<(i64, String, Option<Vec<u8>>)> = self
+            .with_conn(|conn| {
+                let mut stmt =
+                    conn.prepare("SELECT id, content, nonce FROM entries WHERE is_vault = 1")?;
+                let rows = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                    ))
+                })?;
+                rows.collect()
+            })
+            .await?;
+
+        let mut report = VerifyReport::default();
+        for (id, content, nonce) in rows {
+            report.checked += 1;
+            let ok = match nonce {
+                Some(n) => decryptor.decrypt(&content, &n).is_ok(),
+                None => false,
+            };
+            if !ok {
+                report.undecryptable += 1;
+            }
+            self.with_conn(move |conn| {
+                conn.execute(
+                    "UPDATE entries SET is_decryptable = ?1 WHERE id = ?2",
+                    params![ok as i32, id],
+                )?;
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(report)
+    }
+
+    /// 批量删除不可解密的加密区条目（`is_vault=1 AND is_decryptable=0`）。
+    /// 返回被删除的行数（plan U9：「清除不可解密条目」入口）。
+    pub async fn clear_undecryptable(&self) -> SqliteResult<usize> {
+        self.with_conn(|conn| {
+            let n = conn.execute(
+                "DELETE FROM entries WHERE is_vault = 1 AND is_decryptable = 0",
+                [],
+            )?;
+            Ok(n)
+        })
+        .await
+    }
+}
+
+/// [`Storage::move_to_vault`] 的错误：区分「Keychain 不可用（拒绝加密）」与 SQLite 错误。
+#[derive(Debug)]
+pub enum VaultError {
+    /// SQLite 层错误。
+    Sqlite(rusqlite::Error),
+    /// 加密失败（多为 Keychain 不可用）。条目保持明文未加密。
+    Crypto(clipvault_core::crypto::CryptoError),
+}
+
+impl std::fmt::Display for VaultError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VaultError::Sqlite(e) => write!(f, "数据库错误：{e}"),
+            VaultError::Crypto(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for VaultError {}
+
+/// [`Storage::move_to_vault_bulk`] 的结果汇总。
+#[derive(Debug, Default, Clone)]
+pub struct BulkVaultReport {
+    /// 成功加密的条目 id。
+    pub succeeded: Vec<i64>,
+    /// 加密失败、已回退为明文的条目 id。
+    pub failed: Vec<i64>,
+    /// 首个失败原因（用于 toast）。
+    pub last_error: Option<String>,
+}
+
+/// [`Storage::verify_decryptable_on_startup`] 的结果汇总。
+#[derive(Debug, Default, Clone)]
+pub struct VerifyReport {
+    /// 检查过的加密区条目数。
+    pub checked: usize,
+    /// 其中不可解密（`is_decryptable` 置 0）的条目数。
+    pub undecryptable: usize,
 }
 
 // ----------------------------------------------------------------
@@ -696,7 +936,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 1);
+        assert_eq!(uv, 2);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn

@@ -42,6 +42,28 @@ fn main() {
                 skip_next: skip_next.clone(),
             });
 
+            // 3.5 U9：启动时校验加密区条目的可解密性（仅 macOS 且 Keychain 可用）。
+            //     Keychain 不可用时**跳过**（不误标 is_decryptable=0），由横幅提示。
+            #[cfg(target_os = "macos")]
+            {
+                use clipvault_core::crypto::KeyProvider;
+                if clipvault::crypto::KeychainKeyProvider::new()
+                    .data_key()
+                    .is_ok()
+                {
+                    let storage_for_verify = storage.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let cipher = clipvault::crypto::default_vault_cipher();
+                        if let Err(e) = storage_for_verify
+                            .verify_decryptable_on_startup(&cipher)
+                            .await
+                        {
+                            eprintln!("加密区可解密性校验失败：{e}");
+                        }
+                    });
+                }
+            }
+
             // 4. 后台剪贴板 watcher（U3），与上面共享同一批开关。
             let watcher = Watcher::new(storage, guest_mode, skip_next);
             tauri::async_runtime::spawn(watcher.run());
@@ -68,6 +90,10 @@ fn main() {
             commands::set_guest_mode,
             commands::get_guest_mode,
             commands::set_skip_next,
+            commands::keychain_available,
+            commands::move_to_vault,
+            commands::list_vault,
+            commands::clear_undecryptable,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClipVault");

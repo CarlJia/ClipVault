@@ -8,6 +8,7 @@
 
 pub mod classify;
 pub mod commands;
+pub mod crypto;
 pub mod hotkey;
 pub mod pasteback;
 pub mod pin;
@@ -16,6 +17,8 @@ pub mod storage;
 pub mod tray;
 pub mod watcher;
 
+#[cfg(test)]
+mod crypto_test;
 #[cfg(test)]
 mod notes_test;
 #[cfg(test)]

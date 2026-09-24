@@ -46,6 +46,8 @@ pub struct EntryDto {
     pub is_pinned: bool,
     pub pinned_at: Option<i64>,
     pub is_vault: bool,
+    /// 加密区条目是否可解密（`false` → UI 显示「无法解密」徽标，U9）。
+    pub is_decryptable: bool,
     pub created_at: i64,
 }
 
@@ -104,6 +106,7 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
                 is_pinned: e.is_pinned,
                 pinned_at: e.pinned_at,
                 is_vault: e.is_vault,
+                is_decryptable: e.is_decryptable,
                 created_at: e.created_at,
             }
         })
@@ -258,7 +261,22 @@ pub async fn paste_entry(
     {
         use crate::pasteback::{
             CGEVENT_FAIL_MSG, MacosBackend, PasteError, PasteOutcome, RealAccessibilityChecker,
-            VAULT_SEAM_MSG, WINDOW_SWITCHED_MSG, perform_paste,
+            VAULT_DECRYPT_FAIL_MSG, WINDOW_SWITCHED_MSG, perform_paste,
+        };
+
+        // 加密区条目：不可解密（如迁移机器后旧 key 丢失）直接拒绝，避免把密文贴出。
+        if entry.is_vault && !entry.is_decryptable {
+            return Err(VAULT_DECRYPT_FAIL_MSG.to_string());
+        }
+        // vault 条目需要 nonce 才能解密（在锁外、spawn_blocking 前异步取出）。
+        let nonce = if entry.is_vault {
+            state
+                .storage
+                .get_vault_nonce(id)
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            None
         };
 
         let prev = crate::hotkey::last_frontmost();
@@ -266,7 +284,16 @@ pub async fn paste_entry(
         let outcome = tauri::async_runtime::spawn_blocking(move || {
             let checker = RealAccessibilityChecker;
             let backend = MacosBackend::new(win);
-            perform_paste(&checker, &backend, &entry, prev.as_deref())
+            // Keychain 数据密钥解密器；非 vault 条目不会触达它（不会命中 Keychain）。
+            let decryptor = crate::crypto::default_vault_cipher();
+            perform_paste(
+                &checker,
+                &backend,
+                &entry,
+                prev.as_deref(),
+                nonce.as_deref(),
+                &decryptor,
+            )
         })
         .await
         .map_err(|e| e.to_string())?;
@@ -294,7 +321,7 @@ pub async fn paste_entry(
                 })
             }
             Err(PasteError::MissingAccessibility) => Err(ERR_MISSING_ACCESSIBILITY.to_string()),
-            Err(PasteError::VaultDecryptUnimplemented) => Err(VAULT_SEAM_MSG.to_string()),
+            Err(PasteError::VaultDecryptFailed) => Err(VAULT_DECRYPT_FAIL_MSG.to_string()),
             Err(PasteError::UnsupportedPlatform) => Err("回贴仅支持 macOS".to_string()),
         }
     }
@@ -398,4 +425,73 @@ pub fn get_guest_mode(state: State<'_, AppState>) -> bool {
 #[tauri::command]
 pub fn set_skip_next(state: State<'_, AppState>) {
     state.skip_next.store(true, Ordering::SeqCst);
+}
+
+// ----------------------------------------------------------------
+// 加密区 / Vault（U9 / R12）
+// ----------------------------------------------------------------
+
+/// Keychain 数据密钥当前是否可用（读取或首次创建成功）。
+///
+/// 前端据此决定是否显示「⚠️ Keychain 不可用，加密区不可用」横幅（plan U9）。
+/// 首次调用可能触发密钥创建（`SecItemAdd`）；成功后进程内缓存。
+#[tauri::command]
+pub fn keychain_available() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        use clipvault_core::crypto::KeyProvider;
+        crate::crypto::KeychainKeyProvider::new().data_key().is_ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// 把一条明文条目移入加密区（AES-GCM 加密 + Keychain 密钥）。
+///
+/// Keychain 不可用时返回 `Err`，条目保持明文未加密（plan U9：绝不静默写明文进
+/// vault）；前端据此弹 toast + 展示横幅。
+#[tauri::command]
+pub async fn move_to_vault(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let cipher = crate::crypto::default_vault_cipher();
+        state
+            .storage
+            .move_to_vault(id, &cipher)
+            .await
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (id, state);
+        Err("加密区仅支持 macOS".to_string())
+    }
+}
+
+/// 列出加密区条目（元数据；`content` 已清空，不外泄密文）。供 Settings 加密区管理。
+#[tauri::command]
+pub async fn list_vault(state: State<'_, AppState>) -> Result<Vec<EntryDto>, String> {
+    let entries = state
+        .storage
+        .list_vault_entries()
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut dtos = to_dtos(&state, entries).await?;
+    for d in &mut dtos {
+        // 密文不下发前端；UI 按 is_decryptable / note / 类别 / 时间展示。
+        d.content = String::new();
+    }
+    Ok(dtos)
+}
+
+/// 批量删除不可解密的加密区条目（`is_decryptable=0`）。返回删除条数（plan U9）。
+#[tauri::command]
+pub async fn clear_undecryptable(state: State<'_, AppState>) -> Result<usize, String> {
+    state
+        .storage
+        .clear_undecryptable()
+        .await
+        .map_err(|e| e.to_string())
 }

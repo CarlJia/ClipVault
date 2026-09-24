@@ -4,6 +4,7 @@
 //! future test binaries.
 
 pub mod category;
+pub mod crypto;
 pub mod entry;
 pub mod schema;
 

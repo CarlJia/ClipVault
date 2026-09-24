@@ -4,6 +4,7 @@
 // U10 会补上访客 / skip 开关的持久化。
 
 import { invoke } from "@tauri-apps/api/core";
+import type { EntryDto } from "./panel";
 
 /** `paste_entry` 的返回体：区分回贴成功分支与对应固定 toast 文案。 */
 export interface PasteResult {
@@ -119,3 +120,52 @@ export async function setGuestMode(enabled: boolean): Promise<boolean> {
     return !enabled;
   }
 }
+
+// ----------------------------------------------------------------
+// 加密区 / Vault（U9 / R12）
+// ----------------------------------------------------------------
+
+/** 查询 Keychain 数据密钥是否可用（决定加密区是否可用 + 是否显示横幅）。 */
+export async function keychainAvailable(): Promise<boolean> {
+  try {
+    return await invoke<boolean>("keychain_available");
+  } catch {
+    return false;
+  }
+}
+
+/** 把条目移入加密区（AES-GCM + Keychain）。Keychain 不可用时抛出错误。 */
+export async function moveToVault(id: number): Promise<void> {
+  await invoke("move_to_vault", { id });
+}
+
+/** 列出加密区条目（元数据；content 已被后端清空）。 */
+export async function listVault(): Promise<EntryDto[]> {
+  return await invoke<EntryDto[]>("list_vault");
+}
+
+/** 批量删除不可解密条目，返回删除条数。 */
+export async function clearUndecryptable(): Promise<number> {
+  return await invoke<number>("clear_undecryptable");
+}
+
+/**
+ * 刷新「Keychain 不可用」横幅（plan U9）：Keychain 不可用时持续显示，
+ * 提示加密区不可用；恢复后自动隐藏。
+ */
+export async function refreshKeychainBanner(banner: HTMLElement): Promise<void> {
+  const ok = await keychainAvailable();
+  if (ok) {
+    banner.classList.add("hidden");
+    banner.innerHTML = "";
+    return;
+  }
+  banner.classList.remove("hidden");
+  banner.innerHTML = `
+    <span class="banner-icon">􀇾</span>
+    <div class="banner-body">
+      <div class="banner-title">⚠️ Keychain 不可用，加密区暂不可用</div>
+      <div class="banner-sub">无法读取或创建数据密钥；移入加密区与解密回贴将失败。请检查系统钥匙串访问权限。</div>
+    </div>`;
+}
+

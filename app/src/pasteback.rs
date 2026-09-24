@@ -35,16 +35,17 @@ use clipvault_core::Entry;
 pub const WINDOW_SWITCHED_MSG: &str = "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴";
 /// CGEventPost 失败回退的固定提示(计划 U8 step 4,文案固定)。
 pub const CGEVENT_FAIL_MSG: &str = "回贴失败,内容已复制到剪贴板,请手动 ⌘V";
-/// 加密区条目在 U8 阶段的解密接缝错误文案(真正实现留给 U9)。
-pub const VAULT_SEAM_MSG: &str = "加密条目解密尚未实现(U9)";
+/// 加密区条目解密失败的提示（U9：Keychain 不可用或密钥不匹配 → 不回贴）。
+pub const VAULT_DECRYPT_FAIL_MSG: &str = "加密条目解密失败（Keychain 不可用或密钥不匹配）";
 
 /// 回贴失败的类型化原因。前端据此区分「显示 Accessibility 横幅」与「toast」。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PasteError {
     /// 进程未获得 Accessibility 授权:不写剪贴板、不模拟按键(AE7)。
     MissingAccessibility,
-    /// 加密区条目:U8 不解密,留给 U9 的接缝错误。
-    VaultDecryptUnimplemented,
+    /// 加密区条目解密失败（Keychain 不可用 / 密钥不匹配 / nonce 缺失）。
+    /// 不写剪贴板、不模拟按键（U9：不把密文当明文贴出）。
+    VaultDecryptFailed,
     /// 非 macOS 平台:无回贴能力。
     UnsupportedPlatform,
 }
@@ -84,14 +85,24 @@ pub trait PasteBackend {
     fn frontmost_app(&self) -> Option<String>;
 }
 
-/// 加密区解密接缝(U9 territory)。
+/// 加密区解密接缝（U9 已实现）。
 ///
-/// U8 不实现 AES-GCM:非加密条目直接返回明文;`is_vault == true` 的条目
-/// 返回 [`PasteError::VaultDecryptUnimplemented`]。U9 将把此函数替换为
-/// 「Keychain 取 key → AES-GCM 解密」的真实实现(或注入一个 trait 版本)。
-pub fn decrypt_content(entry: &Entry) -> Result<String, PasteError> {
+/// - 非 vault 条目：直接返回明文 `content`（`nonce` / `decryptor` 被忽略）。
+/// - vault 条目：用 `decryptor`（Keychain 数据密钥 + AES-GCM）解密 `content`
+///   （base64 密文）配 `nonce`。Keychain 不可用、密钥不匹配或 nonce 缺失 →
+///   返回 [`PasteError::VaultDecryptFailed`]，**不返回错误明文**。
+///
+/// `nonce` 由调用方（`commands::paste_entry`）在读条目时一并从存储取出。
+pub fn decrypt_content(
+    entry: &Entry,
+    nonce: Option<&[u8]>,
+    decryptor: &dyn crate::crypto::Decryptor,
+) -> Result<String, PasteError> {
     if entry.is_vault {
-        Err(PasteError::VaultDecryptUnimplemented)
+        let nonce = nonce.ok_or(PasteError::VaultDecryptFailed)?;
+        decryptor
+            .decrypt(&entry.content, nonce)
+            .map_err(|_| PasteError::VaultDecryptFailed)
     } else {
         Ok(entry.content.clone())
     }
@@ -102,7 +113,8 @@ pub fn decrypt_content(entry: &Entry) -> Result<String, PasteError> {
 /// 顺序对应计划 U8 Approach:
 /// 1. 每次调用先 `is_trusted()` 重新校验;未授权 → [`PasteError::MissingAccessibility`],
 ///    **不触碰剪贴板、不模拟按键**(AE7)。
-/// 2. 解析内容(加密区接缝:vault 条目返回 U9 seam 错误,不解密)。
+/// 2. 解析内容(加密区接缝:vault 条目走 `decryptor` 解密,失败 →
+///    [`PasteError::VaultDecryptFailed`],不写剪贴板)。
 /// 3. `write_clipboard`。
 /// 4. `refocus_target`(隐藏面板,把焦点还给目标应用)。
 /// 5. `simulate_paste`;失败 → [`PasteOutcome::ClipboardOnly`](内容已在剪贴板)。
@@ -113,6 +125,8 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
     backend: &B,
     entry: &Entry,
     prev_frontmost: Option<&str>,
+    nonce: Option<&[u8]>,
+    decryptor: &dyn crate::crypto::Decryptor,
 ) -> Result<PasteOutcome, PasteError> {
     // 1. 每调用重新校验(防 TCC 静默失效)。
     if !checker.is_trusted() {
@@ -120,7 +134,7 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
     }
 
     // 2. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
-    let content = decrypt_content(entry)?;
+    let content = decrypt_content(entry, nonce, decryptor)?;
 
     // 3. 写剪贴板。
     backend.write_clipboard(&content);

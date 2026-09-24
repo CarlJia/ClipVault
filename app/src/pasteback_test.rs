@@ -7,7 +7,9 @@
 use std::cell::RefCell;
 
 use clipvault_core::Entry;
+use clipvault_core::crypto::CryptoError;
 
+use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, CGEVENT_FAIL_MSG, InjectError, PasteBackend, PasteError, PasteOutcome,
     WINDOW_SWITCHED_MSG, perform_paste,
@@ -21,6 +23,27 @@ struct MockChecker {
 impl AccessibilityChecker for MockChecker {
     fn is_trusted(&self) -> bool {
         self.trusted
+    }
+}
+
+/// 解密 mock：非 vault 条目不会触达它。`Ok(plaintext)` 模拟 Keychain 可用、
+/// 解密成功；`Err` 模拟 Keychain 不可用 / 密钥不匹配。
+struct MockDecryptor {
+    result: Result<String, CryptoError>,
+}
+
+impl Decryptor for MockDecryptor {
+    fn decrypt(&self, _stored_content: &str, _nonce: &[u8]) -> Result<String, CryptoError> {
+        self.result.clone()
+    }
+}
+
+/// 非 vault 分支使用的哨兵解密器：若被调用即 panic（断言 plain 路径不解密）。
+struct NeverDecryptor;
+
+impl Decryptor for NeverDecryptor {
+    fn decrypt(&self, _stored_content: &str, _nonce: &[u8]) -> Result<String, CryptoError> {
+        panic!("非加密条目不应调用解密器");
     }
 }
 
@@ -94,7 +117,14 @@ fn paste_blocked_when_not_trusted() {
     let checker = MockChecker { trusted: false };
     let backend = MockBackend::default();
 
-    let result = perform_paste(&checker, &backend, &plain_entry("hello"), None);
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &plain_entry("hello"),
+        None,
+        None,
+        &NeverDecryptor,
+    );
 
     assert_eq!(result, Err(PasteError::MissingAccessibility));
     // 未授权时绝不触碰剪贴板 / 焦点 / 模拟(AE7)。
@@ -120,6 +150,8 @@ fn paste_proceeds_when_trusted() {
         &backend,
         &plain_entry("payload"),
         Some("com.apple.TextEdit"),
+        None,
+        &NeverDecryptor,
     );
 
     assert_eq!(result, Ok(PasteOutcome::Pasted));
@@ -147,6 +179,8 @@ fn window_switched_when_frontmost_changes() {
         &backend,
         &plain_entry("x"),
         Some("com.apple.TextEdit"),
+        None,
+        &NeverDecryptor,
     );
 
     assert_eq!(result, Ok(PasteOutcome::WindowSwitched));
@@ -158,19 +192,82 @@ fn window_switched_when_frontmost_changes() {
 }
 
 #[test]
-fn vault_entry_returns_decrypt_seam_error() {
+fn vault_entry_decrypts_when_key_present() {
+    // U9：加密区条目在 Keychain 可用时解密成功并正常回贴（AE5）。
+    // （U8 旧行为 vault_entry_returns_decrypt_seam_error 已被本用例取代：
+    //  seam 由 U9 填实，vault 条目现在真正解密而非返回未实现错误。）
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend {
+        frontmost: Some("com.apple.TextEdit".to_string()),
+        ..Default::default()
+    };
+    let decryptor = MockDecryptor {
+        result: Ok("解密后的明文".to_string()),
+    };
+    let nonce = [0u8; 12];
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_entry(),
+        Some("com.apple.TextEdit"),
+        Some(&nonce),
+        &decryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    // 写入剪贴板的是解密后的明文，而非存储中的密文表示。
+    assert_eq!(
+        backend.wrote_clipboard.borrow().as_deref(),
+        Some("解密后的明文"),
+        "vault 条目回贴应写入解密后的明文"
+    );
+    assert!(*backend.simulated.borrow(), "解密成功后应触达 ⌘V 模拟");
+}
+
+#[test]
+fn vault_entry_fails_when_keychain_unavailable() {
+    // U9：Keychain 不可用（解密器报错）→ VaultDecryptFailed，绝不把密文贴出。
     let checker = MockChecker { trusted: true };
     let backend = MockBackend::default();
+    let decryptor = MockDecryptor {
+        result: Err(CryptoError::KeyUnavailable("Keychain 不可用".to_string())),
+    };
+    let nonce = [0u8; 12];
 
-    let result = perform_paste(&checker, &backend, &vault_entry(), None);
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_entry(),
+        None,
+        Some(&nonce),
+        &decryptor,
+    );
 
-    // is_vault=1 → U9 接缝错误,不 panic、不写剪贴板。
-    assert_eq!(result, Err(PasteError::VaultDecryptUnimplemented));
+    assert_eq!(result, Err(PasteError::VaultDecryptFailed));
     assert!(
         backend.wrote_clipboard.borrow().is_none(),
-        "加密区条目在 U8 不应写入剪贴板"
+        "解密失败时不应把密文写入剪贴板"
     );
-    assert!(!*backend.simulated.borrow(), "加密区条目不应触达模拟");
+    assert!(!*backend.simulated.borrow(), "解密失败时不应触达模拟");
+}
+
+#[test]
+fn vault_entry_fails_when_nonce_missing() {
+    // U9：vault 条目缺 nonce（数据损坏）→ 解密失败，安全拒绝。
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend::default();
+    let decryptor = MockDecryptor {
+        result: Ok("不该被用到".to_string()),
+    };
+
+    let result = perform_paste(&checker, &backend, &vault_entry(), None, None, &decryptor);
+
+    assert_eq!(result, Err(PasteError::VaultDecryptFailed));
+    assert!(
+        backend.wrote_clipboard.borrow().is_none(),
+        "缺 nonce 时不应写入剪贴板"
+    );
 }
 
 #[test]
@@ -181,7 +278,14 @@ fn cgevent_failure_falls_back_to_clipboard_only() {
         ..Default::default()
     };
 
-    let result = perform_paste(&checker, &backend, &plain_entry("data"), None);
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &plain_entry("data"),
+        None,
+        None,
+        &NeverDecryptor,
+    );
 
     // 注入失败 → 仅剪贴板;内容仍已写入,提示用户手动 ⌘V。
     assert_eq!(result, Ok(PasteOutcome::ClipboardOnly));
