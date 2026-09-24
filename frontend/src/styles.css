@@ -218,6 +218,23 @@ body {
   flex: 1;
   min-width: 0;
 }
+/* ⌘N 序号徽标：列表前 9 条显示，提示直选快捷键。 */
+.row-index {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--surface);
+  border-radius: 4px;
+  padding: 1px 5px;
+  min-width: 22px;
+  text-align: center;
+}
+.row.selected .row-index {
+  color: var(--accent);
+}
 .row-content {
   font-family: var(--font-mono);
   font-size: 13px;

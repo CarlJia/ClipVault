@@ -110,8 +110,14 @@ export function renderEntries(
       const subtitle = hasNote
         ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.content, 80))}</div>`
         : "";
+      // 前 9 条显示 ⌘N 序号徽标，提示直选快捷键。
+      const idxBadge =
+        i < 9
+          ? `<span class="row-index" title="⌘${i + 1} 直接选中">⌘${i + 1}</span>`
+          : "";
       return `
       <div class="row${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}">
+        ${idxBadge}
         <div class="row-main">
           ${primary}
           ${subtitle}

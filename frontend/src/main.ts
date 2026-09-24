@@ -226,6 +226,20 @@ async function load(preferId?: number): Promise<void> {
 async function activate(): Promise<void> {
   const e = currentEntry();
   if (!e) return;
+  await pasteEntry(e);
+}
+
+/** ⌘N 快捷键：把选中移到列表第 idx 条并回贴。越界则忽略。 */
+async function activateIndex(idx: number): Promise<void> {
+  if (!showingEntries() || idx < 0 || idx >= entries.length) return;
+  selected = idx;
+  paintEntries();
+  scrollToSelected();
+  await pasteEntry(entries[idx]);
+}
+
+/** 回贴一条记录:成功则隐藏面板,否则提示手动 ⌘V(AE3 / AE7)。 */
+async function pasteEntry(e: EntryDto): Promise<void> {
   try {
     const r = await invoke<PasteResult>("paste_entry", { id: e.id });
     if (r.status === "pasted") {
@@ -436,6 +450,18 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") {
     ev.preventDefault();
     void activate();
+    return;
+  }
+  // ⌘1 – ⌘9：直接选中并回贴列表中第 N 条（不带 Shift，避免撞其它组合）。
+  if (
+    (ev.metaKey || ev.ctrlKey) &&
+    !ev.shiftKey &&
+    !ev.altKey &&
+    ev.key >= "1" &&
+    ev.key <= "9"
+  ) {
+    ev.preventDefault();
+    void activateIndex(Number(ev.key) - 1);
     return;
   }
   // ⌘⇧V：打开加密区管理（放在 ⌘E 之前判断，避免与其它组合冲突）。
