@@ -26,6 +26,48 @@
         <div id="list" class="list"></div>
         <div class="hint">↩ 粘贴 · ⌘E 备注 · ⌘P 置顶 · esc 关闭</div>
         <div id="toast" class="toast hidden"></div>
+
+        <!-- 备注 / 标签编辑器（U6）。默认隐藏，⌘E 唤出。 -->
+        <div id="editor" class="editor hidden">
+          <div class="editor-card">
+            <div class="editor-head">
+              <span class="editor-title">备注 &amp; 标签</span>
+              <span id="editor-state" class="editor-state"></span>
+            </div>
+            <div class="editor-preview" id="editor-preview"></div>
+            <div class="editor-field">
+              <label class="editor-label" for="editor-note">备注</label>
+              <textarea
+                id="editor-note"
+                class="editor-note"
+                maxlength="2000"
+                rows="4"
+                placeholder="添加备注…（进入搜索索引）"
+                spellcheck="false"
+              ></textarea>
+              <div class="editor-counter" id="editor-counter">0 / 2000</div>
+            </div>
+            <div class="editor-field">
+              <label class="editor-label" for="editor-tag-input">标签</label>
+              <div class="editor-chips" id="editor-chips">
+                <input
+                  id="editor-tag-input"
+                  class="editor-tag-input"
+                  type="text"
+                  placeholder="输入后回车添加"
+                  autocomplete="off"
+                  autocorrect="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                />
+              </div>
+            </div>
+            <div class="editor-foot">
+              <span class="editor-hint">⌘S 保存 · esc 关闭</span>
+              <button id="editor-retry" class="editor-retry hidden">重试</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

@@ -18,6 +18,11 @@ import {
   renderTags,
 } from "./panel";
 import { refreshAccessibilityBanner } from "./settings";
+import {
+  isEditorOpen,
+  openEditor,
+  setEditorCloseHandler,
+} from "./editor";
 
 const LIMIT = 50;
 const SEARCH_DEBOUNCE_MS = 100;
@@ -163,11 +168,18 @@ async function activate(): Promise<void> {
   }
 }
 
-async function editNote(): Promise<void> {
+function editNote(): void {
   const e = currentEntry();
   if (!e) return;
-  await invoke<string>("open_note_editor", { id: e.id }).catch(() => "");
-  toast("备注 / 标签编辑将在 U6 接入");
+  openEditor(e, (dto) => {
+    // 保存成功：就地更新对应行并重绘，无需整表刷新。
+    const idx = entries.findIndex((x) => x.id === dto.id);
+    if (idx >= 0) {
+      entries[idx] = dto;
+      paintEntries();
+      scrollToSelected();
+    }
+  });
 }
 
 async function togglePin(): Promise<void> {
@@ -250,6 +262,8 @@ listEl.addEventListener("dblclick", (ev) => {
 });
 
 document.addEventListener("keydown", (ev) => {
+  // 编辑器打开时，列表快捷键让位给编辑器（其 Esc / ⌘S 已在 editor.ts 处理）。
+  if (isEditorOpen()) return;
   if (ev.key === "Escape") {
     ev.preventDefault();
     void invoke("hide_panel");
@@ -272,7 +286,7 @@ document.addEventListener("keydown", (ev) => {
   }
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
     ev.preventDefault();
-    void editNote();
+    editNote();
     return;
   }
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "p" || ev.key === "P")) {
@@ -295,5 +309,9 @@ window.addEventListener("focus", () => {
 
 renderTabs();
 searchEl.focus();
+// 编辑器 Esc 关闭后把焦点交还搜索框 / 列表。
+setEditorCloseHandler(() => {
+  searchEl.focus();
+});
 void refreshAccessibilityBanner(bannerEl);
 void load();

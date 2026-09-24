@@ -294,3 +294,189 @@ body {
 .toast.hidden {
   display: none;
 }
+
+/* ---------------------------------------------------------------- */
+/* 备注 / 标签编辑器（U6）                                            */
+/* ---------------------------------------------------------------- */
+
+.editor {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.editor.hidden {
+  display: none;
+}
+
+.editor-card {
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(40, 40, 46, 0.96);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.editor-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.editor-state {
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 16px;
+}
+.editor-state.state-dirty {
+  color: #ffd60a;
+}
+.editor-state.state-saving {
+  color: var(--accent);
+}
+.editor-state.state-saved {
+  color: #30d158;
+}
+.editor-state.state-error {
+  color: var(--danger);
+}
+
+.editor-preview {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  max-height: 44px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.editor-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.editor-note {
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  outline: none;
+  user-select: text;
+}
+.editor-note:focus {
+  border-color: var(--accent);
+}
+.editor-counter {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.editor-counter.at-cap {
+  color: var(--danger);
+}
+
+.editor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 6px 8px;
+  min-height: 38px;
+}
+.editor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 6px;
+  background: var(--chip-tag);
+  color: var(--text);
+  white-space: nowrap;
+}
+.chip-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.chip-x:hover {
+  color: var(--danger);
+}
+.editor-tag-input {
+  flex: 1;
+  min-width: 80px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  user-select: text;
+}
+.editor-tag-input::placeholder {
+  color: var(--muted);
+}
+
+.editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.editor-hint {
+  font-size: 11px;
+  color: var(--muted);
+}
+.editor-retry {
+  border: 1px solid var(--danger);
+  background: transparent;
+  color: var(--danger);
+  border-radius: 6px;
+  padding: 3px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.editor-retry:hover {
+  background: rgba(255, 69, 58, 0.14);
+}
+.editor-retry.hidden {
+  display: none;
+}

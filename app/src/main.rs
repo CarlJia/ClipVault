@@ -63,7 +63,7 @@ fn main() {
             commands::hide_panel,
             commands::paste_entry,
             commands::toggle_pin,
-            commands::open_note_editor,
+            commands::update_entry,
             commands::set_guest_mode,
             commands::get_guest_mode,
             commands::set_skip_next,

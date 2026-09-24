@@ -6,7 +6,7 @@
 //!
 //! - `search_results` 的 FTS 排序细化 → U5
 //! - `toggle_pin` 的置顶排序 → U7
-//! - `open_note_editor` 的备注/标签编辑 → U6
+//! - `update_entry` 的备注/标签编辑 → U6
 //! - `paste_entry` 的 CGEvent 回贴注入 → U8
 //! - `set_guest_mode` / `set_skip_next` 的持久化 → U10
 //!
@@ -212,11 +212,54 @@ pub fn toggle_pin(id: i64) -> Result<String, String> {
     Ok("unimplemented:U7".to_string())
 }
 
-/// U6 完成：打开备注/标签编辑器。U4 仅占位。
+/// U6 完成：写入备注 + 标签，返回刷新后的 [`EntryDto`] 供前端重绘该行。
+///
+/// - 标签为集合语义：先去除首尾空白、丢弃空串、去重（保序），再整组替换
+///   该条目的既有标签（见 [`Storage::update_note_and_tags`]）。
+/// - 备注 2000 字符上限（R8）在此处与存储层双重校验；超限返回 `Err`，
+///   命中前端保存状态机的 `error` 分支。
+/// - 备注 / 标签写入后由 U2 的触发器同步进 FTS，搜索立即命中（AE2）。
 #[tauri::command]
-pub fn open_note_editor(id: i64) -> Result<String, String> {
-    let _ = id;
-    Ok("unimplemented:U6".to_string())
+pub async fn update_entry(
+    id: i64,
+    note: String,
+    tags: Vec<String>,
+    state: State<'_, AppState>,
+) -> Result<EntryDto, String> {
+    if note.chars().count() > crate::storage::MAX_NOTE_CHARS {
+        return Err(format!(
+            "备注超过 {} 字符上限",
+            crate::storage::MAX_NOTE_CHARS
+        ));
+    }
+
+    // 标签集合归一化：trim → 去空 → 去重（保序）。
+    let mut seen = std::collections::HashSet::new();
+    let tags: Vec<String> = tags
+        .into_iter()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .filter(|t| seen.insert(t.clone()))
+        .collect();
+
+    state
+        .storage
+        .update_note_and_tags(id, &note, &tags)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let entry = state
+        .storage
+        .get_by_id(id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("entry {id} 不存在"))?;
+
+    to_dtos(&state, vec![entry])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "无法构建 EntryDto".to_string())
 }
 
 /// 设置访客模式开关。写入与 watcher 共享的原子布尔，并刷新托盘状态。

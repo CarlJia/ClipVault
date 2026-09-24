@@ -12,6 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+/// 备注字符数上限（R8）。UI 与服务端都以此为界；超过则拒绝保存，
+/// 触发前端保存状态机的 `error` 分支。按 Unicode 标量（`char`）计数。
+pub const MAX_NOTE_CHARS: usize = 2000;
+
 /// Default database file location.
 pub fn default_db_path() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable must be set on macOS");
@@ -172,29 +176,39 @@ impl Storage {
 
     /// Update the note and tags for an entry.
     ///
-    /// Tags are upserted: all existing tags for the entry are replaced
-    /// with the new list.  The FTS `tags_text` column is kept in sync
-    /// by the database triggers.
+    /// Tags are replaced wholesale: all existing tag rows for the entry
+    /// are deleted and the new set is inserted (set semantics, R7).  The
+    /// FTS `tags_text` column is kept in sync by the database triggers.
+    ///
+    /// # Errors
+    /// Rejects notes longer than [`MAX_NOTE_CHARS`] characters (R8) with
+    /// [`rusqlite::Error::InvalidParameterName`]; nothing is written in
+    /// that case.
     pub async fn update_note_and_tags(
         &self,
         id: i64,
         note: &str,
         tags: &[String],
     ) -> SqliteResult<()> {
+        if note.chars().count() > MAX_NOTE_CHARS {
+            return Err(rusqlite::Error::InvalidParameterName(format!(
+                "note exceeds {MAX_NOTE_CHARS}-char cap"
+            )));
+        }
         self.with_conn(|conn| {
-            conn.execute(
+            let tx = conn.transaction()?;
+            tx.execute(
                 "UPDATE entries SET note = ?1 WHERE id = ?2",
                 params![note, id],
             )?;
-
-            conn.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])?;
+            tx.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])?;
             for tag in tags {
-                conn.execute(
+                tx.execute(
                     "INSERT INTO tags (entry_id, tag) VALUES (?1, ?2)",
                     params![id, tag],
                 )?;
             }
-
+            tx.commit()?;
             Ok(())
         })
         .await

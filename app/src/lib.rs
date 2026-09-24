@@ -15,6 +15,8 @@ pub mod tray;
 pub mod watcher;
 
 #[cfg(test)]
+mod notes_test;
+#[cfg(test)]
 mod search_test;
 #[cfg(test)]
 mod watcher_test;
