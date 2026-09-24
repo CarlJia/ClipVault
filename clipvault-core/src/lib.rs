@@ -1,9 +1,9 @@
 //! ClipVault core library.
 //!
-//! U1 scaffold: placeholder only. Storage, crypto, and category
-//! logic will be added in subsequent implementation units.
+//! Shared types and storage primitives used by the app binary and
+//! future test binaries.
 
-/// Placeholder function — replaced by U2 storage layer.
-pub fn placeholder() -> &'static str {
-    "ClipVault core"
-}
+pub mod entry;
+pub mod schema;
+
+pub use entry::Entry;

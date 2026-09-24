@@ -1,0 +1,218 @@
+//! Schema definitions and migration runner for ClipVault SQLite database.
+//!
+//! Schema version managed via `PRAGMA user_version`.
+//! Currently ships SCHEMA_V1 only.
+
+use rusqlite::{Connection, Result};
+
+/// DDL for schema version 1.
+/// Tables: entries, tags, settings.
+/// FTS5 virtual table: entries_fts with sync triggers.
+pub const SCHEMA_V1: &str = r#"
+CREATE TABLE IF NOT EXISTS entries (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    content_hash    TEXT    NOT NULL UNIQUE,
+    content         TEXT    NOT NULL,
+    note            TEXT    NOT NULL DEFAULT '',
+    auto_category   TEXT    NOT NULL DEFAULT 'plain',
+    is_pinned       INTEGER NOT NULL DEFAULT 0,
+    pinned_at       INTEGER,
+    is_vault        INTEGER NOT NULL DEFAULT 0,
+    is_decryptable  INTEGER NOT NULL DEFAULT 1,
+    created_at      INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+);
+
+CREATE TABLE IF NOT EXISTS tags (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+    tag      TEXT    NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- FTS5 virtual table for full-text search on non-vault entries.
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+    content,
+    note,
+    tags_text,
+    tokenize='unicode61'
+);
+
+-- Sync trigger: INSERT on entries (skip vault rows)
+CREATE TRIGGER IF NOT EXISTS entries_fts_insert
+AFTER INSERT ON entries
+WHEN NEW.is_vault = 0
+BEGIN
+    INSERT INTO entries_fts(rowid, content, note, tags_text)
+    VALUES (
+        NEW.id,
+        NEW.content,
+        NEW.note,
+        COALESCE((SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = NEW.id), '')
+    );
+END;
+
+-- Sync trigger: UPDATE on entries (handle is_vault transitions)
+CREATE TRIGGER IF NOT EXISTS entries_fts_update
+AFTER UPDATE ON entries
+BEGIN
+    -- If the row is now non-vault, upsert into FTS
+    DELETE FROM entries_fts WHERE rowid = OLD.id;
+    INSERT INTO entries_fts(rowid, content, note, tags_text)
+    SELECT
+        NEW.id,
+        CASE WHEN NEW.is_vault = 0 THEN NEW.content ELSE '' END,
+        CASE WHEN NEW.is_vault = 0 THEN NEW.note ELSE '' END,
+        CASE WHEN NEW.is_vault = 0 THEN COALESCE((SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = NEW.id), '') ELSE '' END
+    WHERE NEW.is_vault = 0;
+END;
+
+-- Sync trigger: DELETE on entries
+CREATE TRIGGER IF NOT EXISTS entries_fts_delete
+AFTER DELETE ON entries
+BEGIN
+    DELETE FROM entries_fts WHERE rowid = OLD.id;
+END;
+
+-- Sync trigger: INSERT on tags — update tags_text in FTS for the associated entry
+CREATE TRIGGER IF NOT EXISTS tags_fts_insert
+AFTER INSERT ON tags
+WHEN (SELECT is_vault FROM entries WHERE id = NEW.entry_id) = 0
+BEGIN
+    UPDATE entries_fts
+    SET tags_text = (
+        SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = NEW.entry_id
+    )
+    WHERE rowid = NEW.entry_id;
+END;
+
+-- Sync trigger: DELETE on tags — update tags_text in FTS for the associated entry
+CREATE TRIGGER IF NOT EXISTS tags_fts_delete
+AFTER DELETE ON tags
+WHEN (SELECT is_vault FROM entries WHERE id = OLD.entry_id) = 0
+BEGIN
+    UPDATE entries_fts
+    SET tags_text = (
+        SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = OLD.entry_id
+    )
+    WHERE rowid = OLD.entry_id;
+END;
+"#;
+
+/// Run all schema migrations, bringing the database from whatever
+/// `user_version` it currently has up to date.
+///
+/// Currently handles 0 → 1 only.
+pub fn run_migrations(conn: &Connection) -> Result<()> {
+    let user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+
+    if user_version == 0 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SCHEMA_V1)?;
+        tx.execute("PRAGMA user_version = 1", [])?;
+        tx.commit()?;
+    }
+
+    Ok(())
+}
+
+/// Run migrations on a fresh in-memory database, returning the connection.
+/// Used by app-level integration tests.
+#[cfg(test)]
+pub fn new_test_db() -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    run_migrations(&conn)?;
+    Ok(conn)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::OpenFlags;
+
+    fn in_memory_rw() -> Connection {
+        Connection::open_in_memory_with_flags(
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn schema_v1_runs_without_error() {
+        let conn = in_memory_rw();
+        run_migrations(&conn).unwrap();
+        let uv: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, 1);
+    }
+
+    #[test]
+    fn tables_exist() {
+        let conn = in_memory_rw();
+        run_migrations(&conn).unwrap();
+
+        for table in &["entries", "tags", "settings"] {
+            let count: i32 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "table '{table}' should exist");
+        }
+
+        let count: i32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='entries_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "entries_fts should exist");
+    }
+
+    #[test]
+    fn migration_idempotent() {
+        let conn = in_memory_rw();
+        run_migrations(&conn).unwrap();
+        run_migrations(&conn).unwrap(); // second call should be no-op
+        let uv: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, 1);
+    }
+
+    #[test]
+    fn schema_migration_zero_to_one() {
+        // Simulate a fresh DB with user_version=0.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("PRAGMA user_version = 0", []).unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let uv: i32 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, 1);
+
+        for table in &["entries", "tags", "settings", "entries_fts"] {
+            let cnt: i32 = conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='{table}'"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(cnt, 1, "table '{table}' should exist after migration");
+        }
+    }
+}
