@@ -28,6 +28,19 @@ use tauri::Manager;
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
+            // 开发模式 (`cargo tauri dev`) 下 binary 直接从 target/debug 运行,
+            // 不在 .app bundle 里,系统读不到 Info.plist 的 LSUIElement=true,
+            // 会按普通 foreground app 处理、Dock 出现图标。打包后的 .app 由
+            // Info.plist 自然隐藏,但为保持开发/打包行为一致,运行时显式设
+            // 激活策略为 Accessory(菜单栏 app,无 Dock)。`macos-private-api`
+            // feature 已启用。
+            #[cfg(target_os = "macos")]
+            {
+                use tauri::ActivationPolicy;
+                if let Err(e) = app.handle().set_activation_policy(ActivationPolicy::Accessory) {
+                    eprintln!("clipvault: 设置 ActivationPolicy::Accessory 失败：{e}");
+                }
+            }
             // 1. 打开存储。
             let storage = Arc::new(Storage::open(&default_db_path())?);
 
