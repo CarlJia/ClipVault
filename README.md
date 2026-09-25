@@ -53,14 +53,56 @@ ClipVault 常驻菜单栏，持续记录你复制过的纯文本，通过全局�
 
 ## Accessibility 首次授权引导
 
-ClipVault 的「按 `Enter` 回贴到当前光标」依赖 macOS **Accessibility（辅助功能）** 权限来模拟 ⌘V 按键。
+ClipVault 的「回贴到当前光标」功能——`Enter` 选中回贴、`⌘1–9` 序号直选回贴、双击列表行回贴——**全部**依赖 macOS **Accessibility（辅助功能）** 权限来模拟 ⌘V 按键。**写系统剪贴板本身不需要该权限**（`NSPasteboard.setString` 始终会执行），但按键模拟必须有授权，未授权时只能回退到「内容已在剪贴板，请手动 ⌘V」。
 
-1. 首次触发回贴时，ClipVault 会弹出引导，点「打开系统设置」跳到
-   「系统设置 → 隐私与安全性 → 辅助功能」。
-2. 在列表中打开 ClipVault 的开关。
-3. 无需重启应用，下一次回贴即可生效。
+### 打包后的 `.app`（正式使用）
 
-**未授权时**：浏览、搜索、加标签、加备注等功能全部可用；仅「回贴」不可用，此时 ClipVault 会明确提示需要授权，并把内容写入剪贴板，你可手动 ⌘V 粘贴。
+1. 首次触发回贴时，ClipVault 面板顶部出现 **Accessibility 横幅**，点「打开系统设置」深链跳转。
+2. 在 **「系统设置 → 隐私与安全性 → 辅助功能」** 列表里找到 **ClipVault**，打开右侧开关。
+   - 首次可能需要点 🔓 解锁并输入密码 / 指纹。
+3. **无需重启**——开关打开后下次回贴自动生效（每次回贴前用 `AXIsProcessTrusted()` 重新校验，防止系统升级后 TCC 缓存失效静默丢权）。
+
+**未授权时** 浏览、搜索、加标签、加备注、Pin 置顶、访客模式、加密区**全部可用**；仅「自动回贴」不可用，此时 ClipVault 会**先把内容写入剪贴板**，再明确提示「已复制到剪贴板，请手动 ⌘V 粘贴；开启「辅助功能」后可自动回贴」，你随时可以手动 ⌘V 拿到内容——所以**未授权不是死路**。
+
+### 开发期（`cargo tauri dev`）—— 关键区别
+
+`cargo tauri dev` 跑的是 debug 版可执行文件，macOS 把 Accessibility 授权**绑定到具体的可执行文件路径 + 签名**上——所以**需要授权的不是 ClipVault 本体，而是启动它的宿主进程**（通常是你的**终端 App**：Terminal / iTerm2 / Warp / VS Code 等，因为 debug 二进制是终端 fork 出来的）。
+
+正确授权方式：
+
+1. 触发一次回贴，面板会弹 Accessibility 横幅。
+2. 手动打开 **「系统设置 → 隐私与安全性 → 辅助功能」**。
+3. 在列表里找你**正在用的终端**（点 **`+`** 添加 `/Applications/Utilities/Terminal.app` 或 `/Applications/iTerm.app` 等），打开它的开关。
+4. 不用重启，回到终端按 `cargo tauri dev` 重新启动 ClipVault 即可。
+
+容易踩的坑：
+- **找 ClipVault → 找不到**：dev 期不在 ClipVault 名字下找，要在终端名字下找。
+- **dev 二进制路径变化**：每次 clean rebuild / 切换 `target/` 偶尔会让授权失效，重新勾一下终端的开关即可；**打包后的 `.app` 没有这个问题**（路径固定 + ad-hoc 签名稳定）。
+
+### 验证是否已授权
+
+- 真的授权了 → 回贴成功后**目标应用**会收到内容，ClipVault 面板**自动隐藏**。
+- 误以为授权了但实际没 → 回贴后 ClipVault **面板不隐藏**（因为后端会重新 `window.show()`），**横幅 + toast 再次出现**告诉你「已复制到剪贴板」。
+
+更直接的命令验证（需要 SIP 关闭的环境才能读到 TCC.db，否则跳过）：
+
+```bash
+sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
+  "SELECT client,auth_value FROM access WHERE service='kTCCServiceAccessibility';" 2>/dev/null \
+  || echo "TCC.db 受 SIP 保护,直接看系统设置界面核对即可"
+```
+
+`auth_value=2` 表示已授权。读不到很正常，**直接看系统设置界面最稳**。
+
+### 仍不生效时的排障
+
+1. 确认**给对了进程**——dev 期是终端、不是 ClipVault。
+2. 在辅助功能列表里**关掉再打开**该进程开关。
+3. 完全退出 ClipVault（菜单栏 → 退出）再重开。
+4. 重置该项后重新授权（打包后）：
+   ```bash
+   tccutil reset Accessibility com.clipvault.app
+   ```
 
 ### 安全边界披露（请务必阅读）
 
