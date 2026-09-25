@@ -86,6 +86,26 @@
             </div>
           </div>
         </div>
+
+        <!-- 设置（U12）。默认隐藏，⌘, 唤出，托盘菜单也可触发。 -->
+        <div id="settings" class="editor hidden">
+          <div class="editor-card settings-card">
+            <div class="editor-head">
+              <span class="editor-title">设置</span>
+              <button id="settings-close" class="banner-btn">关闭</button>
+            </div>
+            <div class="editor-field">
+              <label class="editor-label" for="settings-opacity">面板透明度</label>
+              <div class="settings-row">
+                <input id="settings-opacity" class="slider" type="range" min="30" max="100" step="2" />
+                <span id="settings-opacity-value" class="settings-value">78%</span>
+              </div>
+            </div>
+            <div class="editor-foot">
+              <span class="editor-hint">⌘, 打开设置 · esc 关闭 · 改动即时生效,关闭时自动保存</span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

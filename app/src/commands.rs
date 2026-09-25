@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use clipvault_core::Entry;
 use rusqlite::Result as SqliteResult;
@@ -21,11 +21,15 @@ use crate::tray::{self, TrayState};
 ///
 /// `guest_mode` / `skip_next` 与 [`crate::watcher::Watcher`] 持有的是**同一批**
 /// `Arc<AtomicBool>`，因此这里的写入会被后台 watcher 立即看到（U10 完成持久化）。
+///
+/// `panel_opacity`（U12）只服务 UI 状态，watcher 不消费，但仍作为
+/// `get_panel_opacity` / `set_panel_opacity` 命令的快速读写槽，避免每次查库。
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<Storage>,
     pub guest_mode: Arc<AtomicBool>,
     pub skip_next: Arc<AtomicBool>,
+    pub panel_opacity: Arc<AtomicU32>,
 }
 
 /// 单条剪贴板记录的前端 DTO。
@@ -264,8 +268,8 @@ pub async fn paste_entry(
     #[cfg(target_os = "macos")]
     {
         use crate::pasteback::{
-            CGEVENT_FAIL_MSG, MacosBackend, PasteError, PasteOutcome, RealAccessibilityChecker,
-            VAULT_DECRYPT_FAIL_MSG, WINDOW_SWITCHED_MSG, perform_paste,
+            CGEVENT_FAIL_MSG, MacosBackend, NO_ACCESSIBILITY_MSG, PasteError, PasteOutcome,
+            RealAccessibilityChecker, VAULT_DECRYPT_FAIL_MSG, WINDOW_SWITCHED_MSG, perform_paste,
         };
 
         // 加密区条目：不可解密（如迁移机器后旧 key 丢失）直接拒绝，避免把密文贴出。
@@ -322,6 +326,16 @@ pub async fn paste_entry(
                 Ok(PasteResult {
                     status: "clipboard_only".to_string(),
                     message: CGEVENT_FAIL_MSG.to_string(),
+                })
+            }
+            Ok(PasteOutcome::NoAccessibilityClipboardOnly) => {
+                // 未授权:内容已在剪贴板,但没能自动回贴。重新显示面板,
+                // 前端据 status 亮授权横幅并提示可手动 ⌘V。
+                let _ = window.show();
+                let _ = window.set_focus();
+                Ok(PasteResult {
+                    status: "no_accessibility".to_string(),
+                    message: NO_ACCESSIBILITY_MSG.to_string(),
                 })
             }
             Err(PasteError::MissingAccessibility) => Err(ERR_MISSING_ACCESSIBILITY.to_string()),
@@ -444,6 +458,33 @@ pub fn get_guest_mode(state: State<'_, AppState>) -> bool {
 #[tauri::command]
 pub fn set_skip_next(state: State<'_, AppState>) {
     crate::privacy::set_skip_next(&state.skip_next);
+}
+
+// ----------------------------------------------------------------
+// 面板透明度（U12）
+// ----------------------------------------------------------------
+
+/// 读取当前面板透明度（0-100 整数百分比）。以运行时共享原子为准
+/// （启动时已与 `settings` 表对齐）。
+#[tauri::command]
+pub fn get_panel_opacity(state: State<'_, AppState>) -> u32 {
+    state.panel_opacity.load(Ordering::SeqCst)
+}
+
+/// 设置面板透明度（0-100 整数百分比）。
+///
+/// 写路径经 [`crate::privacy::set_panel_opacity`]：clamp 到
+/// [`crate::privacy::MIN_PANEL_OPACITY`]..=[`crate::privacy::MAX_PANEL_OPACITY`]
+/// 区间 → 更新共享原子（即时生效）→ 持久化到 `settings` 表（跨重启保留）。
+/// 返回 clamp 后的最终值，便于前端回填 slider 防漂移。
+#[tauri::command]
+pub async fn set_panel_opacity(
+    opacity: u32,
+    state: State<'_, AppState>,
+) -> Result<u32, String> {
+    crate::privacy::set_panel_opacity(&state.storage, &state.panel_opacity, opacity)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ----------------------------------------------------------------

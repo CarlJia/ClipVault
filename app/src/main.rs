@@ -16,10 +16,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use clipvault::commands::{self, AppState};
 use clipvault::hotkey;
+use clipvault::privacy;
 use clipvault::storage::{Storage, default_db_path};
 use clipvault::tray;
 use clipvault::watcher::Watcher;
@@ -45,8 +46,10 @@ fn main() {
             let storage = Arc::new(Storage::open(&default_db_path())?);
 
             // 2. 共享开关。guest_mode 持久化于 settings 表；skip_next 纯运行时。
+            //    panel_opacity（U12）持久化于 settings 表，但 watcher 不消费。
             let guest_mode = Arc::new(AtomicBool::new(false));
             let skip_next = Arc::new(AtomicBool::new(false));
+            let panel_opacity = Arc::new(AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY));
 
             // 2.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
             //     使重启后 watcher / 托盘 / 前端与上次状态一致。
@@ -55,11 +58,19 @@ fn main() {
             )
             .unwrap_or(false);
 
+            // 2.6 U12：从 settings 表加载持久化的面板透明度到原子，
+            //     使重启后前端启动即把 `--bg` CSS 变量对齐到上次状态。
+            let _initial_opacity = tauri::async_runtime::block_on(
+                clipvault::privacy::boot_load_panel_opacity(&storage, &panel_opacity),
+            )
+            .unwrap_or(privacy::DEFAULT_PANEL_OPACITY);
+
             // 3. 注册 IPC 共享状态。
             app.manage(AppState {
                 storage: storage.clone(),
                 guest_mode: guest_mode.clone(),
                 skip_next: skip_next.clone(),
+                panel_opacity: panel_opacity.clone(),
             });
 
             // 3.5 U9：启动时校验加密区条目的可解密性（仅 macOS 且 Keychain 可用）。
@@ -110,6 +121,8 @@ fn main() {
             commands::set_guest_mode,
             commands::get_guest_mode,
             commands::set_skip_next,
+            commands::get_panel_opacity,
+            commands::set_panel_opacity,
             commands::keychain_available,
             commands::move_to_vault,
             commands::list_vault,

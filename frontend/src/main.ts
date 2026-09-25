@@ -8,6 +8,7 @@
 
 import "./styles.css";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   type CategoryInfo,
   type EntryDto,
@@ -22,11 +23,13 @@ import {
   type PasteResult,
   clearUndecryptable,
   getGuestMode,
+  getPanelOpacity,
   listVault,
   moveToVault,
   refreshAccessibilityBanner,
   refreshKeychainBanner,
   setGuestMode,
+  setPanelOpacity,
   skipNextCopy,
 } from "./settings";
 import {
@@ -80,7 +83,14 @@ const vaultSubEl = document.querySelector<HTMLDivElement>("#vault-sub")!;
 const vaultCloseEl = document.querySelector<HTMLButtonElement>("#vault-close")!;
 const vaultClearEl = document.querySelector<HTMLButtonElement>("#vault-clear")!;
 
+// 设置模态元素（U12）。⌘, 唤出,托盘菜单也可触发。
+const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
+const settingsCloseEl = document.querySelector<HTMLButtonElement>("#settings-close")!;
+const opacityEl = document.querySelector<HTMLInputElement>("#settings-opacity")!;
+const opacityValueEl = document.querySelector<HTMLSpanElement>("#settings-opacity-value")!;
+
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
+const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
 
 // 当前视图是否在展示「条目列表」（可键盘导航 / 回贴）：
 // recent、all，或 标签/类别 已选中筛选项时。
@@ -402,6 +412,50 @@ vaultClearEl.addEventListener("click", () => {
 });
 
 // ----------------------------------------------------------------
+// 设置（U12）：透明度滑块 + 启动一次性对齐 CSS 变量
+// ----------------------------------------------------------------
+
+/**
+ * 把 0-100 百分比透明度即时应用到 `--bg` CSS 变量。
+ * `.panel` (`styles.css:49`) 用 `background: var(--bg)`，只动变量就一处生效，
+ * `backdrop-filter: blur(20px)` 不被破坏、不触发重排。
+ */
+function applyPanelOpacity(percent: number): void {
+  const alpha = Math.max(0, Math.min(100, percent)) / 100;
+  document.documentElement.style.setProperty(
+    "--bg",
+    `rgba(28, 28, 32, ${alpha})`,
+  );
+}
+
+/** 打开设置模态，并把 slider 位置 / 文本对齐到当前后端值。 */
+async function openSettings(): Promise<void> {
+  const v = await getPanelOpacity();
+  opacityEl.value = String(v);
+  opacityValueEl.textContent = `${v}%`;
+  settingsEl.classList.remove("hidden");
+  // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。
+  searchEl.focus();
+}
+
+function closeSettings(): void {
+  settingsEl.classList.add("hidden");
+  searchEl.focus();
+}
+
+settingsCloseEl.addEventListener("click", closeSettings);
+// `input` 事件即时改 CSS 变量 + 文本预览；`change` 事件再写库，
+// 避免拖动过程产生数十次 IPC。
+opacityEl.addEventListener("input", () => {
+  const v = Number(opacityEl.value);
+  opacityValueEl.textContent = `${v}%`;
+  applyPanelOpacity(v);
+});
+opacityEl.addEventListener("change", () => {
+  void setPanelOpacity(Number(opacityEl.value));
+});
+
+// ----------------------------------------------------------------
 // 事件接线
 // ----------------------------------------------------------------
 
@@ -480,6 +534,14 @@ document.addEventListener("keydown", (ev) => {
     }
     return;
   }
+  // 设置模态打开时,仅处理 Esc 关闭(U12)。
+  if (isSettingsOpen()) {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeSettings();
+    }
+    return;
+  }
   if (ev.key === "Escape") {
     ev.preventDefault();
     void invoke("hide_panel");
@@ -516,6 +578,17 @@ document.addEventListener("keydown", (ev) => {
   if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
     ev.preventDefault();
     void openVault();
+    return;
+  }
+  // ⌘,：打开设置(U12)。
+  if (
+    (ev.metaKey || ev.ctrlKey) &&
+    !ev.shiftKey &&
+    !ev.altKey &&
+    ev.key === ","
+  ) {
+    ev.preventDefault();
+    void openSettings();
     return;
   }
   // ⌘⇧G：切换访客模式（U10 / R10）。
@@ -567,6 +640,14 @@ searchEl.focus();
 setEditorCloseHandler(() => {
   searchEl.focus();
 });
+// U12：托盘「设置…」菜单触发后端 `emit("open-settings")`，前端转呼 openSettings()。
+// listen 返回的 Promise unhandled rejection 静默丢弃：失败属异常路径，丢给 window 错误兜底。
+void listen("open-settings", () => {
+  void openSettings();
+});
+// U12：启动时一次性把 `--bg` CSS 变量对齐到后端持久化的透明度，
+// 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
+void getPanelOpacity().then(applyPanelOpacity);
 void refreshAccessibilityBanner(bannerEl);
 void refreshKeychainBanner(vaultBannerEl);
 void refreshGuestNotice();

@@ -178,3 +178,36 @@ export async function refreshKeychainBanner(banner: HTMLElement): Promise<void> 
     </div>`;
 }
 
+// ----------------------------------------------------------------
+// 面板透明度（U12）
+// ----------------------------------------------------------------
+
+/**
+ * 默认透明度（0-100 整数百分比），与后端 `privacy::DEFAULT_PANEL_OPACITY`、
+ * `styles.css` `--bg` 默认 0.78 三处对齐。前端任何 fallback 都走这个值，
+ * 避免后端拉取失败时显示空背景。
+ */
+export const DEFAULT_PANEL_OPACITY = 78;
+
+/** 读取面板透明度（0-100 整数百分比）。后端失败时回退默认。 */
+export async function getPanelOpacity(): Promise<number> {
+  try {
+    return await invoke<number>("get_panel_opacity");
+  } catch {
+    return DEFAULT_PANEL_OPACITY;
+  }
+}
+
+/**
+ * 设置面板透明度（0-100 整数百分比）。后端会 clamp 到
+ * `[MIN_PANEL_OPACITY=30, MAX_PANEL_OPACITY=100]` 区间。
+ * 返回 clamp 后的最终值（前端 slider 应回填此值），失败返回 -1。
+ */
+export async function setPanelOpacity(v: number): Promise<number> {
+  try {
+    return await invoke<number>("set_panel_opacity", { opacity: v });
+  } catch {
+    return -1;
+  }
+}
+

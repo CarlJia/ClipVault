@@ -35,6 +35,9 @@ use clipvault_core::Entry;
 pub const WINDOW_SWITCHED_MSG: &str = "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴";
 /// CGEventPost 失败回退的固定提示(计划 U8 step 4,文案固定)。
 pub const CGEVENT_FAIL_MSG: &str = "回贴失败,内容已复制到剪贴板,请手动 ⌘V";
+/// 未授权 Accessibility 时的提示:内容已进剪贴板,引导用户手动 ⌘V 或开启授权。
+pub const NO_ACCESSIBILITY_MSG: &str =
+    "已复制到剪贴板,请手动 ⌘V 粘贴。开启「辅助功能」授权后可自动回贴。";
 /// 加密区条目解密失败的提示（U9：Keychain 不可用或密钥不匹配 → 不回贴）。
 pub const VAULT_DECRYPT_FAIL_MSG: &str = "加密条目解密失败（Keychain 不可用或密钥不匹配）";
 
@@ -59,6 +62,9 @@ pub enum PasteOutcome {
     WindowSwitched,
     /// CGEventPost 失败:仅完成剪贴板写入,提示用户手动 ⌘V。
     ClipboardOnly,
+    /// 未授权 Accessibility:内容**已写入剪贴板**(写剪贴板不需要该权限),
+    /// 但无法模拟 ⌘V 自动回贴。提示用户手动 ⌘V,或去开启辅助功能以自动回贴。
+    NoAccessibilityClipboardOnly,
 }
 
 /// [`PasteBackend::simulate_paste`] 的失败标记(事件创建/投递失败)。
@@ -110,12 +116,13 @@ pub fn decrypt_content(
 
 /// 回贴编排(纯决策逻辑,平台副作用全走 trait)。
 ///
-/// 顺序对应计划 U8 Approach:
-/// 1. 每次调用先 `is_trusted()` 重新校验;未授权 → [`PasteError::MissingAccessibility`],
-///    **不触碰剪贴板、不模拟按键**(AE7)。
-/// 2. 解析内容(加密区接缝:vault 条目走 `decryptor` 解密,失败 →
-///    [`PasteError::VaultDecryptFailed`],不写剪贴板)。
-/// 3. `write_clipboard`。
+/// 顺序对应计划 U8 Approach，并修正了「未授权时内容也进不了剪贴板」的缺陷：
+/// 1. 解析内容(加密区接缝:vault 条目走 `decryptor` 解密,失败 →
+///    [`PasteError::VaultDecryptFailed`],**在写剪贴板前**失败,保证密文不落盘剪贴板)。
+/// 2. `write_clipboard`——写剪贴板**不需要** Accessibility 权限,因此**先做**,
+///    这样即便未授权,用户至少能手动 ⌘V 拿到内容。
+/// 3. `is_trusted()` 校验;未授权 → [`PasteOutcome::NoAccessibilityClipboardOnly`]
+///    (内容已在剪贴板,只是无法自动回贴),不再整体失败。
 /// 4. `refocus_target`(隐藏面板,把焦点还给目标应用)。
 /// 5. `simulate_paste`;失败 → [`PasteOutcome::ClipboardOnly`](内容已在剪贴板)。
 /// 6. 用 `frontmost_app` 与 `prev_frontmost` 比对;不一致 →
@@ -128,16 +135,18 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
     nonce: Option<&[u8]>,
     decryptor: &dyn crate::crypto::Decryptor,
 ) -> Result<PasteOutcome, PasteError> {
-    // 1. 每调用重新校验(防 TCC 静默失效)。
-    if !checker.is_trusted() {
-        return Err(PasteError::MissingAccessibility);
-    }
-
-    // 2. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
+    // 1. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
     let content = decrypt_content(entry, nonce, decryptor)?;
 
-    // 3. 写剪贴板。
+    // 2. 写剪贴板。写剪贴板不需要 Accessibility 权限,故先于授权检查——
+    //    保证即便未授权,内容也已在系统剪贴板,用户可手动 ⌘V。
     backend.write_clipboard(&content);
+
+    // 3. 授权校验(每调用重新校验,防 TCC 静默失效)。未授权时内容已在剪贴板,
+    //    只是无法模拟 ⌘V,返回降级结果而非整体失败。
+    if !checker.is_trusted() {
+        return Ok(PasteOutcome::NoAccessibilityClipboardOnly);
+    }
 
     // 4. 隐藏面板,焦点还给目标应用。
     backend.refocus_target();

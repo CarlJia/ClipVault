@@ -113,7 +113,11 @@ fn vault_entry() -> Entry {
 }
 
 #[test]
-fn paste_blocked_when_not_trusted() {
+fn clipboard_written_even_when_not_trusted() {
+    // 未授权 Accessibility 时:写剪贴板不需要该权限,故内容仍应进剪贴板,
+    // 只是无法模拟 ⌘V 自动回贴 → NoAccessibilityClipboardOnly。
+    // （取代旧的 paste_blocked_when_not_trusted:那条断言未授权就完全不写剪贴板,
+    //  正是本次修复的 bug——双击/回贴时内容进不了系统剪贴板。）
     let checker = MockChecker { trusted: false };
     let backend = MockBackend::default();
 
@@ -126,13 +130,43 @@ fn paste_blocked_when_not_trusted() {
         &NeverDecryptor,
     );
 
-    assert_eq!(result, Err(PasteError::MissingAccessibility));
-    // 未授权时绝不触碰剪贴板 / 焦点 / 模拟(AE7)。
-    assert!(
-        backend.wrote_clipboard.borrow().is_none(),
-        "未授权时不应写入剪贴板"
+    assert_eq!(result, Ok(PasteOutcome::NoAccessibilityClipboardOnly));
+    // 内容仍应写入剪贴板,让用户能手动 ⌘V。
+    assert_eq!(
+        backend.wrote_clipboard.borrow().as_deref(),
+        Some("hello"),
+        "未授权时内容仍应写入剪贴板(写剪贴板不需要 Accessibility)"
     );
-    assert!(!*backend.refocused.borrow(), "未授权时不应隐藏面板");
+    // 但不应尝试模拟按键(那才需要授权)。
+    assert!(!*backend.simulated.borrow(), "未授权时不应模拟 ⌘V 按键注入");
+}
+
+#[test]
+fn vault_entry_not_written_when_not_trusted() {
+    // 未授权 + vault 条目:解密仍在写剪贴板前发生。此处 Keychain 可用(解密成功),
+    // 未授权只挡自动回贴,内容(解密后明文)仍写入剪贴板。
+    let checker = MockChecker { trusted: false };
+    let backend = MockBackend::default();
+    let decryptor = MockDecryptor {
+        result: Ok("vault-明文".to_string()),
+    };
+    let nonce = [0u8; 12];
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_entry(),
+        None,
+        Some(&nonce),
+        &decryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::NoAccessibilityClipboardOnly));
+    assert_eq!(
+        backend.wrote_clipboard.borrow().as_deref(),
+        Some("vault-明文"),
+        "vault 条目解密成功后,未授权也应把明文写入剪贴板供手动 ⌘V"
+    );
     assert!(!*backend.simulated.borrow(), "未授权时不应模拟按键");
 }
 

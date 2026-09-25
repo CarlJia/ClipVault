@@ -12,6 +12,7 @@
 use std::sync::atomic::Ordering;
 
 use tauri::AppHandle;
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -72,6 +73,8 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
     let skip = MenuItem::with_id(app, "skip_once", "本次不记录", true, None::<&str>)?;
     let guest = CheckMenuItem::with_id(app, "guest", "访客模式", true, guest_mode, None::<&str>)?;
     let vault = MenuItem::with_id(app, "vault", "加密区", true, None::<&str>)?;
+    // 设置(U12)：弹出主面板 + 通过 "open-settings" 事件让前端打开 #settings 模态。
+    let settings = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
     let about = MenuItem::with_id(app, "about", "关于 ClipVault", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -81,7 +84,7 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&open, &skip, &guest, &vault, &sep, &about, &sep, &quit],
+        &[&open, &skip, &guest, &vault, &settings, &sep, &about, &sep, &quit],
     )?;
 
     let initial = if guest_mode {
@@ -175,6 +178,12 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
         }
         // 加密区（U9）/ 关于面板（后续）暂先打开主面板占位。
         "vault" | "about" => show_panel(app),
+        // 设置(U12)：托盘没有 UI，唤出主面板后发事件让前端打开设置模态。
+        "settings" => {
+            show_panel(app);
+            // emit 失败不影响窗口已显示；前端 listen 见 §main.ts openSettings 入口。
+            let _ = app.emit("open-settings", ());
+        }
         "quit" => {
             crate::hotkey::unregister();
             app.exit(0);
