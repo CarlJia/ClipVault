@@ -54,6 +54,11 @@ let catList: CategoryInfo[] = [];
 let selectedTag: string | null = null;
 let selectedCategory: string | null = null;
 let selected = 0;
+// 缓存当前选中的行元素，避免每次键盘导航都 querySelector(".row.selected")。
+// 列表全量重画（load 完成 / tab 切换 / 过滤变化）时由 `paintEntries` 重建并重置。
+let selectedEl: HTMLElement | null = null;
+// 进行中的 load 请求；新请求发起前 abort 旧的，避免慢响应覆盖快的新结果。
+let loadAbort: AbortController | null = null;
 let searchTimer: number | undefined;
 let toastTimer: number | undefined;
 // 访客模式当前状态（以后端为准，通过 getGuestMode 同步；U10）。
@@ -157,14 +162,16 @@ function renderTabs(): void {
 }
 
 function scrollToSelected(): void {
-  listEl.querySelector<HTMLElement>(".row.selected")?.scrollIntoView({
-    block: "nearest",
-  });
+  selectedEl?.scrollIntoView({ block: "nearest" });
 }
 
-/** 渲染条目列表；筛选态下在顶部补一行「‹ 返回」条。 */
+/** 渲染条目列表；筛选态下在顶部补一行「‹ 返回」条。
+ *  全量重画：仅在数据本身变化（load 完成 / tab 切换 / 筛选变化）时调用。
+ *  选中切换走 [`applySelectionPatch`] 走 classList 增量,不重建 DOM。*/
 function paintEntries(): void {
   renderEntries(listEl, entries, selected);
+  // 重画后缓存当前选中的行元素（如果存在）。下次切换选中时直接复用。
+  selectedEl = listEl.querySelector<HTMLElement>(".row.selected");
   if (currentTab === "tag" && selectedTag !== null) {
     listEl.insertAdjacentHTML(
       "afterbegin",
@@ -178,25 +185,55 @@ function paintEntries(): void {
   }
 }
 
+/** 选中切换的增量路径：仅调整 .selected class,DOM 不重建。
+ *  `idx` 越界时静默忽略。前提:列表已由 [`paintEntries`] 渲染,且与 `entries[]` 一一对应。*/
+function applySelectionPatch(idx: number): void {
+  if (idx < 0 || idx >= entries.length) return;
+  const rows = listEl.children;
+  // 过滤头行（如果有）会出现在最前面,跳过它。
+  const filterRow = listEl.querySelector<HTMLElement>(".filter-back");
+  const offset = filterRow ? 1 : 0;
+  const target = rows[idx + offset] as HTMLElement | undefined;
+  if (!target) return;
+  if (selectedEl && selectedEl !== target) selectedEl.classList.remove("selected");
+  if (target.classList.contains("selected")) {
+    // 已经在选中态,无需操作。
+  } else {
+    target.classList.add("selected");
+  }
+  selectedEl = target;
+}
+
 async function load(preferId?: number): Promise<void> {
+  // 取消上一次还在飞的 load,避免慢响应覆盖快的新结果(连打 / 切 tab / 切筛选)。
+  loadAbort?.abort();
+  loadAbort = new AbortController();
+  const myAbort = loadAbort;
   showProgress(true);
   try {
+    if (myAbort.signal.aborted) return;
     if (currentTab === "tag" && selectedTag === null) {
       tagList = await invoke<TagInfo[]>("get_all_tags");
+      if (myAbort.signal.aborted) return;
       renderTags(listEl, tagList);
       selected = -1;
+      selectedEl = null;
     } else if (currentTab === "category" && selectedCategory === null) {
       catList = await invoke<CategoryInfo[]>("get_categories");
+      if (myAbort.signal.aborted) return;
       renderCategories(listEl, catList);
       selected = -1;
+      selectedEl = null;
     } else {
       // 条目列表：recent / all / 已选标签 / 已选类别。
       const query = searchEl.value.trim();
-      entries = await invoke<EntryDto[]>("search_results", {
+      const result = await invoke<EntryDto[]>("search_results", {
         query,
         tab: tabArg(),
         limit: LIMIT,
       });
+      if (myAbort.signal.aborted) return;
+      entries = result;
       if (selected >= entries.length) selected = entries.length - 1;
       if (selected < 0 && entries.length > 0) selected = 0;
       // 若指定了 preferId（如刚被切换置顶的条目）且仍可见，则优先选中它，
@@ -209,12 +246,15 @@ async function load(preferId?: number): Promise<void> {
       scrollToSelected();
     }
   } catch (e) {
+    // 取消的请求不报错。
+    if (myAbort.signal.aborted) return;
     // 保留上一帧不动，仅在完全无内容时提示。
     if (listEl.childElementCount === 0) {
       listEl.innerHTML = `<div class="empty">加载失败：${String(e)}</div>`;
     }
     toast(`加载失败：${String(e)}`);
   } finally {
+    if (loadAbort === myAbort) loadAbort = null;
     showProgress(false);
   }
 }
@@ -233,18 +273,22 @@ async function activate(): Promise<void> {
 async function activateIndex(idx: number): Promise<void> {
   if (!showingEntries() || idx < 0 || idx >= entries.length) return;
   selected = idx;
-  paintEntries();
+  applySelectionPatch(selected);
   scrollToSelected();
   await pasteEntry(entries[idx]);
 }
 
-/** 回贴一条记录:成功则隐藏面板,否则提示手动 ⌘V(AE3 / AE7)。 */
+/** 回贴一条记录:成功则隐藏面板,否则内容已在剪贴板,提示手动 ⌘V(AE3 / AE7)。 */
 async function pasteEntry(e: EntryDto): Promise<void> {
   try {
     const r = await invoke<PasteResult>("paste_entry", { id: e.id });
     if (r.status === "pasted") {
       // 回贴成功:后端已隐藏面板并把 ⌘V 落到目标应用,无需额外提示。
       await invoke("hide_panel");
+    } else if (r.status === "no_accessibility") {
+      // 未授权:内容已进剪贴板,但无法自动回贴。亮授权横幅 + 提示可手动 ⌘V。
+      await refreshAccessibilityBanner(bannerEl);
+      toast(r.message);
     } else {
       // window_switched / clipboard_only:内容已在剪贴板,后端已重新显示面板,
       // 展示固定提示引导用户手动 ⌘V。
@@ -253,7 +297,7 @@ async function pasteEntry(e: EntryDto): Promise<void> {
   } catch (err) {
     const msg = String(err);
     if (msg.includes("missing-accessibility")) {
-      // AE7:未授权 —— 展示 Accessibility 横幅,不隐藏面板。
+      // 兜底:后端仍以错误形式返回未授权时,展示 Accessibility 横幅。
       await refreshAccessibilityBanner(bannerEl);
       toast("需要「辅助功能」授权才能自动回贴");
     } else {
@@ -294,7 +338,8 @@ async function togglePin(): Promise<void> {
 function moveSelection(delta: number): void {
   if (!showingEntries() || entries.length === 0) return;
   selected = Math.min(Math.max(selected + delta, 0), entries.length - 1);
-  paintEntries();
+  // 选中切换走 classList 增量,DOM 不重建(jsdom 基准:50 行 ~0.02ms)。
+  applySelectionPatch(selected);
   scrollToSelected();
 }
 
@@ -411,7 +456,7 @@ listEl.addEventListener("click", (ev) => {
   const row = target.closest<HTMLElement>(".row");
   if (!row) return;
   selected = Number(row.dataset.index);
-  paintEntries();
+  applySelectionPatch(selected);
 });
 
 listEl.addEventListener("dblclick", (ev) => {
