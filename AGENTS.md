@@ -50,6 +50,20 @@ packaging/build.sh
 - **macOS 专用**：原生绑定（`objc2` 家族、`security-framework`）仅在 `cfg(target_os = "macos")` 下编译。
 - **签名与分发**：ad-hoc 签名，不上 Mac App Store；Gatekeeper 放行步骤见 `README.md`。
 
+## ⚠️ 开发期「辅助功能」授权 —— 容易踩的第一个坑
+
+`cargo tauri dev` 跑的是 debug 版二进制，macOS 把 Accessibility（辅助功能）授权**绑定到具体的可执行文件路径 + 签名**上。所以**需要授权的不是 ClipVault 本体，而是启动它的宿主进程——通常是你的终端 App**（Terminal / iTerm2 / Warp / VS Code 等，debug 二进制是终端 fork 出来的）。
+
+如果你不授权 → 回贴不会自动执行；回贴后 ClipVault 会**先把内容写入剪贴板**，再提示「已复制到剪贴板，请手动 ⌘V 粘贴」——未授权不是死路，但自动回贴失效。
+
+正确做法（细节 + 排障见 `README.md`）：
+1. 打开 **「系统设置 → 隐私与安全性 → 辅助功能」**，在列表里找你**正在用的终端**，打开它的开关。
+2. 回到终端按 `cargo tauri dev` 启动 ClipVault 即可。
+3. 常见坑：**找 ClipVault → 找不到**（dev 期不在 ClipVault 名字下找，要在终端名字下找）。
+4. clean rebuild / 切 target 后授权偶尔失效，重新勾一下即可；**打包后的 `.app` 没有这个问题**。
+
+任何接手这个仓库的 agent,**第一件事就是确认终端在辅助功能列表里**,不然调试回贴时会浪费 15 分钟。
+
 ## 实施进度
 
 U1–U11 全部完成（`git log` 可见各 U 的 commit）。当前测试基线：app 53 passed + core 18 passed，
