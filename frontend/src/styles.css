@@ -38,6 +38,7 @@ body {
 
 #app {
   height: 100%;
+  background: transparent;
 }
 
 .panel {
