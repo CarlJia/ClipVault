@@ -288,28 +288,35 @@ async function activateIndex(idx: number): Promise<void> {
   await pasteEntry(entries[idx]);
 }
 
-/** 回贴一条记录:成功则隐藏面板,否则内容已在剪贴板,提示手动 ⌘V(AE3 / AE7)。 */
+/** 回贴一条记录:任何非抛错路径都隐藏面板(AE3 / AE7 / ⌘N / 双击),
+ *  因为内容已经在剪贴板里、用户的回贴动作已经完成;只有真正报错
+ *  (vault解密失败等)才保留面板让用户处理。 */
 async function pasteEntry(e: EntryDto): Promise<void> {
   try {
     const r = await invoke<PasteResult>("paste_entry", { id: e.id });
-    if (r.status === "pasted") {
-      // 回贴成功:后端已隐藏面板并把 ⌘V 落到目标应用,无需额外提示。
-      await invoke("hide_panel");
-    } else if (r.status === "no_accessibility") {
+    // 任何成功/降级分支:关面板 + 给出适当 toast/横幅。
+    if (r.status === "no_accessibility") {
       // 未授权:内容已进剪贴板,但无法自动回贴。亮授权横幅 + 提示可手动 ⌘V。
       await refreshAccessibilityBanner(bannerEl);
       toast(r.message);
+    } else if (r.status !== "pasted") {
+      // window_switched / clipboard_only:内容已在剪贴板,后端已重新显示面板。
+      // 关掉面板(用户的回贴动作已完成),toast 引导手动 ⌘V。
+      toast(r.message);
     } else {
-      // window_switched / clipboard_only:内容已在剪贴板,后端已重新显示面板,
-      // 展示固定提示引导用户手动 ⌘V。
+      // "pasted":后端已隐藏面板并把 ⌘V 落到目标应用,无需额外提示。
       toast(r.message);
     }
+    await invoke("hide_panel");
   } catch (err) {
     const msg = String(err);
     if (msg.includes("missing-accessibility")) {
       // 兜底:后端仍以错误形式返回未授权时,展示 Accessibility 横幅。
       await refreshAccessibilityBanner(bannerEl);
       toast("需要「辅助功能」授权才能自动回贴");
+    } else if (msg.includes("加密条目解密失败")) {
+      // vault 解密失败:留面板让用户去加密区处理(保留密文不出错)。
+      toast(`加密区条目解密失败:${msg}`);
     } else {
       toast(`回贴失败:${msg}`);
     }
