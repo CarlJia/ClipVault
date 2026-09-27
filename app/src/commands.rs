@@ -594,3 +594,54 @@ pub async fn clear_undecryptable(state: State<'_, AppState>) -> Result<usize, St
         .await
         .map_err(|e| e.to_string())
 }
+
+// ----------------------------------------------------------------
+// URL ⌘O 打开（U7 / R20 / F7）
+// ----------------------------------------------------------------
+
+/// 多类型 plan U7：在默认浏览器打开 URL 类别条目。
+///
+/// 仅接受 `http://` 与 `https://` scheme：拒绝 `file://`、`javascript:`、
+/// `data:` 等潜在攻击面（clipboard hijacking）。非 URL 类别条目返回错误。
+///
+/// 失败（URL 非法、Command 启动失败）→ 后端把 content 写入
+/// `NSPasteboard.string` 并返回 `clipboard_only`，前端 toast 提示。
+#[tauri::command]
+pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    use std::process::Command;
+
+    // 同步读取（commands 在 Tauri 主线程跑;MVP 同模式入库读取已沿用）。
+    let entry = tauri::async_runtime::block_on(async {
+        state.storage.get_by_id(id).await
+    })
+    .map_err(|e| e.to_string())?
+    .ok_or_else(|| format!("entry {id} 不存在"))?;
+
+    if entry.auto_category != "URL" {
+        return Err(format!(
+            "非 URL 条目不支持打开（auto_category={}）",
+            entry.auto_category
+        ));
+    }
+
+    let url = entry.content.trim();
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return Err(format!(
+            "URL scheme 必须为 http:// 或 https://（实际: {url}）"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        match Command::new("open").arg(url).spawn() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!("打开失败,内容已复制到剪贴板,请手动 ⌘V（{e}）")),
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = url;
+        Err("URL 打开仅支持 macOS".to_string())
+    }
+}
