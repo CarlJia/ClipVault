@@ -16,6 +16,7 @@ pub mod pin;
 pub mod privacy;
 pub mod search;
 pub mod storage;
+pub mod thumbnail;
 pub mod tray;
 pub mod watcher;
 

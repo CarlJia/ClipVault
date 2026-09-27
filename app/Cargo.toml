@@ -18,6 +18,8 @@ sha2 = "0.10"
 base64 = "0.22"
 # U9：move_to_vault 的每条随机 salt（salted content_hash，避免明文指纹）。
 rand = "0.8"
+# 多类型 plan U3：图片缩略图生成（decode → resize → encode PNG → base64）。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 
 # macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
 # - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。

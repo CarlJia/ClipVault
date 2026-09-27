@@ -149,6 +149,18 @@ pub async fn insert_captured(
     captured: &Captured,
     auto_category: &str,
 ) -> Result<i64, rusqlite::Error> {
+    let metadata = captured.metadata.to_string();
+    insert_captured_with_metadata(storage, captured, auto_category, &metadata).await
+}
+
+/// Like [`insert_captured`] but takes a pre-rendered metadata JSON string,
+/// letting the caller splice in derived fields (e.g. `thumb` from U3).
+pub async fn insert_captured_with_metadata(
+    storage: &Storage,
+    captured: &Captured,
+    auto_category: &str,
+    metadata_json: &str,
+) -> Result<i64, rusqlite::Error> {
     let hash = captured.fingerprint();
     match captured.kind {
         ContentKind::Text => {
@@ -157,7 +169,6 @@ pub async fn insert_captured(
         }
         _ => {
             let payload = captured.payload.as_deref().unwrap_or(&[]);
-            let metadata = captured.metadata.to_string();
             storage
                 .insert_entry_binary(
                     &hash,
@@ -165,7 +176,7 @@ pub async fn insert_captured(
                     captured.mime.as_deref(),
                     payload,
                     None, // payload_nonce (U6 vault 加密后再写入)
-                    Some(&metadata),
+                    Some(metadata_json),
                 )
                 .await
         }

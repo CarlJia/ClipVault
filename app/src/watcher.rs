@@ -21,6 +21,7 @@ use clipvault_core::ContentKind;
 
 use crate::capture::{self, Captured};
 use crate::storage::Storage;
+use crate::thumbnail;
 
 /// 轮询间隔（R1 修订：< 200ms 检测预算）。
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -188,8 +189,32 @@ impl Watcher {
             other => other.as_str().to_string(),
         };
 
-        // 8. 落库。
-        match capture::insert_captured(&self.storage, &captured, &auto_category).await {
+        // 8. 落库。图片走 thumbnail 生成（U3）。
+        let mut metadata_to_persist = serde_json::to_string(&captured.metadata)
+            .unwrap_or_else(|_| "{}".to_string());
+        if matches!(captured.kind, ContentKind::Image) {
+            let payload_for_thumb = captured.payload.as_deref().unwrap_or(&[]);
+            let mime_for_thumb = captured.mime.as_deref().unwrap_or("");
+            if let Some(t) = thumbnail::make_thumbnail(payload_for_thumb, mime_for_thumb) {
+                // 把 thumb base64 与 dim 拼进 metadata_json
+                let mut meta: serde_json::Value = serde_json::from_str(&metadata_to_persist)
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                if let Some(obj) = meta.as_object_mut() {
+                    obj.insert("thumb".into(), serde_json::Value::String(t.b64));
+                    obj.insert("thumb_dim".into(), serde_json::Value::Number(t.dim.into()));
+                }
+                metadata_to_persist = meta.to_string();
+            }
+        }
+
+        match capture::insert_captured_with_metadata(
+            &self.storage,
+            &captured,
+            &auto_category,
+            &metadata_to_persist,
+        )
+        .await
+        {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
