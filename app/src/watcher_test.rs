@@ -8,6 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use clipvault_core::ContentKind;
+
+use crate::capture::Captured;
 use crate::classify::{AutoCategory, classify};
 use crate::storage::Storage;
 use crate::storage::test_helpers::open_test_db;
@@ -92,7 +95,7 @@ async fn process_respects_skip_next() {
     let (watcher, storage, skip_next) = make_watcher(false, true);
 
     // skip-once 置位:本次不入库,并复位 flag。
-    watcher.process("first copy".to_string()).await;
+    watcher.process(Captured::text("first copy")).await;
     assert_eq!(row_count(&storage).await, 0, "skip-once 应阻止本次入库");
     assert!(
         !skip_next.load(Ordering::SeqCst),
@@ -100,25 +103,49 @@ async fn process_respects_skip_next() {
     );
 
     // 再次复制(不同内容,避开去重窗口)应正常入库。
-    watcher.process("second copy".to_string()).await;
+    watcher.process(Captured::text("second copy")).await;
     assert_eq!(row_count(&storage).await, 1, "复位后应恢复入库");
 }
 
 #[tokio::test]
 async fn process_respects_guest_mode() {
     let (watcher, storage, _skip) = make_watcher(true, false);
-    watcher.process("captured while guest".to_string()).await;
+    watcher.process(Captured::text("captured while guest")).await;
     assert_eq!(row_count(&storage).await, 0, "访客模式下不应入库");
 }
 
 #[tokio::test]
 async fn process_dedups_within_window() {
     let (watcher, storage, _skip) = make_watcher(false, false);
-    watcher.process("repeated text".to_string()).await;
-    watcher.process("repeated text".to_string()).await;
+    watcher.process(Captured::text("repeated text")).await;
+    watcher.process(Captured::text("repeated text")).await;
     assert_eq!(
         row_count(&storage).await,
         1,
         "5 秒窗口内的同内容重复只应入库一次"
     );
+}
+
+#[tokio::test]
+async fn process_handles_binary_capture() {
+    // 多类型 plan U2:图片捕获走 binary 路径,auto_category = "image"。
+    let (watcher, storage, _skip) = make_watcher(false, false);
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89";
+    watcher
+        .process(Captured::image("image/png", png.to_vec(), 1, 1))
+        .await;
+    let entries = storage.list_recent(10).await.unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].content_kind, ContentKind::Image.as_str());
+    assert_eq!(entries[0].auto_category, "image");
+    assert!(entries[0].payload.is_some());
+}
+
+#[tokio::test]
+async fn process_skips_payload_over_25mb() {
+    // R23: payload > 25MB 时不入库,日志一行。
+    let (watcher, storage, _skip) = make_watcher(false, false);
+    let big = vec![0u8; 26 * 1024 * 1024];
+    watcher.process(Captured::image("image/png", big, 1, 1)).await;
+    assert_eq!(row_count(&storage).await, 0, "25MB 超限应跳过");
 }

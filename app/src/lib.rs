@@ -6,6 +6,7 @@
 //! U4 adds the frontend shell wiring: IPC commands, the menu-bar tray,
 //! and the Carbon global hotkey.
 
+pub mod capture;
 pub mod classify;
 pub mod commands;
 pub mod crypto;

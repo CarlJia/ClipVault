@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
-use crate::classify::classify;
+use clipvault_core::ContentKind;
+
+use crate::capture::{self, Captured};
 use crate::storage::Storage;
 
 /// 轮询间隔（R1 修订：< 200ms 检测预算）。
@@ -96,50 +98,64 @@ impl Watcher {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Some(text) = self.poll_change() {
-                self.process(text).await;
+            if let Some(captured) = self.poll_change() {
+                self.process(captured).await;
             }
         }
     }
 
-    /// 读取剪贴板变化（macOS 实现)。
+    /// 读取剪贴板变化（macOS 实现 / 多类型扩展后）。
     ///
-    /// 当 `changeCount` 相较上次增长时返回其纯文本内容,否则返回 `None`。
+    /// 调用 `capture::poll_first_non_empty` 按 `filenames → image → rtf →
+    /// color → string` 顺序探测,首个非空胜出。`changeCount` 没增长则
+    /// 返回 `None`。
     #[cfg(target_os = "macos")]
-    fn poll_change(&self) -> Option<String> {
-        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
-
-        // NSPasteboard.generalPasteboard 不限主线程,可在 tokio 工作线程调用。
+    fn poll_change(&self) -> Option<Captured> {
+        use objc2_app_kit::NSPasteboard;
         let pasteboard = NSPasteboard::generalPasteboard();
         let change_count = pasteboard.changeCount() as i64;
-
         let prev = self.last_change_count.swap(change_count, Ordering::SeqCst);
-        if change_count == prev {
-            return None;
-        }
-
-        let value = unsafe { pasteboard.stringForType(NSPasteboardTypeString) };
-        value.map(|s| s.to_string())
+        capture::poll_first_non_empty(change_count, prev)
     }
 
     /// 非 macOS 平台无 `NSPasteboard`,始终返回 `None`。
     #[cfg(not(target_os = "macos"))]
-    fn poll_change(&self) -> Option<String> {
+    fn poll_change(&self) -> Option<Captured> {
         None
     }
 
-    /// 处理一段新捕获的文本:去重 + skip-once + 访客模式过滤 + 分类 + 入库。
-    pub async fn process(&self, text: String) {
-        // 1. 空白直接忽略。
-        if text.trim().is_empty() {
-            return;
+    /// 处理一次多类型捕获:去重 + skip-once + 访客模式过滤 + 25MB 上限 +
+    /// 分类 + 入库。
+    ///
+    /// `auto_category` 对非文本类型取 `content_kind.as_str()`（与 KTD8
+    /// 对齐）;文本类型走 [`crate::classify::classify`]。
+    pub async fn process(&self, captured: Captured) {
+        // 1. 空白文本直接忽略（binary 不可能为空,直接走 25MB 检查）
+        if matches!(captured.kind, ContentKind::Text) {
+            if captured
+                .text
+                .as_deref()
+                .map(|t| t.trim().is_empty())
+                .unwrap_or(true)
+            {
+                return;
+            }
         }
 
-        // 2. 计算指纹。
-        let hash = hash_prefix(&text);
+        // 2. 25MB payload 上限（multi-type plan R23）:binary 跳过并日志一行
+        if let Some(payload) = captured.payload.as_ref() {
+            if payload.len() > MAX_PAYLOAD_BYTES {
+                let mb = payload.len() / 1024 / 1024;
+                eprintln!("[capture] skipped: payload too large ({mb} MB)");
+                return;
+            }
+        }
+
+        // 3. 指纹。
+        let hash = captured.fingerprint();
         let now = Instant::now();
 
-        // 3. 去重判定:锁内比对并更新指纹,入库前释放锁(不跨 await 持锁)。
+        // 4. 去重判定:锁内比对并更新指纹,入库前释放锁(不跨 await 持锁)。
         {
             let mut guard = self.last_hash.lock().await;
             if should_dedup(
@@ -153,23 +169,27 @@ impl Watcher {
             *guard = Some((hash.clone(), now));
         }
 
-        // 4. skip-once:消费并复位;命中则本次不入库(R11)。
+        // 5. skip-once:消费并复位;命中则本次不入库(R11)。
         if self.skip_next.swap(false, Ordering::SeqCst) {
             return;
         }
 
-        // 5. 访客模式:开启时不入库(R10;开关由 U10 写入)。
+        // 6. 访客模式:开启时不入库(R10;开关由 U10 写入)。
         if self.guest_mode.load(Ordering::SeqCst) {
             return;
         }
 
-        // 6. 自动分类并写入。
-        let category = classify(&text);
-        match self
-            .storage
-            .insert_entry(&hash, &text, category.as_str())
-            .await
-        {
+        // 7. auto_category: 文本走 classify 启发式,二进制与 kind 同名。
+        let auto_category = match captured.kind {
+            ContentKind::Text => {
+                let text = captured.text.as_deref().unwrap_or("");
+                crate::classify::classify(text).as_str().to_string()
+            }
+            other => other.as_str().to_string(),
+        };
+
+        // 8. 落库。
+        match capture::insert_captured(&self.storage, &captured, &auto_category).await {
             Ok(_) => {}
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
@@ -182,3 +202,8 @@ impl Watcher {
         }
     }
 }
+
+/// 25MB payload 上限（multi-type plan R23）。超限 watcher 跳过本次
+/// 捕获并写一行 `[capture] skipped: payload too large` 日志,不弹用户
+/// 提示 toast（避免误打扰）。
+pub const MAX_PAYLOAD_BYTES: usize = 25 * 1024 * 1024;
