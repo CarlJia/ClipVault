@@ -39,23 +39,21 @@ pub struct Thumbnail {
 pub fn make_thumbnail(bytes: &[u8], _mime: &str) -> Option<Thumbnail> {
     let img = image::load_from_memory(bytes).ok()?;
     let primary = encode_thumbnail(&img, PRIMARY_DIM);
-    if let Some(b64) = primary {
-        if b64.len() <= THUMB_B64_BUDGET {
+    if let Some(b64) = primary
+        && b64.len() <= THUMB_B64_BUDGET {
             return Some(Thumbnail {
                 b64,
                 dim: PRIMARY_DIM,
             });
         }
-    }
     let fallback = encode_thumbnail(&img, FALLBACK_DIM);
-    if let Some(b64) = fallback {
-        if b64.len() <= THUMB_B64_BUDGET {
+    if let Some(b64) = fallback
+        && b64.len() <= THUMB_B64_BUDGET {
             return Some(Thumbnail {
                 b64,
                 dim: FALLBACK_DIM,
             });
         }
-    }
     None
 }
 
@@ -134,7 +132,7 @@ mod tests {
         // 24×24 RGB image should produce non-empty PNG output.
         let img = image::RgbImage::from_pixel(24, 24, image::Rgb([100, 150, 200]));
         let b64 = encode_thumbnail(&img.into(), 64).expect("encode should succeed");
-        assert!(b64.len() > 0);
+        assert!(!b64.is_empty());
         // PNG 解码回来应当等于 64×64。
         let bytes = STANDARD.decode(&b64).unwrap();
         let decoded = image::load_from_memory(&bytes).unwrap();

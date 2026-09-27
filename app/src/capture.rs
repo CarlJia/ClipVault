@@ -205,7 +205,7 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
         NSPasteboard, NSPasteboardTypeColor, NSPasteboardTypePNG, NSPasteboardTypeRTF,
         NSPasteboardTypeString, NSPasteboardTypeTIFF,
     };
-    use objc2_foundation::NSString;
+    
 
     let pb = NSPasteboard::generalPasteboard();
 
@@ -338,10 +338,13 @@ fn extract_printable_paths(bytes: &[u8]) -> Vec<String> {
     paths
 }
 
-/// 从图片字节（PNG/TIFF）解析 (width, height)。失败时返回 (0, 0）。
+/// 从图片字节（PNG/TIFF）解析 (width, height)。失败时返回 (0, 0)。
 /// 真实 ImageIO `CGImageSourceCopyPropertiesAtIndex` 留作后续增强
-/// （U3 thumbnail 路径已引入 ImageIO 间接调用）。
-#[cfg_attr(not(test), allow(dead_code))]
+/// （U3 thumbnail 路径已引入 ImageIO 间接调用）。`#[allow(dead_code)]`
+/// 因该函数是公共扩展点(U2 解析 + U3 缩略图可能都会需要);当前 U2
+/// 路径直接调 `png_dimensions` / `tiff_dimensions`,该 wrapper 暂时
+/// 无人调用,但作为头字节维度解析的统一入口保留。
+#[allow(dead_code)]
 fn image_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     png_dimensions(bytes).or_else(|| tiff_dimensions(bytes))
 }

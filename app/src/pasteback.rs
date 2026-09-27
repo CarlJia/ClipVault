@@ -290,7 +290,7 @@ mod imp {
                             _ => NSPasteboardTypePNG,
                         }
                     };
-                    let _ = unsafe { pasteboard.setData_forType(Some(&nsdata), pb_type) };
+                    let _ = pasteboard.setData_forType(Some(&nsdata), pb_type);
                 }
                 ContentKind::File => {
                     // payload 是 JSON-encoded Vec<String>。真实生产应转 NSArray<NSString>

@@ -132,8 +132,8 @@ impl Watcher {
     /// 对齐）;文本类型走 [`crate::classify::classify`]。
     pub async fn process(&self, captured: Captured) {
         // 1. 空白文本直接忽略（binary 不可能为空,直接走 25MB 检查）
-        if matches!(captured.kind, ContentKind::Text) {
-            if captured
+        if matches!(captured.kind, ContentKind::Text)
+            && captured
                 .text
                 .as_deref()
                 .map(|t| t.trim().is_empty())
@@ -141,16 +141,14 @@ impl Watcher {
             {
                 return;
             }
-        }
 
         // 2. 25MB payload 上限（multi-type plan R23）:binary 跳过并日志一行
-        if let Some(payload) = captured.payload.as_ref() {
-            if payload.len() > MAX_PAYLOAD_BYTES {
+        if let Some(payload) = captured.payload.as_ref()
+            && payload.len() > MAX_PAYLOAD_BYTES {
                 let mb = payload.len() / 1024 / 1024;
                 eprintln!("[capture] skipped: payload too large ({mb} MB)");
                 return;
             }
-        }
 
         // 3. 指纹。
         let hash = captured.fingerprint();
