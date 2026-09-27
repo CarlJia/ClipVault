@@ -205,7 +205,6 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
         NSPasteboard, NSPasteboardTypeColor, NSPasteboardTypePNG, NSPasteboardTypeRTF,
         NSPasteboardTypeString, NSPasteboardTypeTIFF,
     };
-    
 
     let pb = NSPasteboard::generalPasteboard();
 

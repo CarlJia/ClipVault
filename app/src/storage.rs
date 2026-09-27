@@ -664,8 +664,6 @@ pub mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::test_helpers::open_test_db;
-    
-    
 
     #[tokio::test]
     async fn insert_select_roundtrip() {

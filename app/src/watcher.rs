@@ -138,17 +138,18 @@ impl Watcher {
                 .as_deref()
                 .map(|t| t.trim().is_empty())
                 .unwrap_or(true)
-            {
-                return;
-            }
+        {
+            return;
+        }
 
         // 2. 25MB payload 上限（multi-type plan R23）:binary 跳过并日志一行
         if let Some(payload) = captured.payload.as_ref()
-            && payload.len() > MAX_PAYLOAD_BYTES {
-                let mb = payload.len() / 1024 / 1024;
-                eprintln!("[capture] skipped: payload too large ({mb} MB)");
-                return;
-            }
+            && payload.len() > MAX_PAYLOAD_BYTES
+        {
+            let mb = payload.len() / 1024 / 1024;
+            eprintln!("[capture] skipped: payload too large ({mb} MB)");
+            return;
+        }
 
         // 3. 指纹。
         let hash = captured.fingerprint();
