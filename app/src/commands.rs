@@ -46,6 +46,14 @@ pub struct EntryDto {
     /// 加密区条目是否可解密（`false` → UI 显示「无法解密」徽标，U9）。
     pub is_decryptable: bool,
     pub created_at: i64,
+    /// 多类型 plan U5：`text` / `image` / `file` / `rtf` / `color`。
+    pub content_kind: String,
+    /// 多类型 plan U5：二进制 MIME（如 `image/png`）。文本条目为 `None`。
+    pub mime_type: Option<String>,
+    /// 多类型 plan U5：图片缩略图 base64（64×64 PNG），其他 kind 为 `None`。
+    pub thumb: Option<String>,
+    /// 多类型 plan U5：结构化 metadata JSON（图片维度/文件名/RGBA 等）。
+    pub metadata: Option<String>,
 }
 
 /// 「标签」tab 的聚合项：标签名 + 条目数（R6）。
@@ -105,6 +113,12 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
         .into_iter()
         .map(|e| {
             let tags = tag_map.remove(&e.id).unwrap_or_default();
+            // 解析 metadata_json 提取 thumb 字段;thumb 外的 width/height/paths/rgba
+            // 字段已嵌入 metadata JSON,前端 parseMeta 自行解析。
+            let thumb = e
+                .metadata_json
+                .as_deref()
+                .and_then(extract_thumb_from_metadata);
             EntryDto {
                 id: e.id,
                 content: e.content,
@@ -116,9 +130,20 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
                 is_vault: e.is_vault,
                 is_decryptable: e.is_decryptable,
                 created_at: e.created_at,
+                content_kind: e.content_kind,
+                mime_type: e.mime_type,
+                thumb,
+                metadata: e.metadata_json,
             }
         })
         .collect())
+}
+
+/// 从 metadata_json 提取 thumb 字段(U3 写入的 base64 PNG)。
+fn extract_thumb_from_metadata(s: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .and_then(|v| v.get("thumb").and_then(|t| t.as_str().map(|s| s.to_string())))
 }
 
 // ----------------------------------------------------------------

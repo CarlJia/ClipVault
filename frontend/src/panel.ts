@@ -16,6 +16,14 @@ export interface EntryDto {
   /** 加密区条目是否可解密；`false` → 显示「无法解密」徽标（U9）。 */
   is_decryptable: boolean;
   created_at: number;
+  /** 多类型 plan U5：内容类型（text / image / file / rtf / color）。 */
+  content_kind?: string;
+  /** 多类型 plan U5：MIME for binary kinds。 */
+  mime_type?: string | null;
+  /** 多类型 plan U5：图片 64×64 PNG base64；其他 kind 为 null。 */
+  thumb?: string | null;
+  /** 多类型 plan U5：结构化 metadata 字符串（图片维度/文件名/RGBA 等）。 */
+  metadata?: string | null;
 }
 
 /** 「标签」tab 聚合项。 */
@@ -92,8 +100,6 @@ export function renderEntries(
       const tags = e.tags
         .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
         .join("");
-      // 加密区徽标（U9）：普通面板通常不含 vault 条目（已被后端排除），
-      // 但若出现则显式标注，且不可解密时给出「无法解密」警示。
       const vault = e.is_vault
         ? `<span class="chip chip-vault" title="加密区条目">🔒 加密</span>`
         : "";
@@ -101,32 +107,105 @@ export function renderEntries(
         e.is_vault && !e.is_decryptable
           ? `<span class="chip chip-undec" title="密钥缺失，无法解密">⚠ 无法解密</span>`
           : "";
-      // 有备注时：备注作主标题（📝 前缀），实际内容降为副标题缩略显示；
-      // 无备注时：内容仍作主标题，无副标题。
-      const hasNote = Boolean(e.note);
-      const primary = hasNote
-        ? `<div class="row-content row-note-title" title="${escapeHtml(e.note)}">${pin}📝 ${escapeHtml(previewOf(e.note, 80))}</div>`
-        : `<div class="row-content">${pin}${escapeHtml(previewOf(e.content))}</div>`;
-      const subtitle = hasNote
-        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.content, 80))}</div>`
-        : "";
-      // 前 9 条显示 ⌘N 序号徽标，提示直选快捷键。
+      const kind = e.content_kind ?? "text";
+      const kindBadge = kind === "text" ? "" : `<span class="chip chip-kind" data-kind="${escapeHtml(kind)}">${escapeHtml(kind.toUpperCase())}</span>`;
+      const previewHtml = renderKindPreview(e, kind, pin);
       const idxBadge =
         i < 9
           ? `<span class="row-index" title="⌘${i + 1} 直接选中">⌘${i + 1}</span>`
           : "";
       return `
-      <div class="row${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}">
+      <div class="row row-kind-${escapeHtml(kind)}${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}" data-kind="${escapeHtml(kind)}">
         ${idxBadge}
         <div class="row-main">
-          ${primary}
-          ${subtitle}
-          <div class="row-meta">${cat}${tags}${vault}${undec}</div>
+          ${previewHtml}
+          <div class="row-meta">${cat}${kindBadge}${tags}${vault}${undec}</div>
         </div>
         <div class="row-time">${formatTime(e.created_at)}</div>
       </div>`;
     })
     .join("");
+}
+
+/** 根据 content_kind 渲染不同的主预览块（U5 多类型）。 */
+function renderKindPreview(e: EntryDto, kind: string, pin: string): string {
+  const hasNote = Boolean(e.note);
+  switch (kind) {
+    case "image": {
+      const thumb = e.thumb;
+      const meta = parseMeta(e.metadata);
+      const dims = meta && meta.width && meta.height ? `${meta.width}×${meta.height}` : "";
+      const size = meta && meta.size_bytes
+        ? formatBytes(Number(meta.size_bytes))
+        : "";
+      const ariaLabel = `图片: ${dims || "未知尺寸"}, ${size || "未知大小"}`;
+      const imgHtml = thumb
+        ? `<img class="row-thumb" src="data:image/png;base64,${escapeHtml(thumb)}" alt="${escapeHtml(ariaLabel)}" aria-label="${escapeHtml(ariaLabel)}" role="img">`
+        : `<div class="row-thumb row-thumb-placeholder" aria-label="${escapeHtml(ariaLabel)}" role="img">${escapeHtml(size || "图片")}</div>`;
+      const titleHtml = hasNote
+        ? `<div class="row-content row-note-title" title="${escapeHtml(e.note)}">${pin}📝 ${escapeHtml(previewOf(e.note, 80))}</div>`
+        : `<div class="row-content row-image-meta">${pin}${escapeHtml(dims)} ${escapeHtml(size)}</div>`;
+      return `<div class="row-image-wrap">${imgHtml}${titleHtml}</div>`;
+    }
+    case "file": {
+      const meta = parseMeta(e.metadata);
+      const paths: string[] = Array.isArray(meta?.paths) ? (meta!.paths as string[]) : [];
+      const first = paths[0] ?? "(无路径)";
+      const more = paths.length > 1 ? ` 等 ${paths.length} 项` : "";
+      const titleHtml = `<div class="row-content row-file-name">${pin}📄 ${escapeHtml(basenameOf(first))}${escapeHtml(more)}</div>`;
+      const subtitle = hasNote
+        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.note, 80))}</div>`
+        : `<div class="row-subtitle" title="${escapeHtml(first)}">${escapeHtml(first)}</div>`;
+      return titleHtml + subtitle;
+    }
+    case "rtf": {
+      const titleHtml = `<div class="row-content row-rtf-badge">${pin}📝 RTF 富文本</div>`;
+      const subtitle = hasNote
+        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.note, 80))}</div>`
+        : "";
+      return titleHtml + subtitle;
+    }
+    case "color": {
+      const meta = parseMeta(e.metadata);
+      const rgba = (meta?.rgba as string) ?? "rgba(0,0,0,1)";
+      const swatch = `<span class="row-color-swatch" style="background:${escapeHtml(rgba)}" role="img" aria-label="颜色 ${escapeHtml(rgba)}"></span>`;
+      const titleHtml = `<div class="row-content row-color-meta">${pin}${swatch}${escapeHtml(rgba)}</div>`;
+      const subtitle = hasNote
+        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.note, 80))}</div>`
+        : "";
+      return titleHtml + subtitle;
+    }
+    case "text":
+    default: {
+      const titleHtml = hasNote
+        ? `<div class="row-content row-note-title" title="${escapeHtml(e.note)}">${pin}📝 ${escapeHtml(previewOf(e.note, 80))}</div>`
+        : `<div class="row-content">${pin}${escapeHtml(previewOf(e.content))}</div>`;
+      const subtitle = hasNote
+        ? `<div class="row-subtitle" title="${escapeHtml(e.content)}">${escapeHtml(previewOf(e.content, 80))}</div>`
+        : "";
+      return titleHtml + subtitle;
+    }
+  }
+}
+
+function parseMeta(s: string | null | undefined): Record<string, unknown> | null {
+  if (!s) return null;
+  try {
+    return JSON.parse(s) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function basenameOf(p: string): string {
+  const m = p.split("/").pop() ?? p;
+  return m;
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /** 渲染「标签」聚合列表。可点击筛选。 */

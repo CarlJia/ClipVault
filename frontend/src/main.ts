@@ -124,6 +124,16 @@ function toast(msg: string): void {
   }, 1600);
 }
 
+/** 多类型 plan U7 + R20：URL ⌘O 打开。 */
+async function openUrlAction(e: EntryDto): Promise<void> {
+  if (e.auto_category !== "URL") return;
+  try {
+    await invoke("open_url", { id: e.id });
+  } catch (err) {
+    toast(`打开失败：${String(err)}`);
+  }
+}
+
 /**
  * 刷新访客模式提示条（U10 / R10）：开启时在面板顶部显示一条常驻提示，
  * 说明「不记录新条目、已有条目只读可访问」，从而在「最近」等视图里对
@@ -567,6 +577,13 @@ document.addEventListener("keydown", (ev) => {
   if (ev.key === "Enter") {
     ev.preventDefault();
     void activate();
+    return;
+  }
+  // ⌘O：URL 类别条目在默认浏览器打开（U7 + R20）。
+  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (ev.key === "o" || ev.key === "O")) {
+    ev.preventDefault();
+    const e = currentEntry();
+    if (e) void openUrlAction(e);
     return;
   }
   // ⌘1 – ⌘9：直接选中并回贴列表中第 N 条（不带 Shift，避免撞其它组合）。
