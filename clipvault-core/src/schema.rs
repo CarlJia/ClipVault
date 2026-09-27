@@ -3,6 +3,9 @@
 //! Schema version managed via `PRAGMA user_version`.
 //! - V1 (U2): entries / tags / settings + FTS5 `entries_fts` with sync triggers.
 //! - V2 (U9): adds `entries.nonce BLOB` for AES-GCM vault ciphertext nonces.
+//! - V3 (multi-type plan): adds `content_kind` / `mime_type` / `payload` /
+//!   `payload_nonce` / `metadata_json` for non-text clipboard entries
+//!   (image/file/rtf/color).
 
 use rusqlite::{Connection, Result};
 
@@ -114,10 +117,37 @@ pub const MIGRATION_V2: &str = r#"
 ALTER TABLE entries ADD COLUMN nonce BLOB;
 "#;
 
+/// DDL for schema version 3 (multi-type plan).
+///
+/// Adds five columns supporting non-text clipboard kinds (image/file/rtf/color):
+/// - `content_kind TEXT NOT NULL DEFAULT 'text'`: stable kind label written by
+///   [`ContentKind::as_str`]. Existing V2 rows back-fill to `'text'`.
+/// - `mime_type TEXT`: MIME type for binary payloads (e.g. `image/png`).
+///   `NULL` for text entries.
+/// - `payload BLOB`: opaque binary content (image bytes / RTF bytes / JSON-
+///   encoded file path array / color encoded data). `NULL` for text entries.
+/// - `payload_nonce BLOB`: 12-byte AES-GCM nonce for the encrypted payload
+///   (vault binary entries). Independent from `nonce` which protects the
+///   text `content` ciphertext. `NULL` for non-vault rows.
+/// - `metadata_json TEXT`: structured metadata (image dimensions, file paths,
+///   RGBA string, etc.). Searchable for `file` kind filename tokens via the
+///   `entries_fts_*` triggers.
+///
+/// All five additions are additive: existing rows keep their values, and the
+/// `content_kind` default ensures no NULL constraint violations on V2 data.
+pub const MIGRATION_V3: &str = r#"
+ALTER TABLE entries ADD COLUMN content_kind TEXT NOT NULL DEFAULT 'text';
+ALTER TABLE entries ADD COLUMN mime_type TEXT;
+ALTER TABLE entries ADD COLUMN payload BLOB;
+ALTER TABLE entries ADD COLUMN payload_nonce BLOB;
+ALTER TABLE entries ADD COLUMN metadata_json TEXT;
+"#;
+
 /// Run all schema migrations, bringing the database from whatever
 /// `user_version` it currently has up to date.
 ///
-/// Handles 0 → 1 (V1 base schema) and 1 → 2 (add `nonce`).
+/// Handles 0 → 1 (V1 base schema), 1 → 2 (add `nonce`), and 2 → 3 (add
+/// content_kind / mime_type / payload / payload_nonce / metadata_json).
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     let mut user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -133,6 +163,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(MIGRATION_V2)?;
         tx.execute("PRAGMA user_version = 2", [])?;
+        tx.commit()?;
+        user_version = 2;
+    }
+
+    if user_version == 2 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_V3)?;
+        tx.execute("PRAGMA user_version = 3", [])?;
         tx.commit()?;
     }
 
@@ -167,7 +205,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
     }
 
     #[test]
@@ -206,7 +244,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
     }
 
     #[test]
@@ -220,7 +258,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn
@@ -252,10 +290,30 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 2, "should be at V2 after migration");
+        assert_eq!(uv, 3, "should be at V3 after migration");
         assert!(
             column_exists(&conn, "entries", "nonce"),
-            "V2 must add the nonce column"
+            "V3 must retain the nonce column from V2"
+        );
+        assert!(
+            column_exists(&conn, "entries", "content_kind"),
+            "V3 must add content_kind column"
+        );
+        assert!(
+            column_exists(&conn, "entries", "mime_type"),
+            "V3 must add mime_type column"
+        );
+        assert!(
+            column_exists(&conn, "entries", "payload"),
+            "V3 must add payload column"
+        );
+        assert!(
+            column_exists(&conn, "entries", "payload_nonce"),
+            "V3 must add payload_nonce column"
+        );
+        assert!(
+            column_exists(&conn, "entries", "metadata_json"),
+            "V3 must add metadata_json column"
         );
     }
 

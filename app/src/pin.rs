@@ -25,7 +25,8 @@ use crate::storage::Storage;
 
 /// 读回整行 entry 的列清单（顺序须与 [`Entry::from_sqlite_row`] 对齐）。
 const SELECT_ONE: &str = "SELECT id, content_hash, content, note, auto_category, \
-     is_pinned, pinned_at, is_vault, is_decryptable, created_at \
+     is_pinned, pinned_at, is_vault, is_decryptable, created_at, \
+     content_kind, mime_type, payload, payload_nonce, metadata_json \
      FROM entries WHERE id = ?1";
 
 /// 切换 `id` 条目的置顶状态，返回刷新后的 [`Entry`]。

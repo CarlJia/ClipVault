@@ -93,6 +93,11 @@ fn plain_entry(content: &str) -> Entry {
         0, // is_vault
         1, // is_decryptable
         0,
+        "text".to_string(),   // content_kind (V3)
+        None,                 // mime_type
+        None,                 // payload
+        None,                 // payload_nonce
+        None,                 // metadata_json
     )
 }
 
@@ -109,6 +114,11 @@ fn vault_entry() -> Entry {
         1, // is_vault
         1,
         0,
+        "text".to_string(),   // content_kind (V3)
+        None,
+        None,
+        None,
+        None,
     )
 }
 

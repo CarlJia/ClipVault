@@ -45,7 +45,8 @@ pub enum SearchTab {
 }
 
 const SELECT_COLS: &str = "e.id, e.content_hash, e.content, e.note, e.auto_category, \
-     e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at";
+     e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at, \
+     e.content_kind, e.mime_type, e.payload, e.payload_nonce, e.metadata_json";
 
 /// Pin 优先 + 时间倒序（R17）。`pinned_at` nulls-last 手工兜底。
 pub(crate) const PIN_ORDER: &str = "e.is_pinned DESC, \

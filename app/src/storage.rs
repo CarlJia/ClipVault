@@ -19,7 +19,8 @@ pub const MAX_NOTE_CHARS: usize = 2000;
 /// entries 表的标准列清单（顺序须与 [`Entry::from_sqlite_row`] 对齐）。
 /// 通过 `format!` 内联进各 `SELECT`，与 `search.rs` 的 `SELECT_COLS` 同理。
 const ENTRY_COLS: &str = "id, content_hash, content, note, auto_category, \
-     is_pinned, pinned_at, is_vault, is_decryptable, created_at";
+     is_pinned, pinned_at, is_vault, is_decryptable, created_at, \
+     content_kind, mime_type, payload, payload_nonce, metadata_json";
 
 /// `is_vault` 三态标记的原始整数值：明文 / 已加密 / 加密中（pending）。
 const VAULT_PLAINTEXT: i32 = 0;
@@ -81,6 +82,10 @@ impl Storage {
     /// # Errors
     /// Returns a SQLite error (constraint violation) if `content_hash`
     /// already exists (duplicate fingerprint).
+    ///
+    /// V3 schema: `content_kind` defaults to `"text"`, all binary columns
+    /// default to `NULL`. Use [`Storage::insert_entry_binary`] for non-text
+    /// kinds (image/file/rtf/color).
     pub async fn insert_entry(
         &self,
         content_hash: &str,
@@ -92,6 +97,45 @@ impl Storage {
                 "INSERT INTO entries (content_hash, content, auto_category)
                  VALUES (?1, ?2, ?3)",
                 params![content_hash, content, auto_category],
+            )?;
+            Ok(conn.last_insert_rowid())
+        })
+        .await
+    }
+
+    /// Insert a binary-kind entry (V3 schema).
+    ///
+    /// Use for image/file/rtf/color captures. The text `content` field is left
+    /// empty (descriptive text lives in `metadata_json`); the binary bytes go
+    /// in `payload`. `payload_nonce` and `metadata_json` are optional — pass
+    /// `None` when the entry is not in the vault or has no structured metadata.
+    pub async fn insert_entry_binary(
+        &self,
+        content_hash: &str,
+        content_kind: &str,
+        mime_type: Option<&str>,
+        payload: &[u8],
+        payload_nonce: Option<&[u8]>,
+        metadata_json: Option<&str>,
+    ) -> SqliteResult<i64> {
+        let payload_vec = payload.to_vec();
+        let payload_nonce_vec = payload_nonce.map(|n| n.to_vec());
+        let metadata_owned = metadata_json.map(|s| s.to_string());
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO entries
+                 (content_hash, content, auto_category, content_kind,
+                  mime_type, payload, payload_nonce, metadata_json)
+                 VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    content_hash,
+                    content_kind,   // auto_category mirrors content_kind for binary
+                    content_kind,
+                    mime_type,
+                    payload_vec,
+                    payload_nonce_vec,
+                    metadata_owned,
+                ],
             )?;
             Ok(conn.last_insert_rowid())
         })
@@ -820,7 +864,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_migration_zero_to_one() {
+    async fn schema_migration_zero_to_three() {
         use rusqlite::Connection;
 
         // Simulate a fresh DB with user_version=0.
@@ -832,7 +876,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 2);
+        assert_eq!(uv, 3);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn
