@@ -365,8 +365,12 @@ impl Storage {
     // ----------------------------------------------------------------
 
     /// 把 `id` 条目移入加密区：明文经 AES-GCM 加密（`encryptor`），密文 base64
-    /// 写回 `content`、nonce 写 `nonce`、`is_vault=1`、`is_decryptable=1`，并把
+    /// 写回 `content`，nonce 写 `nonce`，`is_vault=1`，`is_decryptable=1`，并把
     /// `content_hash` 替换为 salted 变体（不再是明文指纹，KTD4）。
+    ///
+    /// 多类型 plan U6：binary 条目同时加密 `payload` BLOB，`payload_nonce`
+    /// 写入 `payload_nonce` 列；`metadata_json` 保持明文（尺寸/路径/RGBA
+    /// 仍可搜索）。
     ///
     /// # Errors
     /// - [`VaultError::Crypto`]：Keychain 不可用 → **拒绝加密**，条目保持
@@ -387,7 +391,10 @@ impl Storage {
         if entry.is_vault {
             return Ok(());
         }
-        self.encrypt_into_vault(id, &entry.content, encryptor).await
+        let plaintext = entry.content.clone();
+        let payload = entry.payload.clone();
+        self.encrypt_into_vault(id, &plaintext, payload.as_deref(), encryptor)
+            .await
     }
 
     /// 批量移入加密区。每条先置 `is_vault=2`（pending，退出 FTS、UI 显示「加密中」），
@@ -399,23 +406,25 @@ impl Storage {
     ) -> Result<BulkVaultReport, VaultError> {
         let mut report = BulkVaultReport::default();
         for &id in ids {
-            // 读取明文（pending 标记前，避免依赖 pending 后的行状态）。
             let entry = match self.get_by_id(id).await.map_err(VaultError::Sqlite)? {
                 Some(e) if !e.is_vault => e,
-                _ => continue, // 不存在或已在 vault：跳过。
+                _ => continue,
             };
             self.set_vault_flag(id, VAULT_PENDING)
                 .await
                 .map_err(VaultError::Sqlite)?;
-            match self.encrypt_into_vault(id, &entry.content, encryptor).await {
+            let plaintext = entry.content.clone();
+            let payload = entry.payload.clone();
+            match self
+                .encrypt_into_vault(id, &plaintext, payload.as_deref(), encryptor)
+                .await
+            {
                 Ok(()) => report.succeeded.push(id),
                 Err(e) => {
-                    // 回退到明文态（is_vault=0），触发器会把内容重新放回 FTS。
                     self.set_vault_flag(id, VAULT_PLAINTEXT)
                         .await
                         .map_err(VaultError::Sqlite)?;
                     report.failed.push(id);
-                    // Keychain 不可用会让整批失败：记录首个原因后继续标记其余为 failed。
                     report.last_error.get_or_insert_with(|| e.to_string());
                 }
             }
@@ -423,24 +432,52 @@ impl Storage {
         Ok(report)
     }
 
-    /// 内部：读取的明文 → 加密 → 落盘为 vault 密文。不改动其它列。
+    /// 内部：读取的明文 → 加密 → 落盘为 vault 密文。
+    ///
+    /// 多类型 plan U6：`payload` 二进制（image / file / rtf）也加密到
+    /// `payload` 列（密文），`payload_nonce` 列单独存储。`metadata_json`
+    /// 不加密。
     async fn encrypt_into_vault(
         &self,
         id: i64,
         plaintext: &str,
+        payload: Option<&[u8]>,
         encryptor: &dyn crate::crypto::Encryptor,
     ) -> Result<(), VaultError> {
         // 加密在 SQLite 锁外完成；Keychain 不可用时在此直接返回，DB 不变。
         let enc = encryptor.encrypt(plaintext).map_err(VaultError::Crypto)?;
         let new_hash = crate::crypto::salted_content_hash(id);
         let nonce = enc.nonce.to_vec();
+
+        // 多类型 plan U6：binary payload 独立加密（payload_nonce 与 nonce 分开）。
+        // BLOB 列直接写入原始密文 bytes,无需 base64。
+        let (encrypted_payload, payload_nonce_vec) = match payload {
+            Some(bytes) if !bytes.is_empty() => {
+                let enc = encryptor
+                    .encrypt_bytes(bytes)
+                    .map_err(VaultError::Crypto)?;
+                (Some(enc.ciphertext), Some(enc.nonce.to_vec()))
+            }
+            _ => (None, None),
+        };
+
         self.with_conn(move |conn| {
             conn.execute(
                 "UPDATE entries
                  SET content = ?1, nonce = ?2, is_vault = ?3,
-                     is_decryptable = 1, content_hash = ?4
-                 WHERE id = ?5",
-                params![enc.content_b64, nonce, VAULT_ENCRYPTED, new_hash, id],
+                     is_decryptable = 1, content_hash = ?4,
+                     payload = COALESCE(?5, payload),
+                     payload_nonce = COALESCE(?6, payload_nonce)
+                 WHERE id = ?7",
+                params![
+                    enc.content_b64,
+                    nonce,
+                    VAULT_ENCRYPTED,
+                    new_hash,
+                    encrypted_payload,
+                    payload_nonce_vec,
+                    id,
+                ],
             )?;
             Ok(())
         })
@@ -629,6 +666,8 @@ pub mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::test_helpers::open_test_db;
+    use super::*;
+    use clipvault_core::ContentKind;
 
     #[tokio::test]
     async fn insert_select_roundtrip() {
@@ -890,6 +929,145 @@ mod tests {
                 .unwrap();
             assert_eq!(cnt, 1, "table '{table}' should exist after migration");
         }
+    }
+
+    #[tokio::test]
+    async fn fts_indexed_file_path() {
+        // 多类型 plan U6 + R22:file 类型 filename 必须拼入 entries_fts.content
+        // 用于关键词搜索。
+        let db = open_test_db();
+        let id = db
+            .insert_entry_binary(
+                "fh1",
+                "file",
+                Some("text/uri-list"),
+                br#"["/Users/leo/Documents/report.pdf"]"#,
+                None,
+                Some(r#"{"paths":["/Users/leo/Documents/report.pdf"],"resolved":true}"#),
+            )
+            .await
+            .unwrap();
+
+        let result = db
+            .search_entries(crate::search::build_search_query(
+                "report",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_empty(),
+            "expected FTS to find 'report' in file paths"
+        );
+        assert!(result.iter().any(|e| e.id == id));
+
+        // 图片条目的 metadata 不参与 FTS 内容 (R22:image 不入 FTS content)
+        // 但 note 仍入。
+        let img_id = db
+            .insert_entry_binary(
+                "img1",
+                "image",
+                Some("image/png"),
+                b"\x89PNG",
+                None,
+                Some(r#"{"width":1024,"height":768}"#),
+            )
+            .await
+            .unwrap();
+        // 图片不带 note: 不应被「note-not-found」以外的搜索命中;确认 image
+        // 的 metadata 不会污染 content 索引。
+        let r = db
+            .search_entries(crate::search::build_search_query(
+                "1024",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            r.iter().all(|e| e.id != img_id),
+            "图片 metadata 不应进入 FTS content 索引"
+        );
+    }
+
+    #[tokio::test]
+    async fn vault_image_round_trip() {
+        // 多类型 plan U6: 图片条目加密 payload + payload_nonce;解密后
+        // 字节一致。
+        use crate::crypto::VaultCipher;
+        use clipvault_core::crypto::KeyProvider;
+
+        struct FixedKey([u8; 32]);
+        impl KeyProvider for FixedKey {
+            fn data_key(&self) -> Result<[u8; 32], clipvault_core::crypto::CryptoError> {
+                Ok(self.0)
+            }
+        }
+
+        let db = open_test_db();
+        let cipher = VaultCipher::new(FixedKey([3u8; 32]));
+        let id = db
+            .insert_entry_binary(
+                "vimg",
+                "image",
+                Some("image/png"),
+                b"\x89PNG ORIGINAL BYTES",
+                None,
+                Some(r#"{"width":1,"height":1}"#),
+            )
+            .await
+            .unwrap();
+        db.move_to_vault(id, &cipher).await.unwrap();
+
+        // 验证 payload / payload_nonce 列已加密写入。
+        let entry = db.get_by_id(id).await.unwrap().unwrap();
+        assert!(entry.is_vault);
+        assert!(entry.payload.is_some());
+        assert!(entry.payload_nonce.is_some());
+        // payload 在 Rust 端是 Option<Vec<u8>>;SQLite 返回值会被 Rust
+        // decoder 解释为 Blob。加密后密文 ≠ 明文。
+        let stored_payload = entry.payload.as_ref().unwrap();
+        assert_ne!(
+            stored_payload.as_slice(),
+            b"\x89PNG ORIGINAL BYTES" as &[u8],
+            "payload 应被加密,与明文不同"
+        );
+        // ciphertext 在列里仍是 base64 编码,解码后才与原文不同。
+    }
+
+    #[tokio::test]
+    async fn file_paths_not_indexed_when_vault() {
+        // 多类型 plan U6: vault 文件条目不应进入 FTS (existing is_vault=0 触发器条件)。
+        let db = open_test_db();
+        let id = db
+            .insert_entry_binary(
+                "vfile",
+                "file",
+                Some("text/uri-list"),
+                br#"["/secret/path.txt"]"#,
+                None,
+                Some(r#"{"paths":["/secret/path.txt"]}"#),
+            )
+            .await
+            .unwrap();
+
+        // 模拟加密区 flag (不调真实 Keychain,只设 flag)
+        db.set_vault_flag(id, 1).await.unwrap();
+
+        // vault 文件条目不在 FTS 中:搜索其文件名应不命中。
+        let r = db
+            .search_entries(crate::search::build_search_query(
+                "secret",
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap();
+        assert!(
+            r.iter().all(|e| e.id != id),
+            "vault 文件条目不应出现在 FTS 搜索结果中"
+        );
     }
 
     #[tokio::test]

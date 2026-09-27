@@ -46,6 +46,9 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
 );
 
 -- Sync trigger: INSERT on entries (skip vault rows)
+-- U6 multi-type plan: file kind entries get paths from metadata_json into
+-- the FTS content column (filename search via R22). Image/rtf/color leave
+-- content empty (R22: those kinds do not contribute to FTS).
 CREATE TRIGGER IF NOT EXISTS entries_fts_insert
 AFTER INSERT ON entries
 WHEN NEW.is_vault = 0
@@ -53,22 +56,32 @@ BEGIN
     INSERT INTO entries_fts(rowid, content, note, tags_text)
     VALUES (
         NEW.id,
-        NEW.content,
+        CASE WHEN NEW.content_kind = 'file'
+             THEN COALESCE(json_extract(NEW.metadata_json, '$.paths'), '')
+             ELSE NEW.content
+        END,
         NEW.note,
         COALESCE((SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = NEW.id), '')
     );
 END;
 
--- Sync trigger: UPDATE on entries (handle is_vault transitions)
+-- Sync trigger: UPDATE on entries (handle is_vault transitions and kind changes)
+-- U6: same kind-aware content extraction as the INSERT trigger so that
+-- kind transitions (e.g. file -> vault -> file) correctly re-index.
 CREATE TRIGGER IF NOT EXISTS entries_fts_update
 AFTER UPDATE ON entries
 BEGIN
-    -- If the row is now non-vault, upsert into FTS
     DELETE FROM entries_fts WHERE rowid = OLD.id;
     INSERT INTO entries_fts(rowid, content, note, tags_text)
     SELECT
         NEW.id,
-        CASE WHEN NEW.is_vault = 0 THEN NEW.content ELSE '' END,
+        CASE WHEN NEW.is_vault = 0
+             THEN CASE WHEN NEW.content_kind = 'file'
+                       THEN COALESCE(json_extract(NEW.metadata_json, '$.paths'), '')
+                       ELSE NEW.content
+                  END
+             ELSE ''
+        END,
         CASE WHEN NEW.is_vault = 0 THEN NEW.note ELSE '' END,
         CASE WHEN NEW.is_vault = 0 THEN COALESCE((SELECT GROUP_CONCAT(tag, ', ') FROM tags WHERE entry_id = NEW.id), '') ELSE '' END
     WHERE NEW.is_vault = 0;

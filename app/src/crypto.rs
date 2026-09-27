@@ -27,6 +27,17 @@ pub struct EncryptedContent {
     pub nonce: [u8; NONCE_LEN],
 }
 
+/// 多类型 plan U6：`move_to_vault` 加密 binary payload 的落盘表示。
+/// 密文是 AES-GCM 输出原始 bytes（写入 `entries.payload` BLOB 列）；
+/// nonce 写入 `entries.payload_nonce`（BLOB 列）。注意 `EncryptedContent`
+/// 与本结构不同——文本密文走 base64 是为了在 TEXT 列保持 UTF-8 合法，
+/// BLOB 列没有这个限制。
+#[derive(Debug, Clone)]
+pub struct EncryptedBytes {
+    pub ciphertext: Vec<u8>,
+    pub nonce: [u8; NONCE_LEN],
+}
+
 /// 加密接缝：明文 → 落盘表示。Keychain 不可用时返回 [`CryptoError::KeyUnavailable`]，
 /// 调用方（`move_to_vault`）据此**拒绝加密**、不落盘任何明文到 vault（plan U9）。
 ///
@@ -34,6 +45,16 @@ pub struct EncryptedContent {
 /// 跨 await 持有 `&dyn Encryptor`。
 pub trait Encryptor: Send + Sync {
     fn encrypt(&self, plaintext: &str) -> Result<EncryptedContent, CryptoError>;
+    /// 多类型 plan U6：加密 vault binary payload BLOB。
+    /// 默认实现：使用同一 KeyProvider key 做 AES-GCM，返回原始密文 bytes +
+    /// 独立 nonce。密文是 GCM 输出（已含 tag），直接写入 BLOB 列。
+    fn encrypt_bytes(&self, bytes: &[u8]) -> Result<EncryptedBytes, CryptoError> {
+        let key = self.data_key()?;
+        let (ciphertext, nonce) = crypto::encrypt(&key, bytes);
+        Ok(EncryptedBytes { ciphertext, nonce })
+    }
+    /// Subclass hook: same pattern as Decryptor::data_key.
+    fn data_key(&self) -> Result<[u8; clipvault_core::crypto::KEY_LEN], CryptoError>;
 }
 
 /// 解密接缝：`(base64 密文, nonce)` → 明文。密钥不可用或认证失败均返回 `Err`。
@@ -76,6 +97,10 @@ impl<P: KeyProvider> Encryptor for VaultCipher<P> {
             content_b64: B64.encode(ciphertext),
             nonce,
         })
+    }
+
+    fn data_key(&self) -> Result<[u8; clipvault_core::crypto::KEY_LEN], CryptoError> {
+        self.provider.data_key()
     }
 }
 
