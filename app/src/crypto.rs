@@ -39,6 +39,20 @@ pub trait Encryptor: Send + Sync {
 /// 解密接缝：`(base64 密文, nonce)` → 明文。密钥不可用或认证失败均返回 `Err`。
 pub trait Decryptor: Send + Sync {
     fn decrypt(&self, stored_content: &str, nonce: &[u8]) -> Result<String, CryptoError>;
+    /// 解密 vault 二进制 payload（U4 multi-type plan）。
+    /// 默认实现：base64 解码后调 [`crypto::decrypt`]。子类可重写以处理
+    /// 未 base64 编码的原始密文 BLOB。
+    fn decrypt_bytes(&self, stored_bytes: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptoError> {
+        let key = self.data_key()?;
+        let nonce_arr: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
+        let s = std::str::from_utf8(stored_bytes).map_err(|_| CryptoError::Decrypt)?;
+        let ciphertext = B64.decode(s).map_err(|_| CryptoError::Decrypt)?;
+        crypto::decrypt(&key, &ciphertext, &nonce_arr)
+    }
+    /// Subclass hook: give trait impls access to the underlying key provider
+    /// for default-impl reuse. Concrete [`VaultCipher`] wires its own
+    /// [`KeyProvider`].
+    fn data_key(&self) -> Result<[u8; clipvault_core::crypto::KEY_LEN], CryptoError>;
 }
 
 /// 泛型于 [`KeyProvider`] 的 vault 加解密器。
@@ -74,6 +88,10 @@ impl<P: KeyProvider> Decryptor for VaultCipher<P> {
         let nonce: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
         let plaintext = crypto::decrypt(&key, &ciphertext, &nonce)?;
         String::from_utf8(plaintext).map_err(|_| CryptoError::Decrypt)
+    }
+
+    fn data_key(&self) -> Result<[u8; clipvault_core::crypto::KEY_LEN], CryptoError> {
+        self.provider.data_key()
     }
 }
 

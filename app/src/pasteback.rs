@@ -29,7 +29,7 @@
 //! 系统升级后 TCC 缓存失效),故 [`RealAccessibilityChecker`] 调用它;首启引导
 //! 走前端深链按钮而非系统弹窗,因此不需要 options 变体。
 
-use clipvault_core::Entry;
+use clipvault_core::{ContentKind, Entry};
 
 /// 目标窗口在回贴后失焦时的固定提示(计划 U8 step 3)。
 pub const WINDOW_SWITCHED_MSG: &str = "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴";
@@ -81,8 +81,19 @@ pub trait AccessibilityChecker {
 /// 平台副作用接缝:剪贴板写入、失焦前的面板隐藏、⌘V 模拟、前台应用读取。
 /// 真机走 macOS 实现;测试用 mock 记录调用轨迹并驱动失败路径。
 pub trait PasteBackend {
-    /// `NSPasteboard.clearContents()` + `setString:forType:`。
-    fn write_clipboard(&self, content: &str);
+    /// 写入剪贴板:多类型 plan U4 按 `kind` 分发到 `setString` /
+    /// `setData` / `setPropertyList`。
+    ///
+    /// `content` 仅 `Text` 类型使用;`payload` 是二进制 bytes (image / rtf
+    /// / file),`mime` 用于 image 子类型 PNG / JPEG / TIFF 派发。`color`
+    /// 走 `content`(rgba 文本)。
+    fn write_clipboard(
+        &self,
+        kind: ContentKind,
+        content: &str,
+        payload: Option<&[u8]>,
+        mime: Option<&str>,
+    );
     /// 在模拟按键前把键盘焦点还给目标应用(隐藏 ClipVault 面板,F2)。
     fn refocus_target(&self);
     /// 通过 CGEvent 模拟 ⌘V。事件创建或投递失败时返回 [`InjectError`]。
@@ -91,14 +102,17 @@ pub trait PasteBackend {
     fn frontmost_app(&self) -> Option<String>;
 }
 
-/// 加密区解密接缝（U9 已实现）。
+/// 加密区解密接缝（U9 已实现，U4 多类型 plan 扩展）。
 ///
-/// - 非 vault 条目：直接返回明文 `content`（`nonce` / `decryptor` 被忽略）。
-/// - vault 条目：用 `decryptor`（Keychain 数据密钥 + AES-GCM）解密 `content`
-///   （base64 密文）配 `nonce`。Keychain 不可用、密钥不匹配或 nonce 缺失 →
+/// - 文本条目：直接返回明文 `content`（`nonce` / `decryptor` 被忽略）。
+/// - vault 文本条目：用 `decryptor`（Keychain 数据密钥 + AES-GCM）解密
+///   `content`（base64 密文）配 `nonce`。
+/// - vault 二进制条目：用 `decryptor` 解密 `payload`（BLOB）配
+///   `payload_nonce`。Keychain 不可用、密钥不匹配或 nonce 缺失 →
 ///   返回 [`PasteError::VaultDecryptFailed`]，**不返回错误明文**。
 ///
 /// `nonce` 由调用方（`commands::paste_entry`）在读条目时一并从存储取出。
+/// `payload_nonce` 同理；非二进制或非 vault 条目为 `None`。
 pub fn decrypt_content(
     entry: &Entry,
     nonce: Option<&[u8]>,
@@ -111,6 +125,24 @@ pub fn decrypt_content(
             .map_err(|_| PasteError::VaultDecryptFailed)
     } else {
         Ok(entry.content.clone())
+    }
+}
+
+/// 解密 vault 二进制条目（U4 multi-type plan）。文本条目走
+/// [`decrypt_content`]；非 vault 二进制条目 payload 已是明文。
+pub fn decrypt_payload(
+    entry: &Entry,
+    payload: &[u8],
+    payload_nonce: Option<&[u8]>,
+    decryptor: &dyn crate::crypto::Decryptor,
+) -> Result<Vec<u8>, PasteError> {
+    if entry.is_vault {
+        let nonce = payload_nonce.ok_or(PasteError::VaultDecryptFailed)?;
+        decryptor
+            .decrypt_bytes(payload, nonce)
+            .map_err(|_| PasteError::VaultDecryptFailed)
+    } else {
+        Ok(payload.to_vec())
     }
 }
 
@@ -133,14 +165,34 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
     entry: &Entry,
     prev_frontmost: Option<&str>,
     nonce: Option<&[u8]>,
+    payload_nonce: Option<&[u8]>,
     decryptor: &dyn crate::crypto::Decryptor,
 ) -> Result<PasteOutcome, PasteError> {
     // 1. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
-    let content = decrypt_content(entry, nonce, decryptor)?;
+    //    - text kind: 走 `decrypt_content`(base64 解码 entry.content 配 nonce)。
+    //    - 非 text kind: entry.content 留空;vault 条目需要 `decrypt_payload` 解密
+    //      payload BLOB;非 vault 条目 payload 是明文,直接用。
+    let kind = ContentKind::parse(&entry.content_kind);
+    let text = if matches!(kind, ContentKind::Text) {
+        decrypt_content(entry, nonce, decryptor)?
+    } else {
+        String::new()
+    };
+    let payload_bytes: Option<Vec<u8>> = if matches!(kind, ContentKind::Text) {
+        None
+    } else {
+        let raw = entry.payload.as_deref().unwrap_or(&[]);
+        Some(decrypt_payload(entry, raw, payload_nonce, decryptor)?)
+    };
 
     // 2. 写剪贴板。写剪贴板不需要 Accessibility 权限,故先于授权检查——
     //    保证即便未授权,内容也已在系统剪贴板,用户可手动 ⌘V。
-    backend.write_clipboard(&content);
+    backend.write_clipboard(
+        kind,
+        &text,
+        payload_bytes.as_deref(),
+        entry.mime_type.as_deref(),
+    );
 
     // 3. 授权校验(每调用重新校验,防 TCC 静默失效)。未授权时内容已在剪贴板,
     //    只是无法模拟 ⌘V,返回降级结果而非整体失败。
@@ -169,7 +221,7 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
 // ================================================================
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{AccessibilityChecker, InjectError, PasteBackend};
+    use super::{AccessibilityChecker, ContentKind, InjectError, PasteBackend};
 
     // ---- Accessibility ----
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -208,14 +260,68 @@ mod imp {
     }
 
     impl PasteBackend for MacosBackend {
-        fn write_clipboard(&self, content: &str) {
-            use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        fn write_clipboard(
+            &self,
+            kind: ContentKind,
+            content: &str,
+            payload: Option<&[u8]>,
+            mime: Option<&str>,
+        ) {
+            use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF};
             use objc2_foundation::NSString;
 
             let pasteboard = NSPasteboard::generalPasteboard();
             pasteboard.clearContents();
-            let ns = NSString::from_str(content);
-            let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+
+            match kind {
+                ContentKind::Text => {
+                    let ns = NSString::from_str(content);
+                    let _ = unsafe {
+                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
+                    };
+                }
+                ContentKind::Image => {
+                    let bytes = payload.unwrap_or(&[]);
+                    let nsdata = objc2_foundation::NSData::from_vec(bytes.to_vec());
+                    let pb_type = unsafe {
+                        match mime.unwrap_or("image/png") {
+                            "image/tiff" => NSPasteboardTypeTIFF,
+                            _ => NSPasteboardTypePNG,
+                        }
+                    };
+                    let _ = unsafe { pasteboard.setData_forType(Some(&nsdata), pb_type) };
+                }
+                ContentKind::File => {
+                    // payload 是 JSON-encoded Vec<String>。真实生产应转 NSArray<NSString>
+                    // 写 .filenames (NSFilenamesPboardType) 以让 Finder / Slack 文件
+                    // 上传框等接受;objc2 0.3 当前未暴露 writeObjects 所需的
+                    // ProtocolObject<NSArray<NSString>> 路径，且 setPropertyList_forType
+                    // 需要 AnyObject 桥接（遗留 nspasteboard 类型常量为 NSFilenamesPboardType
+                    // 字符串字面量）。MVP U4 阶段采用 setString_forType 退化路径：
+                    // 把 paths 用 `\n` 拼接写为文本，目标应用收到纯文本路径列表
+                    // （AE10 已声明 "若目标应用不支持文件引用，toast 提示降级"）。
+                    // 后续增强：补 setPropertyList_forType 把 paths 转 NSArray 写 .filenames。
+                    let paths: Vec<String> = serde_json::from_slice(payload.unwrap_or(&[]))
+                        .unwrap_or_default();
+                    let joined = paths.join("\n");
+                    let ns = objc2_foundation::NSString::from_str(&joined);
+                    let _ = unsafe {
+                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
+                    };
+                }
+                ContentKind::Rtf => {
+                    let bytes = payload.unwrap_or(&[]);
+                    let nsdata = objc2_foundation::NSData::from_vec(bytes.to_vec());
+                    let _ = unsafe { pasteboard.setData_forType(Some(&nsdata), NSPasteboardTypeRTF) };
+                }
+                ContentKind::Color => {
+                    // color 走 rgba() 文本字符串写入 .string 类型。
+                    let ns = NSString::from_str(content);
+                    let _ = unsafe {
+                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
+                    };
+                }
+            }
         }
 
         fn refocus_target(&self) {

@@ -286,6 +286,19 @@ pub async fn paste_entry(
         } else {
             None
         };
+        let payload_nonce = if entry.is_vault && entry.content_kind != "text" {
+            // 多类型 plan U4:binary vault 条目需要 payload_nonce 才能解密 payload BLOB。
+            // 现有 get_vault_nonce 读 entries.nonce 列;此处复用同一函数
+            // (content_kind 已确保 kind 与 nonce 列对应:nonce 保护文本 content,
+            //  payload_nonce 保护 payload BLOB)。
+            state
+                .storage
+                .get_vault_nonce(id)
+                .await
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
 
         let prev = crate::hotkey::last_frontmost();
         let win = window.clone();
@@ -300,6 +313,7 @@ pub async fn paste_entry(
                 &entry,
                 prev.as_deref(),
                 nonce.as_deref(),
+                payload_nonce.as_deref(),
                 &decryptor,
             )
         })
