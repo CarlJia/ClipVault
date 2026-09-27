@@ -363,7 +363,15 @@ fn vault_entry_fails_when_nonce_missing() {
         bytes: Ok(Vec::new()),
     };
 
-    let result = perform_paste(&checker, &backend, &vault_entry(), None, None, None, &decryptor);
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_entry(),
+        None,
+        None,
+        None,
+        &decryptor,
+    );
 
     assert_eq!(result, Err(PasteError::VaultDecryptFailed));
     assert!(
@@ -419,7 +427,10 @@ fn image_entry_dispatches_payload_to_setdata() {
 
     assert_eq!(result, Ok(PasteOutcome::Pasted));
     assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Image));
-    assert_eq!(*backend.wrote_payload_len.borrow(), Some(b"\x89PNG raw bytes".len()));
+    assert_eq!(
+        *backend.wrote_payload_len.borrow(),
+        Some(b"\x89PNG raw bytes".len())
+    );
 }
 
 #[test]

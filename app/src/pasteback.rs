@@ -267,7 +267,10 @@ mod imp {
             payload: Option<&[u8]>,
             mime: Option<&str>,
         ) {
-            use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString, NSPasteboardTypeTIFF};
+            use objc2_app_kit::{
+                NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeRTF, NSPasteboardTypeString,
+                NSPasteboardTypeTIFF,
+            };
             use objc2_foundation::NSString;
 
             let pasteboard = NSPasteboard::generalPasteboard();
@@ -276,9 +279,7 @@ mod imp {
             match kind {
                 ContentKind::Text => {
                     let ns = NSString::from_str(content);
-                    let _ = unsafe {
-                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
-                    };
+                    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
                 }
                 ContentKind::Image => {
                     let bytes = payload.unwrap_or(&[]);
@@ -301,25 +302,22 @@ mod imp {
                     // 把 paths 用 `\n` 拼接写为文本，目标应用收到纯文本路径列表
                     // （AE10 已声明 "若目标应用不支持文件引用，toast 提示降级"）。
                     // 后续增强：补 setPropertyList_forType 把 paths 转 NSArray 写 .filenames。
-                    let paths: Vec<String> = serde_json::from_slice(payload.unwrap_or(&[]))
-                        .unwrap_or_default();
+                    let paths: Vec<String> =
+                        serde_json::from_slice(payload.unwrap_or(&[])).unwrap_or_default();
                     let joined = paths.join("\n");
                     let ns = objc2_foundation::NSString::from_str(&joined);
-                    let _ = unsafe {
-                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
-                    };
+                    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
                 }
                 ContentKind::Rtf => {
                     let bytes = payload.unwrap_or(&[]);
                     let nsdata = objc2_foundation::NSData::from_vec(bytes.to_vec());
-                    let _ = unsafe { pasteboard.setData_forType(Some(&nsdata), NSPasteboardTypeRTF) };
+                    let _ =
+                        unsafe { pasteboard.setData_forType(Some(&nsdata), NSPasteboardTypeRTF) };
                 }
                 ContentKind::Color => {
                     // color 走 rgba() 文本字符串写入 .string 类型。
                     let ns = NSString::from_str(content);
-                    let _ = unsafe {
-                        pasteboard.setString_forType(&ns, NSPasteboardTypeString)
-                    };
+                    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
                 }
             }
         }

@@ -84,7 +84,9 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
 
     let menu = Menu::with_items(
         app,
-        &[&open, &skip, &guest, &vault, &settings, &sep, &about, &sep, &quit],
+        &[
+            &open, &skip, &guest, &vault, &settings, &sep, &about, &sep, &quit,
+        ],
     )?;
 
     let initial = if guest_mode {

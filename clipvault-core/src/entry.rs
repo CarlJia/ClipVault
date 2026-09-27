@@ -38,7 +38,6 @@ pub struct Entry {
     pub created_at: i64,
 
     // --- V3 columns (multi-type plan) ---
-
     /// Stable content-kind label from [`crate::ContentKind::as_str`].
     /// Always `"text"` for MVP-derived rows; one of `text` / `image` / `file`
     /// / `rtf` / `color` for multi-type captures.

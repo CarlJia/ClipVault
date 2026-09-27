@@ -190,8 +190,8 @@ impl Watcher {
         };
 
         // 8. 落库。图片走 thumbnail 生成（U3）。
-        let mut metadata_to_persist = serde_json::to_string(&captured.metadata)
-            .unwrap_or_else(|_| "{}".to_string());
+        let mut metadata_to_persist =
+            serde_json::to_string(&captured.metadata).unwrap_or_else(|_| "{}".to_string());
         if matches!(captured.kind, ContentKind::Image) {
             let payload_for_thumb = captured.payload.as_deref().unwrap_or(&[]);
             let mime_for_thumb = captured.mime.as_deref().unwrap_or("");

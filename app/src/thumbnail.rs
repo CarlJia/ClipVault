@@ -41,13 +41,19 @@ pub fn make_thumbnail(bytes: &[u8], _mime: &str) -> Option<Thumbnail> {
     let primary = encode_thumbnail(&img, PRIMARY_DIM);
     if let Some(b64) = primary {
         if b64.len() <= THUMB_B64_BUDGET {
-            return Some(Thumbnail { b64, dim: PRIMARY_DIM });
+            return Some(Thumbnail {
+                b64,
+                dim: PRIMARY_DIM,
+            });
         }
     }
     let fallback = encode_thumbnail(&img, FALLBACK_DIM);
     if let Some(b64) = fallback {
         if b64.len() <= THUMB_B64_BUDGET {
-            return Some(Thumbnail { b64, dim: FALLBACK_DIM });
+            return Some(Thumbnail {
+                b64,
+                dim: FALLBACK_DIM,
+            });
         }
     }
     None

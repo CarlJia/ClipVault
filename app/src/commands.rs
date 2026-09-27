@@ -143,7 +143,10 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
 fn extract_thumb_from_metadata(s: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(s)
         .ok()
-        .and_then(|v| v.get("thumb").and_then(|t| t.as_str().map(|s| s.to_string())))
+        .and_then(|v| {
+            v.get("thumb")
+                .and_then(|t| t.as_str().map(|s| s.to_string()))
+        })
 }
 
 // ----------------------------------------------------------------
@@ -517,10 +520,7 @@ pub fn get_panel_opacity(state: State<'_, AppState>) -> u32 {
 /// 区间 → 更新共享原子（即时生效）→ 持久化到 `settings` 表（跨重启保留）。
 /// 返回 clamp 后的最终值，便于前端回填 slider 防漂移。
 #[tauri::command]
-pub async fn set_panel_opacity(
-    opacity: u32,
-    state: State<'_, AppState>,
-) -> Result<u32, String> {
+pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Result<u32, String> {
     crate::privacy::set_panel_opacity(&state.storage, &state.panel_opacity, opacity)
         .await
         .map_err(|e| e.to_string())
@@ -611,11 +611,9 @@ pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
     use std::process::Command;
 
     // 同步读取（commands 在 Tauri 主线程跑;MVP 同模式入库读取已沿用）。
-    let entry = tauri::async_runtime::block_on(async {
-        state.storage.get_by_id(id).await
-    })
-    .map_err(|e| e.to_string())?
-    .ok_or_else(|| format!("entry {id} 不存在"))?;
+    let entry = tauri::async_runtime::block_on(async { state.storage.get_by_id(id).await })
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| format!("entry {id} 不存在"))?;
 
     if entry.auto_category != "URL" {
         return Err(format!(

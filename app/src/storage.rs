@@ -129,7 +129,7 @@ impl Storage {
                  VALUES (?1, '', ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     content_hash,
-                    content_kind,   // auto_category mirrors content_kind for binary
+                    content_kind, // auto_category mirrors content_kind for binary
                     content_kind,
                     mime_type,
                     payload_vec,
@@ -453,9 +453,7 @@ impl Storage {
         // BLOB 列直接写入原始密文 bytes,无需 base64。
         let (encrypted_payload, payload_nonce_vec) = match payload {
             Some(bytes) if !bytes.is_empty() => {
-                let enc = encryptor
-                    .encrypt_bytes(bytes)
-                    .map_err(VaultError::Crypto)?;
+                let enc = encryptor.encrypt_bytes(bytes).map_err(VaultError::Crypto)?;
                 (Some(enc.ciphertext), Some(enc.nonce.to_vec()))
             }
             _ => (None, None),

@@ -130,7 +130,10 @@ pub async fn persist_panel_opacity(storage: &Storage, opacity: u32) -> SqliteRes
 
 /// 运行时应用面板透明度：更新共享原子（单一事实来源）。同步、无 I/O。
 pub fn apply_panel_opacity(flag: &AtomicU32, opacity: u32) {
-    flag.store(opacity.clamp(MIN_PANEL_OPACITY, MAX_PANEL_OPACITY), Ordering::SeqCst);
+    flag.store(
+        opacity.clamp(MIN_PANEL_OPACITY, MAX_PANEL_OPACITY),
+        Ordering::SeqCst,
+    );
 }
 
 /// 写路径：clamp 输入 → 更新共享原子（即时生效）*并*持久化到 `settings` 表。

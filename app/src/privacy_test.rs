@@ -202,7 +202,9 @@ async fn set_panel_opacity_updates_both_and_clamps() {
     let flag = AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY);
 
     // 合法值直传。
-    let r = privacy::set_panel_opacity(&storage, &flag, 60).await.unwrap();
+    let r = privacy::set_panel_opacity(&storage, &flag, 60)
+        .await
+        .unwrap();
     assert_eq!(r, 60, "返回值应回传 clamp 后的最终值");
     assert_eq!(flag.load(Ordering::SeqCst), 60, "原子应同步到 60");
     assert_eq!(
@@ -212,11 +214,15 @@ async fn set_panel_opacity_updates_both_and_clamps() {
     );
 
     // 越界值(0 / 150)→ clamp 回 [30, 100]。
-    let r = privacy::set_panel_opacity(&storage, &flag, 0).await.unwrap();
+    let r = privacy::set_panel_opacity(&storage, &flag, 0)
+        .await
+        .unwrap();
     assert_eq!(r, privacy::MIN_PANEL_OPACITY, "0 应 clamp 到 MIN");
     assert_eq!(flag.load(Ordering::SeqCst), privacy::MIN_PANEL_OPACITY);
 
-    let r = privacy::set_panel_opacity(&storage, &flag, 150).await.unwrap();
+    let r = privacy::set_panel_opacity(&storage, &flag, 150)
+        .await
+        .unwrap();
     assert_eq!(r, privacy::MAX_PANEL_OPACITY, "150 应 clamp 到 MAX");
     assert_eq!(flag.load(Ordering::SeqCst), privacy::MAX_PANEL_OPACITY);
 }

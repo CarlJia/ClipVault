@@ -110,7 +110,9 @@ async fn process_respects_skip_next() {
 #[tokio::test]
 async fn process_respects_guest_mode() {
     let (watcher, storage, _skip) = make_watcher(true, false);
-    watcher.process(Captured::text("captured while guest")).await;
+    watcher
+        .process(Captured::text("captured while guest"))
+        .await;
     assert_eq!(row_count(&storage).await, 0, "访客模式下不应入库");
 }
 
@@ -146,6 +148,8 @@ async fn process_skips_payload_over_25mb() {
     // R23: payload > 25MB 时不入库,日志一行。
     let (watcher, storage, _skip) = make_watcher(false, false);
     let big = vec![0u8; 26 * 1024 * 1024];
-    watcher.process(Captured::image("image/png", big, 1, 1)).await;
+    watcher
+        .process(Captured::image("image/png", big, 1, 1))
+        .await;
     assert_eq!(row_count(&storage).await, 0, "25MB 超限应跳过");
 }

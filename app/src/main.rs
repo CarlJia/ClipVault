@@ -38,7 +38,10 @@ fn main() {
             #[cfg(target_os = "macos")]
             {
                 use tauri::ActivationPolicy;
-                if let Err(e) = app.handle().set_activation_policy(ActivationPolicy::Accessory) {
+                if let Err(e) = app
+                    .handle()
+                    .set_activation_policy(ActivationPolicy::Accessory)
+                {
                     eprintln!("clipvault: 设置 ActivationPolicy::Accessory 失败：{e}");
                 }
             }
