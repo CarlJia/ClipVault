@@ -11,6 +11,7 @@ pub mod classify;
 pub mod commands;
 pub mod crypto;
 pub mod hotkey;
+pub mod panel;
 pub mod pasteback;
 pub mod pin;
 pub mod privacy;
@@ -20,6 +21,8 @@ pub mod thumbnail;
 pub mod tray;
 pub mod watcher;
 
+#[cfg(test)]
+mod commands_test;
 #[cfg(test)]
 mod crypto_test;
 #[cfg(test)]

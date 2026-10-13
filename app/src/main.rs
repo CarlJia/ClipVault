@@ -7,6 +7,7 @@
 //! 4. 在 tokio 运行时上 spawn U3 的 [`Watcher`]。
 //! 5. 构建菜单栏托盘（U4）。
 //! 6. 注册 Carbon 全局热键 ⌥⌘V（U4 / KTD2）。
+//! 7. 注册窗口事件钩子：面板失焦（点击面板之外）时自动收起，见 [`panel`]。
 //!
 //! 主窗口在 `tauri.conf.json` 中初始 `visible: false`，靠热键 / 托盘唤出，
 //! 符合 LSUIElement 菜单栏应用形态。
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use clipvault::commands::{self, AppState};
 use clipvault::hotkey;
+use clipvault::panel;
 use clipvault::privacy;
 use clipvault::storage::{Storage, default_db_path};
 use clipvault::tray;
@@ -28,6 +30,8 @@ use tauri::Manager;
 
 fn main() {
     tauri::Builder::default()
+        // 7. 点击面板之外 → 面板失焦 → 自动收起。
+        .on_window_event(panel::handle_window_event)
         .setup(|app| {
             // 开发模式 (`cargo tauri dev`) 下 binary 直接从 target/debug 运行,
             // 不在 .app bundle 里,系统读不到 Info.plist 的 LSUIElement=true,
@@ -130,6 +134,7 @@ fn main() {
             commands::move_to_vault,
             commands::list_vault,
             commands::clear_undecryptable,
+            commands::open_url,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClipVault");
