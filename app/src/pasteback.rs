@@ -40,15 +40,61 @@ use std::time::{Duration, Instant};
 
 use clipvault_core::{ContentKind, Entry};
 
+// ---------------- 面向用户的固定文案（平台感知） ----------------
+//
+// 这些文案里藏着两处平台差异：修饰键（macOS `⌘` / Windows `Ctrl+`）与密钥托管
+// （macOS Keychain / Windows 凭据管理器）。按仓库既有惯例（见 `storage::resolve_data_dir`），
+// 平台以**显式 bool 参数**传进纯函数、生产调用点传 [`IS_MACOS`] —— 这样 Windows 分支的
+// 文案也能在 macOS 上被单测覆盖，而不是等真机跑起来才发现写错。
+
+/// 本进程所在平台是否 macOS。生产调用点用它；纯函数本身只认显式参数。
+pub const IS_MACOS: bool = cfg!(target_os = "macos");
+
+/// 修饰键标签：macOS `⌘`，其余平台 `Ctrl+`。
+pub fn modifier_label(is_macos: bool) -> &'static str {
+    if is_macos { "⌘" } else { "Ctrl+" }
+}
+
 /// 目标窗口在回贴后失焦时的固定提示(计划 U8 step 3)。
-pub const WINDOW_SWITCHED_MSG: &str = "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴";
-/// CGEventPost 失败回退的固定提示(计划 U8 step 4,文案固定)。
-pub const CGEVENT_FAIL_MSG: &str = "回贴失败,内容已复制到剪贴板,请手动 ⌘V";
-/// 未授权 Accessibility 时的提示:内容已进剪贴板,引导用户手动 ⌘V 或开启授权。
-pub const NO_ACCESSIBILITY_MSG: &str =
-    "已复制到剪贴板,请手动 ⌘V 粘贴。开启「辅助功能」授权后可自动回贴。";
-/// 加密区条目解密失败的提示（U9：Keychain 不可用或密钥不匹配 → 不回贴）。
-pub const VAULT_DECRYPT_FAIL_MSG: &str = "加密条目解密失败（Keychain 不可用或密钥不匹配）";
+pub fn window_switched_msg(is_macos: bool) -> String {
+    format!(
+        "目标窗口已切换,内容已写入剪贴板,请手动 {}V 粘贴",
+        modifier_label(is_macos)
+    )
+}
+
+/// 按键注入失败回退的固定提示(计划 U8 step 4,文案固定)。
+///
+/// 名字里的 CGEvent 是 macOS 侧的注入手段；Windows 侧是 `SendInput`，文案本身两端通用。
+pub fn cgevent_fail_msg(is_macos: bool) -> String {
+    format!(
+        "回贴失败,内容已复制到剪贴板,请手动 {}V",
+        modifier_label(is_macos)
+    )
+}
+
+/// 未授权 Accessibility 时的提示:内容已进剪贴板,引导用户手动粘贴或开启授权。
+///
+/// Windows 上 `check_accessibility` 恒为已授权、这条不可达；文案仍按平台走，
+/// 免得留下「Windows 上也提示去开 macOS 辅助功能」的隐患。
+pub fn no_accessibility_msg(is_macos: bool) -> String {
+    format!(
+        "已复制到剪贴板,请手动 {}V 粘贴。开启「辅助功能」授权后可自动回贴。",
+        modifier_label(is_macos)
+    )
+}
+
+/// 加密区条目解密失败的提示（U9：密钥托管不可用或密钥不匹配 → 不回贴）。
+pub fn vault_decrypt_fail_msg(is_macos: bool) -> String {
+    // macOS 侧写英文 `Keychain`（与移植前逐字一致，含其后那个空格）；Windows 侧是中文
+    // 「凭据管理器」，中文与「不可用」之间不留空格。
+    let store = if is_macos {
+        "Keychain "
+    } else {
+        "凭据管理器"
+    };
+    format!("加密条目解密失败（{store}不可用或密钥不匹配）")
+}
 
 // ---------------- 还焦点的时间策略（F2） ----------------
 //

@@ -231,6 +231,23 @@ pub fn check_accessibility() -> bool {
     crate::hotkey::check_accessibility()
 }
 
+/// 平台标识（KTD16）。前端据此渲染修饰键提示（`⌘X` / `Ctrl+X`）与平台相关文案。
+///
+/// 刻意由后端给：WebView2 的 UA 串会随版本漂移，而 `std::env::consts::OS` 是事实。
+/// 前端只在启动时取一次并缓存（`frontend/src/platform.ts`）。
+#[derive(Debug, Clone, Serialize)]
+pub struct PlatformInfo {
+    /// `"macos"` | `"windows"` | `"linux"` | …（取值即 `std::env::consts::OS`）。
+    pub os: String,
+}
+
+#[tauri::command]
+pub fn platform_info() -> PlatformInfo {
+    PlatformInfo {
+        os: std::env::consts::OS.to_string(),
+    }
+}
+
 /// 关闭（隐藏）主面板。前端 `Esc` 调用。
 ///
 /// Esc 是「我不贴了」：隐藏面板的同时必须把键盘焦点交还唤出面板前的前台 App，
@@ -318,14 +335,14 @@ pub async fn paste_entry(
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         use crate::pasteback::{
-            CGEVENT_FAIL_MSG, NO_ACCESSIBILITY_MSG, PasteError, PasteOutcome,
-            RealAccessibilityChecker, RealPasteBackend, VAULT_DECRYPT_FAIL_MSG,
-            WINDOW_SWITCHED_MSG, perform_paste,
+            IS_MACOS, PasteError, PasteOutcome, RealAccessibilityChecker, RealPasteBackend,
+            cgevent_fail_msg, no_accessibility_msg, perform_paste, vault_decrypt_fail_msg,
+            window_switched_msg,
         };
 
         // 加密区条目：不可解密（如迁移机器后旧 key 丢失）直接拒绝，避免把密文贴出。
         if entry.is_vault && !entry.is_decryptable {
-            return Err(VAULT_DECRYPT_FAIL_MSG.to_string());
+            return Err(vault_decrypt_fail_msg(IS_MACOS));
         }
         // vault 条目需要 nonce 才能解密（在锁外、spawn_blocking 前异步取出）。
         let nonce = if entry.is_vault {
@@ -378,7 +395,7 @@ pub async fn paste_entry(
                 let _ = window.set_focus();
                 Ok(PasteResult {
                     status: "window_switched".to_string(),
-                    message: WINDOW_SWITCHED_MSG.to_string(),
+                    message: window_switched_msg(IS_MACOS),
                 })
             }
             Ok(PasteOutcome::ClipboardOnly) => {
@@ -386,7 +403,7 @@ pub async fn paste_entry(
                 let _ = window.set_focus();
                 Ok(PasteResult {
                     status: "clipboard_only".to_string(),
-                    message: CGEVENT_FAIL_MSG.to_string(),
+                    message: cgevent_fail_msg(IS_MACOS),
                 })
             }
             Ok(PasteOutcome::NoAccessibilityClipboardOnly) => {
@@ -396,11 +413,11 @@ pub async fn paste_entry(
                 let _ = window.set_focus();
                 Ok(PasteResult {
                     status: "no_accessibility".to_string(),
-                    message: NO_ACCESSIBILITY_MSG.to_string(),
+                    message: no_accessibility_msg(IS_MACOS),
                 })
             }
             Err(PasteError::MissingAccessibility) => Err(ERR_MISSING_ACCESSIBILITY.to_string()),
-            Err(PasteError::VaultDecryptFailed) => Err(VAULT_DECRYPT_FAIL_MSG.to_string()),
+            Err(PasteError::VaultDecryptFailed) => Err(vault_decrypt_fail_msg(IS_MACOS)),
             // `perform_paste` 从不构造这个变体（它是给"没有回贴能力的平台"准备的），
             // 走到这里说明平台 gating 出了错。文案不再写死 macOS —— 这句话在 Windows 上
             // 会是纯粹的误导。

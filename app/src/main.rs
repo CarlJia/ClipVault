@@ -116,6 +116,7 @@ fn main() {
             commands::get_all_tags,
             commands::get_categories,
             commands::check_accessibility,
+            commands::platform_info,
             commands::hide_panel,
             commands::open_accessibility_settings,
             commands::paste_entry,

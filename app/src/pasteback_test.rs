@@ -13,8 +13,9 @@ use clipvault_core::crypto::CryptoError;
 
 use crate::crypto::Decryptor;
 use crate::pasteback::{
-    AccessibilityChecker, CGEVENT_FAIL_MSG, InjectError, PasteBackend, PasteError, PasteOutcome,
-    WINDOW_SWITCHED_MSG, perform_paste, should_replace_target, wait_for_frontmost,
+    AccessibilityChecker, InjectError, PasteBackend, PasteError, PasteOutcome, cgevent_fail_msg,
+    modifier_label, no_accessibility_msg, perform_paste, should_replace_target,
+    vault_decrypt_fail_msg, wait_for_frontmost, window_switched_msg,
 };
 
 /// 固定返回布尔的 Accessibility mock。
@@ -289,10 +290,6 @@ fn window_switched_when_frontmost_changes() {
     );
 
     assert_eq!(result, Ok(PasteOutcome::WindowSwitched));
-    assert_eq!(
-        WINDOW_SWITCHED_MSG,
-        "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴"
-    );
 }
 
 #[test]
@@ -405,7 +402,53 @@ fn cgevent_failure_falls_back_to_clipboard_only() {
         Some("data"),
         "回退路径下内容仍应已在剪贴板"
     );
-    assert_eq!(CGEVENT_FAIL_MSG, "回贴失败,内容已复制到剪贴板,请手动 ⌘V");
+}
+
+// ----------------------------------------------------------------
+// 平台相关文案（U5 / RW8 / RW9）
+// ----------------------------------------------------------------
+//
+// 四个文案函数都吃一个显式 `is_macos`，所以**两个平台的分支都能在 macOS 上被断言**
+// —— 这正是把它们写成纯函数而不是 `cfg!` 分支常量的原因（同 `storage::resolve_data_dir`）。
+
+#[test]
+fn paste_messages_follow_platform_modifier() {
+    assert_eq!(modifier_label(true), "⌘");
+    assert_eq!(modifier_label(false), "Ctrl+");
+
+    // macOS：与移植前逐字一致 —— 平台化不许把 macOS 文案改坏。
+    assert_eq!(
+        window_switched_msg(true),
+        "目标窗口已切换,内容已写入剪贴板,请手动 ⌘V 粘贴"
+    );
+    assert_eq!(
+        cgevent_fail_msg(true),
+        "回贴失败,内容已复制到剪贴板,请手动 ⌘V"
+    );
+    assert_eq!(
+        no_accessibility_msg(true),
+        "已复制到剪贴板,请手动 ⌘V 粘贴。开启「辅助功能」授权后可自动回贴。"
+    );
+    assert_eq!(
+        vault_decrypt_fail_msg(true),
+        "加密条目解密失败（Keychain 不可用或密钥不匹配）"
+    );
+
+    // Windows：修饰键换成 Ctrl+，且不得再出现 ⌘。
+    for msg in [
+        window_switched_msg(false),
+        cgevent_fail_msg(false),
+        no_accessibility_msg(false),
+    ] {
+        assert!(msg.contains("Ctrl+V"), "Windows 文案应提示 Ctrl+V：{msg}");
+        assert!(!msg.contains('⌘'), "Windows 文案不该出现 ⌘：{msg}");
+    }
+
+    // Windows：密钥托管是「凭据管理器」，不是 Keychain。
+    assert_eq!(
+        vault_decrypt_fail_msg(false),
+        "加密条目解密失败（凭据管理器不可用或密钥不匹配）"
+    );
 }
 
 #[test]
