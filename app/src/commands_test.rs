@@ -101,3 +101,62 @@ fn every_tauri_command_is_registered_in_generate_handler() {
          前端 invoke 会报 `command ... not found`：{missing:?}"
     );
 }
+
+// ----------------------------------------------------------------
+// open_url 的 scheme 白名单（U7；Windows 侧 U5 复用它）
+// ----------------------------------------------------------------
+//
+// 判据抽成纯函数后，两端共用同一份校验 —— 这条正是"平台移植时最容易两端各写一遍、
+// 然后其中一端的白名单悄悄松掉"的地方。
+
+use crate::commands::openable_url;
+
+#[test]
+fn openable_url_accepts_http_and_https() {
+    assert_eq!(
+        openable_url("http://example.com/a?b=1").unwrap(),
+        "http://example.com/a?b=1"
+    );
+    assert_eq!(
+        openable_url("https://example.com").unwrap(),
+        "https://example.com"
+    );
+}
+
+#[test]
+fn openable_url_trims_surrounding_whitespace() {
+    // 剪贴板内容常带换行（从终端或多行文本里复制的 URL）。
+    assert_eq!(
+        openable_url("  https://example.com/x\n").unwrap(),
+        "https://example.com/x"
+    );
+}
+
+#[test]
+fn openable_url_rejects_dangerous_schemes() {
+    // 这些 scheme 被系统处理器接手时可能触发本地执行或脚本执行（clipboard hijacking），
+    // 一律拒绝。
+    for raw in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "data:text/html,<script>alert(1)</script>",
+        "vbscript:msgbox(1)",
+        "ftp://example.com/x",
+    ] {
+        assert!(openable_url(raw).is_err(), "{raw} 不该通过白名单");
+    }
+}
+
+#[test]
+fn openable_url_rejects_empty_and_plain_text() {
+    assert!(openable_url("").is_err());
+    assert!(openable_url("   ").is_err());
+    assert!(openable_url("example.com").is_err());
+}
+
+#[test]
+fn openable_url_is_case_sensitive_today() {
+    // 既有行为：scheme 首字母大写会被拒绝（RFC 上 scheme 不区分大小写，这是已知的严格侧偏差）。
+    // 钉住它，免得日后以为是随手写松了。
+    assert!(openable_url("HTTPS://example.com").is_err());
+}

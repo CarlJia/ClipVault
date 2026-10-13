@@ -55,13 +55,19 @@ security-framework = "3"
 # Windows 原生绑定（多平台 plan U1 起）。仅在 Windows 目标上编译，与上面的 objc2 家族对称。
 # - 剪贴板：U1 采集（OpenClipboard / GetClipboardData / CF_HDROP / CF_DIB*）与
 #   U3 回贴（SetClipboardData 写回 CF_UNICODETEXT / CF_HDROP / 注册格式 PNG）。
+# - 热键与注入：U2 RegisterHotKey、U3 SendInput（都在 Win32_UI_Input_KeyboardAndMouse）。
+# - 凭据库：U4 数据密钥（CredReadW / CredWriteW）。
 # - 选 `windows` crate 而非 `windows-sys`：前者把返回 BOOL 的 API 映射成 Result
 #   （省掉逐处 GetLastError 判定），并自带 INPUT / CREDENTIALW / DROPFILES / MSG
 #   等结构体定义 —— 手写 #[repr(C)] 布局正是 FFI 最容易出错的地方。0.61.3 已在
 #   依赖树内（tauri / wry / webview2-com 传递引入），不新解析第二个版本。
+#
+# 注：`Win32_Security_Credentials` 会连带打开父模块 `Win32_Security`；feature 之间
+# 有依赖关系，少写一个就会在编译期以 "could not find `Security` in `Win32`" 的形式暴露。
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = [
     "Win32_Foundation",
+    "Win32_Security_Credentials",
     "Win32_System_DataExchange",
     "Win32_System_Memory",
     "Win32_System_Ole",

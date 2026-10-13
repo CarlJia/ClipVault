@@ -243,7 +243,11 @@ pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
 
 /// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
 ///
-/// 用 `open(1)` 打开 `x-apple.systempreferences:` URL scheme;非 macOS 为 no-op。
+/// 用 `open(1)` 打开 `x-apple.systempreferences:` URL scheme。
+///
+/// Windows 上不存在这个授权概念（`hotkey::check_accessibility` 恒为已授权），因此
+/// 前端也不会显示引导横幅、不会调到这里；万一调到了，返回一句说清原因的错误，
+/// 而不是一句在 Windows 上毫无意义的"仅支持 macOS"。
 #[tauri::command]
 pub fn open_accessibility_settings() -> Result<(), String> {
     #[cfg(target_os = "macos")]
@@ -256,9 +260,13 @@ pub fn open_accessibility_settings() -> Result<(), String> {
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
     {
-        Err("仅支持 macOS".to_string())
+        Err("Windows 无需「辅助功能」授权，回贴无需任何系统授权".to_string())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Err("当前平台不支持".to_string())
     }
 }
 
@@ -609,20 +617,34 @@ pub async fn clear_undecryptable(state: State<'_, AppState>) -> Result<usize, St
 }
 
 // ----------------------------------------------------------------
-// URL ⌘O 打开（U7 / R20 / F7）
+// URL ⌘O 打开（U7 / R20 / F7；Windows 侧 U5）
 // ----------------------------------------------------------------
 
-/// 多类型 plan U7：在默认浏览器打开 URL 类别条目。
+/// 校验一条条目内容能否作为 URL 打开，返回去掉首尾空白后的 URL。
 ///
-/// 仅接受 `http://` 与 `https://` scheme：拒绝 `file://`、`javascript:`、
-/// `data:` 等潜在攻击面（clipboard hijacking）。非 URL 类别条目返回错误。
+/// 只接受 `http://` 与 `https://`：拒绝 `file://`、`javascript:`、`data:` 等潜在攻击面
+/// （clipboard hijacking）。抽成纯函数，两端共用同一条判据，也可单测。
+pub(crate) fn openable_url(raw: &str) -> Result<&str, String> {
+    let url = raw.trim();
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Ok(url)
+    } else {
+        Err(format!(
+            "URL scheme 必须为 http:// 或 https://（实际: {url}）"
+        ))
+    }
+}
+
+/// 多类型 plan U7：在系统默认浏览器打开 URL 类别条目。
 ///
-/// 失败（URL 非法、Command 启动失败）→ 后端把 content 写入
-/// `NSPasteboard.string` 并返回 `clipboard_only`，前端 toast 提示。
+/// 仅接受 `http://` 与 `https://` scheme；非 URL 类别条目直接返回错误。
+///
+/// 打开失败只返回错误（前端 toast 提示），**不**代客户写剪贴板：用户想复制这条内容的话，
+/// 在面板上对它按回车即可 —— 回贴链路本来就会把内容写进剪贴板，这里再写一次是多余的。
+/// （本函数的文档此前声称失败时会"把 content 写入 NSPasteboard 并返回 clipboard_only"，
+/// 那从未实现过，已改正。）
 #[tauri::command]
 pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    use std::process::Command;
-
     // 同步读取（commands 在 Tauri 主线程跑;MVP 同模式入库读取已沿用）。
     let entry = tauri::async_runtime::block_on(async { state.storage.get_by_id(id).await })
         .map_err(|e| e.to_string())?
@@ -635,24 +657,63 @@ pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
         ));
     }
 
-    let url = entry.content.trim();
-    if !(url.starts_with("http://") || url.starts_with("https://")) {
-        return Err(format!(
-            "URL scheme 必须为 http:// 或 https://（实际: {url}）"
-        ));
-    }
+    let url = openable_url(&entry.content)?;
 
     #[cfg(target_os = "macos")]
     {
-        match Command::new("open").arg(url).spawn() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(format!("打开失败,内容已复制到剪贴板,请手动 ⌘V（{e}）")),
-        }
+        // `use` 放在分支内部：放在函数顶部的话，Windows 构建会因"未使用的导入"
+        // 在 `-D warnings` 下直接编译失败。
+        use std::process::Command;
+        Command::new("open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("打开失败：{e}"))
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        open_in_default_browser(url)
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = url;
-        Err("URL 打开仅支持 macOS".to_string())
+        Err("当前平台不支持打开 URL".to_string())
+    }
+}
+
+/// Windows：`ShellExecuteW` 把 URL 交给系统默认处理器（浏览器 / 关联程序）。
+///
+/// **不用 `cmd /C start`**：那要把 URL 拼进命令行，`&`、`^`、`|`、`%` 都得转义，
+/// 漏一个就是命令注入（而这里的 URL 来自剪贴板，正是不可信输入）。`ShellExecuteW`
+/// 直接把 URL 当参数交给系统，没有这层转义面。
+///
+/// 用返回值判断成败：这套 API 的 `HINSTANCE` 实际被当作整型用，**> 32 才是成功**，
+/// ≤ 32 是错误码（0 表示内存不足、2 表示文件不存在等）。只看"没 panic"会把打开失败
+/// 静默当成成功。
+#[cfg(target_os = "windows")]
+fn open_in_default_browser(url: &str) -> Result<(), String> {
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    use windows::core::PCWSTR;
+
+    let operation = crate::winclip::utf16_nul("open");
+    let target = crate::winclip::utf16_nul(url);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            PCWSTR(operation.as_ptr()),
+            PCWSTR(target.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    let code = result.0 as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!("打开失败（ShellExecute 返回 {code}）"))
     }
 }
