@@ -1,8 +1,8 @@
-# ClipVault — macOS 纯文本剪贴板管理器
+# ClipVault — 剪贴板管理器（macOS / Windows）
 
-ClipVault 常驻菜单栏，持续记录你复制过的纯文本，通过全局快捷键（默认 `⌥⌘V`）呼出 Raycast 风格命令面板，即时搜索、按 `Enter` 回贴到当前光标。支持自动类别（URL / Email / 路径 / 代码 / JSON / 纯文本）、自由标签、备注、逐条 Pin 置顶、AES-GCM 加密区与访客模式。**默认完全离线，不连接网络、不上传任何数据。**
+ClipVault 常驻菜单栏（macOS）/ 通知区（Windows），持续记录你复制过的内容（文本 / 图片 / 文件 / RTF），通过全局快捷键（macOS 默认 `⌥⌘V`、Windows 默认 `Ctrl+Alt+V`）呼出 Raycast 风格命令面板，即时搜索、按 `Enter` 回贴到当前光标。支持自动类别（URL / Email / 路径 / 代码 / JSON / 纯文本）、自由标签、备注、逐条 Pin 置顶、AES-GCM 加密区与访客模式。**默认完全离线，不连接网络、不上传任何数据。**
 
-单一事实来源（需求 / 设计 / 验收）：[`docs/plans/2026-09-24-0931-feat-clipvault-mvp-plan.md`](./docs/plans/2026-09-24-0931-feat-clipvault-mvp-plan.md)
+单一事实来源（需求 / 设计 / 验收）：macOS 见 [`docs/plans/2026-09-24-0931-feat-clipvault-mvp-plan.md`](./docs/plans/2026-09-24-0931-feat-clipvault-mvp-plan.md)，Windows 见 [`docs/plans/2026-10-13-1716-feat-windows-platform-support-plan.md`](./docs/plans/2026-10-13-1716-feat-windows-platform-support-plan.md)。
 
 ---
 
@@ -28,11 +28,33 @@ ClipVault 常驻菜单栏，持续记录你复制过的纯文本，通过全局�
 
 ## 安装
 
+### macOS
+
 1. 从 DMG 安装：双击对应架构的 DMG（Apple Silicon → `ClipVault_<版本>_arm64.dmg`，Intel → `ClipVault_<版本>_x64.dmg`），把 `ClipVault.app` 拖入 `Applications`。
 2. 首次启动会被 Gatekeeper 拦截（因为是 ad-hoc 签名）。按下面「Gatekeeper 放行」放行一次即可，以后正常双击。
 3. 首次运行会引导你授予 **Accessibility 权限**（用于回贴，见下文）。
 
-### Gatekeeper 放行（两种方法）
+### Windows（10 22H2 / 11，x64）
+
+1. 运行 `ClipVault_<版本>_x64-setup.exe`（NSIS 安装包，默认**按当前用户**安装，不需要管理员权限）。
+2. 首次运行会被 **SmartScreen** 拦一下：安装包**未做 Authenticode 签名**（需商业代码签名证书）。
+   点「更多信息」→「仍要运行」即可放行；Windows 11 上这个入口在小字链接里。
+3. **不需要任何系统授权**，装完即用：Windows 侧靠 `SendInput` 注入按键，没有 macOS 那种
+   「辅助功能」授权门槛，也没有授权横幅。全局快捷键是 `Ctrl+Alt+V`（面板内其余快捷键同理：
+   `Ctrl+E` 备注、`Ctrl+P` 置顶、`Ctrl+O` 打开 URL……界面上的提示条会按平台显示）。
+
+#### Windows 已知限制（请先读）
+
+- **不承诺 ARM64**：可编译，但未做验收（Windows plan 的 Scope Boundaries）。
+- **目标进程以管理员（高完整性）运行时无法自动回贴**：`SendInput` 受 UIPI 限制，注入会被系统
+  静默丢弃 —— 这是 Windows 的安全设计，ClipVault 不做绕过。此时降级为「内容已写入剪贴板，
+  请手动 `Ctrl+V`」，不是报错。
+- **不产生 color 类型条目**：Win32 剪贴板没有颜色类型（颜色通常以文本或私有格式出现），
+  采集侧永远不会构造 `ContentKind::Color`。界面上 color 行的渲染分支保留不动（它服务历史库
+  与跨平台共享的库文件）。
+- **加密区的密钥不跨平台互通**：见下文「加密区与密钥托管」。
+
+### Gatekeeper 放行（两种方法，仅 macOS）
 
 **方法 A — 右键打开（推荐，macOS 13 及大多数场景）**
 
@@ -51,7 +73,11 @@ ClipVault 常驻菜单栏，持续记录你复制过的纯文本，通过全局�
 
 ---
 
-## Accessibility 首次授权引导
+## Accessibility 首次授权引导（**仅 macOS**）
+
+> **Windows 用户请跳过本节**：Windows 侧用 `SendInput` 注入按键，**不需要任何系统授权**，
+> ClipVault 也不会在 Windows 上显示任何授权横幅或系统设置深链（Windows plan 的 RW8）。
+> 下面讲的全是 macOS 的 TCC 授权模型。
 
 ClipVault 的「回贴到当前光标」功能——`Enter` 选中回贴、`⌘1–9` 序号直选回贴、双击列表行回贴——**全部**依赖 macOS **Accessibility（辅助功能）** 权限来模拟 ⌘V 按键。**写系统剪贴板本身不需要该权限**（`NSPasteboard.setString` 始终会执行），但按键模拟必须有授权，未授权时只能回退到「内容已在剪贴板，请手动 ⌘V」。
 
@@ -110,11 +136,13 @@ sqlite3 "$HOME/Library/Application Support/com.apple.TCC/TCC.db" \
 
 ### 安全边界披露（请务必阅读）
 
-授予 Accessibility 权限后，**任何应用在系统 TCC 权限模型下技术上都能模拟任意键盘事件**——这是 macOS 权限边界本身的性质，不是 ClipVault 特有的。就 ClipVault 而言：
+**macOS**：授予 Accessibility 权限后，**任何应用在系统 TCC 权限模型下技术上都能模拟任意键盘事件**——这是 macOS 权限边界本身的性质，不是 ClipVault 特有的。就 ClipVault 而言：
 
 - 代码路径**仅模拟 ⌘V** 一个组合键用于回贴，不记录、不模拟其他按键，不读取其他应用内容。
 - 请仅在**受信任的个人环境**下运行本应用。
 - 在**企业 MDM 管控**的 Mac 上安装前，请先确认组织安全策略允许具备 Accessibility 权限的第三方（未 notarized）应用。
+
+**Windows**：没有需要预先授予的系统授权（`SendInput` 不需要授权），但仍有一条系统边界：注入**只能到达同权限级别的进程**，对以管理员（高完整性）运行的目标会被 UIPI 静默丢弃 —— ClipVault 因此降级为「写入剪贴板 + 提示手动 `Ctrl+V`」，不做绕过。反过来同样成立：ClipVault 以普通用户权限运行，不会也无法注入到提权进程中。
 
 ---
 
@@ -124,20 +152,28 @@ ClipVault 默认全部离线，不做云同步、不上传任何数据（见下�
 
 ### 数据存储位置
 
-- SQLite 数据库：`$HOME/Library/Application Support/ClipVault/clipvault.db`
+- macOS：`$HOME/Library/Application Support/ClipVault/clipvault.db`
+- Windows：`%APPDATA%\ClipVault\clipvault.db`（即 `C:\Users\<你>\AppData\Roaming\ClipVault\`）
+
+两边的库文件结构相同（同一份 schema），但**数据密钥不互通**，见下文。
 
 ### 非加密条目的安全边界（默认）
 
-- 非加密区条目以**明文**存储在上述 SQLite 文件中，安全边界是 **macOS 用户登录会话 + 用户家目录的文件系统权限**。
-- ClipVault **不使用** SQLCipher，也**不使用** `NSFileProtectionComplete`。原因：`NSFileProtectionComplete` 会让数据在设备锁定时不可读，与「随时检索历史剪贴板」的核心场景冲突。
-- 因此：**在未启用 FileVault 的设备上，能物理访问磁盘的人即可读取这些明文条目。**
-- 强烈建议开启 **FileVault 全盘加密**（系统设置 → 隐私与安全性 → FileVault）作为整机层面的保护。
+- 非加密区条目以**明文**存储在上述 SQLite 文件中，安全边界是**操作系统用户登录会话 + 用户家目录 / `%APPDATA%` 的文件系统权限**。
+- ClipVault **不使用** SQLCipher，也**不使用** `NSFileProtectionComplete`（macOS）。原因：`NSFileProtectionComplete` 会让数据在设备锁定时不可读，与「随时检索历史剪贴板」的核心场景冲突。
+- 因此：**在未启用磁盘加密的设备上（macOS 的 FileVault / Windows 的 BitLocker），能物理访问磁盘的人即可读取这些明文条目。**
+- 强烈建议开启 **FileVault 全盘加密**（系统设置 → 隐私与安全性 → FileVault）或 **BitLocker** 作为整机层面的保护。
 - 「加密区」（AES-GCM）是针对**敏感条目的纵深防御**，而非对整个数据库加密。
 
-### 加密区与 Keychain 密钥（不可导出）
+### 加密区与密钥托管（不可导出）
 
-- 加密区条目用 **AES-256-GCM** 加密后存储，数据密钥由 macOS **Keychain** 托管（`service = com.clipvault.data_key`）。
-- **该 Keychain 密钥不可导出**。这意味着：如果你**更换机器**（换新 Mac、或 Time Machine 恢复未能带回 Keychain 项），旧的加密条目将**永久无法解密**——它们会在 UI 上显示「无法解密」徽标（`is_decryptable=0`），并提供批量清除入口。
+- 加密区条目用 **AES-256-GCM** 加密后存储，数据密钥交给**系统**托管：macOS 是 **Keychain**
+  （`service = com.clipvault.data_key`），Windows 是**凭据管理器**（`TargetName = ClipVault/data_key`，
+  `CRED_TYPE_GENERIC` + `CRED_PERSIST_LOCAL_MACHINE`）。
+- **该密钥不可导出**。这意味着：如果你**更换机器**（换新 Mac、或 Time Machine 恢复未能带回 Keychain 项），旧的加密条目将**永久无法解密**——它们会在 UI 上显示「无法解密」徽标（`is_decryptable=0`），并提供批量清除入口。
+- **密钥不跨平台、不跨机器互通**：macOS 与 Windows 各自托管自己的密钥，两边**不共享**加密区内容 ——
+  即便把 `clipvault.db` 从一台机器拷到另一台，其中的加密条目也解不开（这正是设计意图：密钥从不离开
+  系统凭据库，也就无法随库文件一起泄露）。非加密条目与元数据不受影响。
 - 这是「零密码、首次启动零摩擦」设计（KTD4）的代价。元数据（标签、类别、备注、时间戳）仍为明文可见；仅密文内容不可恢复。
 - 未来可能加入「用户口令派生备份密钥」作为可选项，MVP 不包含。
 
@@ -145,10 +181,15 @@ ClipVault 默认全部离线，不做云同步、不上传任何数据（见下�
 
 ## 开发
 
-前置：macOS 13+、Rust（edition 2024 工具链）、Node.js（前端）、`cargo install tauri-cli --version "~2.11" --locked`。
+前置：Rust（edition 2024 工具链）、Node.js（前端）、`cargo install tauri-cli --version "~2.11" --locked`。
+
+- **macOS**：13+，另需 Xcode 命令行工具（`xcode-select --install`）。
+- **Windows**：10 22H2 / 11（x64），另需 **MSVC 工具链**（Visual Studio Build Tools 里勾「使用 C++
+  的桌面开发」）与 **WebView2 运行时**（Windows 11 自带；Windows 10 通常随 Edge 一起装好）。
+  开发期**不需要**任何系统授权（对比 macOS 那节辅助功能授权）。
 
 ```bash
-# 起开发模式（空浮层 + 菜单栏 + 全局快捷键）
+# 起开发模式（空浮层 + 菜单栏 / 托盘 + 全局快捷键）
 cargo tauri dev
 
 # 全量测试（app + clipvault-core）
@@ -161,6 +202,8 @@ cargo fmt --all -- --check
 ```
 
 ## 打包 / 发布
+
+### macOS（DMG）
 
 两个架构**分别**打（不再做 universal2）：universal2 是把两份二进制 `lipo` 合并成一个 `.app`，对本项目只会让包体积近似翻倍；拆开后每个架构一个 DMG，用户按自己的机器下。（两种做法都得编两遍，matrix 只是让它并行。）
 
@@ -189,7 +232,22 @@ packaging/dmg.sh target/aarch64-apple-darwin/release/bundle/macos/ClipVault.app 
 
 交叉编译：Apple Silicon 上编 x86_64 需要 `rustup target add x86_64-apple-darwin`（Intel 上编 arm64 同理）。Apple SDK 自带两份架构 slice，不需要额外工具链。
 
-发版走 `.github/workflows/package.yml`：macOS job 用 matrix 并行跑这两个架构（产物 Artifact 分别是 `ClipVault-macos-arm64` / `ClipVault-macos-x64`），Windows job 跑 `packaging\build-windows.ps1` 出 NSIS 安装包，`release` job 把两个 DMG 与 `.exe` 一起挂到 `v*` tag 的 Release 上。
+### Windows（NSIS 安装包）
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
+```
+
+一条命令走完：安装前端依赖 → `cargo tauri build --bundles nsis` → 打印产物路径。
+产物 → `target\release\bundle\nsis\ClipVault_<版本>_x64-setup.exe`。
+
+只打 NSIS、**不打 MSI**：`targets: "all"` 在 Windows 上会连带给需要 WiX 工具链的 MSI，
+那是这条链路上最容易失败的一环，而 MSI 对「按用户安装的托盘小工具」没有额外价值。
+安装包**未做 Authenticode 签名**，首次运行会被 SmartScreen 拦一下（放行步骤见「安装 → Windows」）。
+
+### CI 发版
+
+走 `.github/workflows/package.yml`：macOS job 用 matrix 并行跑这两个架构（产物 Artifact 分别是 `ClipVault-macos-arm64` / `ClipVault-macos-x64`），Windows job 跑 `packaging\build-windows.ps1` 出 NSIS 安装包，`release` job 把两个 DMG 与 `.exe` 一起挂到 `v*` tag 的 Release 上。
 
 > **版本约束**：`app/Cargo.toml` 的 `tauri` 与 `frontend/package.json` 的 `@tauri-apps/api` 必须停在**同一个 major.minor**——`cargo tauri build` 启动时会交叉校验，不一致直接报 `Found version mismatched Tauri packages` 并中止（Windows job 就栽在这儿）。所以两边都写成 `~2.11`（`^` 会浮到 2.12+，而 npm 侧锁的是 2.11.1），升级 tauri 时两处一起抬。`Cargo.lock` 因此纳入版本控制：CI 与开发机用同一棵依赖树。
 
@@ -207,5 +265,10 @@ cargo tree | grep -E 'reqwest|hyper'          # → 无输出
 grep -rE 'reqwest::|hyper::|TcpStream|std::net::' app/src clipvault-core/src   # → 无输出
 ```
 
-两条检查均为**零命中**：无 `reqwest` / `hyper` 依赖，无 `TcpStream` / `std::net` / `tokio::net` 调用点。ClipVault 仅通过 `NSPasteboard`、Keychain 与本地 SQLite 文件工作，无任何外发 socket。
+两条检查均为**零命中**：无 `reqwest` / `hyper` 依赖，无 `TcpStream` / `std::net` / `tokio::net` 调用点。ClipVault 只碰本地剪贴板、系统凭据库与本地 SQLite 文件，没有任何外发 socket：
+
+- **macOS**：`NSPasteboard`、Keychain（`security-framework`）、CGEvent；
+- **Windows**：Win32 剪贴板 API、凭据管理器（`CredReadW` / `CredWriteW`）、`SendInput` —— 新增的
+  `windows` crate 只用于这些，不引入任何网络能力。该目标的整树编译与 lint 由 CI 的 `windows` job
+  覆盖（本地开发机是 macOS，`cfg(target_os = "windows")` 的分支根本不参与编译）。
 
