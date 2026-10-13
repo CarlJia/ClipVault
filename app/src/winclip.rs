@@ -257,9 +257,13 @@ fn build_palette(dib: &[u8], header: &DibHeader) -> Option<Vec<(u8, u8, u8)>> {
     let end = start.checked_add(entries.checked_mul(4)?)?;
     let bytes = dib.get(start..end)?;
     // 条目数可少于满编(部分 8bpp DIB 只带前 N 项),缺失的下标由 `get` 判 None。
+    // 用 `as_chunks` 而非 `chunks_exact`:后者在 clippy 1.99 起会报
+    // chunks_exact_to_as_chunks;两者都会丢掉末尾不足一项的字节。
     Some(
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|quad| (quad[2], quad[1], quad[0]))
             .collect(),
     )

@@ -438,9 +438,14 @@ mod win {
     /// `CF_UNICODETEXT` 之间自动转换,所以只挂旧格式的复制源也能读到。
     fn read_text() -> Option<Captured> {
         let bytes = read_bytes(CF_UNICODETEXT.0 as u32, MAX_BINARY_READ_BYTES)?;
+        // `as_chunks` 而不是 `chunks_exact`：后者在 clippy 1.99 起会报
+        // chunks_exact_to_as_chunks。两者都会丢掉末尾不足一组的字节，语义一致
+        // （剪贴板文本按 UTF-16 对齐，正常不会出现奇数长度）。
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         // 结尾的 NUL 是格式的一部分,不是内容。
         let text = String::from_utf16_lossy(&units);
