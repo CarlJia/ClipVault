@@ -259,4 +259,7 @@ jobs:
           gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || \
             gh release create "$tag" --repo "$repo" --title "ClipVault $tag" --generate-notes
           gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber
-          gh release view "$tag" --repo "$repo" --json assets --jq 'assets[].name'
+          # 回读一遍确认真上去了。注意 jq 表达式的开头那个点：裸标识符在 jq 里是
+          # **函数引用**，写成 `assets[].name` 会让 gh 报 "function not defined: assets/0"
+          # 并以非零退出把整个 job 拖挂（这一行也是头一回真正跑到才暴露的）。
+          gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name'
