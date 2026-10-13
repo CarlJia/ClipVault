@@ -520,6 +520,26 @@ README.md                             [改] Windows 安装/使用/限制/凭据�
   `@tauri-apps/api` 2.11.1 —— 这正是 Windows 打包首次失败的根因。修法:两侧都写 `~2.11`
   (`app/Cargo.toml` / `frontend/package.json`)、`Cargo.lock` 纳入版本控制(此前被
   `.gitignore` 的 `*.lock` 误伤),这样 CI 与开发机用同一棵依赖树。
+  **打包耗时优化(实测后追加)**:分步耗时显示开销集中在 `cargo install tauri-cli` ——
+  三个 job 各自从源码编一遍(它拖着 oxc 那套解析器依赖),占 macOS 的 38%、Windows 的 45%。
+  故加三块 `actions/cache`(仍是官方 action,不破上面那条约束):`~/.cargo/bin`(cargo-tauri
+  二进制,key 带 `TAURI_CLI_MINOR`,命中后安装步骤直接跳过,判据用 `command -v cargo-tauri`
+  而不是 cargo 自己的 already-installed 记录)、`~/.cargo/registry` + `git`、以及 release
+  编译产物(key 带 Cargo.lock 哈希 + `restore-keys` 回退;只缓 release,不缓 debug ——
+  clippy/test 的 `target/debug` 体积大得多,挤占 10GB 额度不划算)。同时删掉 build.sh /
+  build-windows.ps1 里与 `beforeBuildCommand` 重复的前端构建。实测(同一天对比):
+  Windows 21m9s → 7m52s、macOS x64 14m26s → 2m59s、arm64 14m49s → 5m03s。
+  残留:编译步骤仍会重编一部分非本仓库依赖(arm64 只省下 60s),原因是 `~/.cargo/registry`
+  与 `target/` 一起从缓存还原后 mtime 关系让 cargo 指纹判定为过期 —— 这是手工 target 缓存
+  相对 `Swatinem/rust-cache` 的短板;要吃掉剩余 1.5~3.5 分钟需放宽「不引入第三方 action」。
+  **release job 的三个硬约束(都是头一回真正跑到才暴露的)**:①该 job 只消费 Artifacts、
+  不 checkout,而 gh 默认靠 `.git` 里的 remote 推断仓库,故每条 gh 命令必须显式带
+  `--repo "$GITHUB_REPOSITORY"`;②upload-artifact 按上传路径的公共祖先剥前缀,DMG 会落在
+  `dist/dmg/` 下而非 `dist/` 根,原来的 `dist/*.dmg` 匹配不到 —— 会**静默发出只有 `.exe`
+  的 Release**,故改为 `find` 递归收集 + 空集守卫;③两个架构的 `ClipVault.app` 同名,合并
+  Artifacts 时 x64 覆盖 arm64,故 macOS 侧先暂存再上传并改名 `ClipVault_<arch>.app`。
+  另外 `gh release view ... --jq 'assets[].name'` 少了开头的点(jq 里裸标识符是函数引用),
+  会把已经成功的发版拖成失败。
 - **Test scenarios.** 无(CI 自身即验证)。
 - **Verification.** 本地:`python3 packaging/make_icons.py` 产出的 ICO 用一次性解析脚本结构校验
   (条目数 6、尺寸集合、偏移在文件范围内);`cargo tauri info` 确认 config 仍可解析。
