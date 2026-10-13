@@ -15,9 +15,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 与本地开发用的 tauri-cli 同一条线（本地 2.11.5）。这里必须是 `~` 而不是 `^`：
+  # 与本地开发用的 tauri-cli 同一条线（本地 2.11.5）。必须是 `~` 而不是 `^`：
   # `^2.11` 实际会装到 2.12.x，装出来的 CLI 就不在 tauri crate（`~2.11`）的线上了。
-  TAURI_CLI_VERSION: '~2.11'
+  # 这里只存版本号本身，`~` 在安装命令处拼、缓存 key 用这个干净值 ——
+  # 两边是同一个来源，不会出现「改了版本没改缓存 key」的漂移。
+  TAURI_CLI_MINOR: '2.11'
 
 jobs:
   macos:
@@ -34,6 +36,42 @@ jobs:
             rust-target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
+
+      # ---- 三块缓存。都用 actions/cache（官方 action），符合 U8「不引入第三方 action」。----
+      #
+      # 1) cargo-install 出来的二进制。tauri-cli 拖着 oxc 那一整套解析器依赖，从源码
+      #    编一次要 7~9 分钟 —— 三个 job 各编一遍，是全流程最大的一笔开销。缓存命中后
+      #    这步退化成「什么都不做」。key 带 TAURI_CLI_MINOR，换版本时自动失效重编。
+      - name: 缓存 cargo 安装的二进制（cargo-tauri）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
+
+      # 2) crates.io 索引 + 已下载/解包的 crate 源码。内容跨平台完全一致，所以 key
+      #    不带 runner.os —— 三个 job 共用同一份，省两次上传。
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      # 3) release 编译产物（主要是依赖的 rlib）。不存在「缓存用错」的可能：cargo 按
+      #    指纹（含 rustc 版本、feature、编译参数）逐条校验，本仓库自己的 crate 改了
+      #    只重编它自己和上层，依赖照旧复用。key 带 Cargo.lock 哈希，依赖变动时靠
+      #    restore-keys 回退到上一次的缓存，还能捞回没变的那部分。
+      - name: 缓存 release 编译产物
+        uses: actions/cache@v4
+        with:
+          path: target/${{ matrix.rust-target }}/release
+          key: cargo-target-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-${{ matrix.arch }}-
 
       # runner 上预装了 rustup/rustc，但仍然显式安装一次：CI 的可复现性不该依赖
       # runner 镜像的默认值。clippy/rustfmt 由 profile minimal 之外单独指定。
@@ -54,7 +92,17 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: 安装 tauri-cli
-        run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+        run: |
+          # 缓存命中时 cargo-tauri 已在 PATH 上，直接跳过；否则从源码编（7~9 分钟）。
+          # 判据用「PATH 里有没有 cargo-tauri」而不是 cargo 自己的 "already installed"
+          # 记录：后者读 ~/.cargo/.crates*.json，万一二进制在、记录不在，cargo install
+          # 会以 "binary `cargo-tauri` already exists" 直接失败；也不要去执行
+          # `cargo tauri --version` 探测，那样会留下非零退出码给后续判断添乱。
+          if command -v cargo-tauri >/dev/null 2>&1; then
+            echo "tauri-cli 命中缓存，跳过源码编译"
+          else
+            cargo install tauri-cli --version "~$TAURI_CLI_MINOR" --locked
+          fi
 
       # 直接复用仓库里的打包脚本，而不是把步骤摊在 workflow 里：本地怎么打，CI 就怎么打，
       # 差别只有传进去的架构参数。
@@ -74,6 +122,35 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 三块缓存，与 macos job 同理（见那边的注释）。差别只有一处：
+      # **只缓存 release，不缓存 debug** —— clippy/test 在 debug 下产出的 target/debug
+      # 比 release 大得多（本机量级 3~10GB），塞进 10GB 的仓库缓存额度会把其它条目挤掉，
+      # 而它能省的只有那 4 分钟 lint+测试。净收益不划算，故留作每次重编。
+      - name: 缓存 cargo 安装的二进制（cargo-tauri）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
+
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: 缓存 release 编译产物
+        uses: actions/cache@v4
+        with:
+          path: target/release
+          key: cargo-target-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-release-
 
       - name: 安装 Rust 工具链
         run: |
@@ -103,7 +180,16 @@ jobs:
         run: cargo test --workspace
 
       - name: 安装 tauri-cli
-        run: cargo install tauri-cli --version "$env:TAURI_CLI_VERSION" --locked
+        run: |
+          # 与 macos job 同理（见那边的注释）：判据是 PATH 里有没有 cargo-tauri，
+          # 不去执行探测命令 —— 免得留下非零的 $LASTEXITCODE 被 GHA 的 pwsh 包装
+          # 当成整步失败。
+          if (Get-Command cargo-tauri -ErrorAction SilentlyContinue) {
+            Write-Host "tauri-cli 命中缓存，跳过源码编译"
+          } else {
+            cargo install tauri-cli --version "~$env:TAURI_CLI_MINOR" --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo install tauri-cli 失败" }
+          }
 
       - name: 打包（前端 → tauri build --bundles nsis）
         run: packaging/build-windows.ps1

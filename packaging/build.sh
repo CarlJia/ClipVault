@@ -62,8 +62,11 @@ esac
 # 用 node 而不是 sed：node 本来就是构建前端的前置依赖，而 JSON 用 sed 抓字段迟早出错。
 VERSION="$(node -p "require('./app/tauri.conf.json').version")"
 
-echo "==> [1/4] 构建前端"
-(cd frontend && npm ci && npm run build)
+echo "==> [1/4] 安装前端依赖"
+# 这里只装依赖、不 build：tauri.conf.json 的 beforeBuildCommand 会在 cargo tauri build
+# 开头自己跑一遍 `npm --prefix ../frontend run build`，而且是在 Rust 编译**之前**
+# （前端报错照样早失败、不浪费那几分钟），所以在脚本里再 build 一次纯属重复劳动。
+(cd frontend && npm ci)
 
 echo "==> [2/4] cargo tauri build（${ARCH_LABEL}${RUST_TARGET:+ / ${RUST_TARGET}}）"
 # `--bundles app` 是刻意的：tauri.conf.json 里是 `targets: "all"`，在 macOS 上会连带给
