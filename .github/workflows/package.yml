@@ -256,6 +256,23 @@ jobs:
           echo "待上传 ${#assets[@]} 个资产："
           printf '  %s\n' "${assets[@]}"
 
+          # 每个资产名里都必须含 tag 的版本号。这条断言是有来历的：换版本号会让
+          # Cargo.lock 变 → target 缓存 key 变 → restore-keys 前缀回退命中**上一版**的
+          # 缓存，而那份缓存里带着上一版 `bundle/dmg/ClipVault_<旧版本>_*.dmg`；收集是按
+          # 通配来的，于是旧版本的文件跟着一起发到了新 Release 上（v0.2.0 上真发生过）。
+          # 上游已修（build.sh 打新 DMG 前先清旧产物），这里再兜一道：
+          # 宁可发布失败，也不要发出混着旧版本文件的 Release。
+          version="${tag#v}"
+          for a in "${assets[@]}"; do
+            case "$(basename "$a")" in
+              *"$version"*) ;;
+              *)
+                echo "错误：资产 $(basename "$a") 的名字里没有 tag $tag 的版本号 $version" >&2
+                exit 1
+                ;;
+            esac
+          done
+
           gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || \
             gh release create "$tag" --repo "$repo" --title "ClipVault $tag" --generate-notes
           gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber

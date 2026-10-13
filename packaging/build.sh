@@ -92,6 +92,13 @@ fi
 APP_PATH="${BUNDLE_DIR}/macos/ClipVault.app"
 DMG_PATH="${BUNDLE_DIR}/dmg/ClipVault_${VERSION}_${ARCH_LABEL}.dmg"
 
+# 先清掉旧 DMG 再打新的。原因不是洁癖：CI 的 target 缓存**包含 bundle 目录**，而换版本号
+# 会让 Cargo.lock 变、缓存 key 变、`restore-keys` 前缀回退命中上一版的缓存 —— 于是
+# `bundle/dmg/` 里躺着上一个版本的 `ClipVault_<旧版本>_<arch>.dmg`。上传侧是按
+# `ClipVault_*.dmg` 通配收集的，旧文件会跟着一起进 artifact、最后发到新版本的 Release 上
+# （v0.2.0 上真的发生过：0.1.0 的三个文件也挂上去了）。
+rm -f "${BUNDLE_DIR}"/dmg/ClipVault_*.dmg
+
 echo "==> [3/4] ad-hoc 签名"
 "${SCRIPT_DIR}/codesign.sh" "${APP_PATH}"
 
