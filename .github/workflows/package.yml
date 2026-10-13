@@ -51,8 +51,11 @@ jobs:
             ~/.cargo/.crates2.json
           key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
 
-      # 2) crates.io 索引 + 已下载/解包的 crate 源码。内容跨平台完全一致，所以 key
-      #    不带 runner.os —— 三个 job 共用同一份，省两次上传。
+      # 2) crates.io 索引 + 已下载/解包的 crate 源码。
+      #    注意：这个 key 里没有 runner.os，但**并不会**让三个 job 共用一份 ——
+      #    hashFiles() 的摘要不止算文件内容（实测同一份 Cargo.lock 在 macOS 与 Windows
+      #    runner 上给出两个不同哈希），所以事实上就是各平台一份，加起来 ~323MB，
+      #    占额度很小。不把 runner.os 显式写进 key 只是懒得改，行为上没有差别。
       - name: 缓存 crates.io 索引与源码
         uses: actions/cache@v4
         with:
