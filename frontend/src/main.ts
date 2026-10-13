@@ -12,6 +12,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   type CategoryInfo,
   type EntryDto,
+  EYE_SVG,
   type TagInfo,
   renderCategories,
   renderEntries,
@@ -19,6 +20,7 @@ import {
   renderTags,
   renderVaultList,
 } from "./panel";
+import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
   type PasteResult,
   clearUndecryptable,
@@ -147,14 +149,16 @@ async function openUrlAction(e: EntryDto): Promise<void> {
  * 同步内部 `guestMode` 状态。
  */
 async function refreshGuestNotice(): Promise<void> {
+  // 文案里有修饰键（⌘⇧G / Ctrl+Shift+G），等平台标识就绪再渲染。
+  await whenPlatformReady();
   guestMode = await getGuestMode();
   if (guestMode) {
     guestNoticeEl.classList.remove("hidden");
     guestNoticeEl.innerHTML = `
-      <span class="banner-icon">􀩦</span>
+      <span class="banner-icon">${EYE_SVG}</span>
       <div class="banner-body">
         <div class="banner-title">访客模式 · 不记录新条目</div>
-        <div class="banner-sub">新复制的内容不会入库；已有条目仍只读可访问。⌘⇧G 关闭。</div>
+        <div class="banner-sub">新复制的内容不会入库；已有条目仍只读可访问。${keys("⌘⇧G")} 关闭。</div>
       </div>`;
   } else {
     guestNoticeEl.classList.add("hidden");
@@ -429,7 +433,7 @@ async function openVault(): Promise<void> {
     const undec = items.filter((x) => !x.is_decryptable).length;
     vaultSubEl.textContent =
       items.length === 0
-        ? "把敏感条目移入加密区（列表中按 ⌘L）后，内容以 AES-256-GCM 加密存储。"
+        ? `把敏感条目移入加密区（列表中按 ${keys("⌘L")}）后，内容以 AES-256-GCM 加密存储。`
         : `共 ${items.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
     vaultClearEl.classList.toggle("hidden", undec === 0);
   } catch (err) {
@@ -806,7 +810,13 @@ void listen("open-settings", () => {
 // U12：启动时一次性把 `--bg` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
 void getPanelOpacity().then(applyPanelOpacity);
-void refreshAccessibilityBanner(bannerEl);
-void refreshKeychainBanner(vaultBannerEl);
-void refreshGuestNotice();
-void load();
+// U7：平台标识（`platform_info`）先到位再首屏渲染 —— 底部键帽、行序号徽标（⌘1–9）、
+// 各横幅文案都含平台差异，晚一步就会先用 macOS 文案画出来而之后没人重渲染。
+// `initPlatform()` 同时会遍历改写 `<kbd>` 键帽；三个 refresh 函数内部也会
+// `await whenPlatformReady()`，所以后续的 focus 路径同样安全。
+void initPlatform().then(() => {
+  void refreshAccessibilityBanner(bannerEl);
+  void refreshKeychainBanner(vaultBannerEl);
+  void refreshGuestNotice();
+  void load();
+});

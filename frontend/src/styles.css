@@ -13,8 +13,8 @@
   --chip-tag: rgba(255, 255, 255, 0.1);
   --danger: #ff453a;
   --warn: rgba(255, 214, 10, 0.16);
-  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
-  --font-mono: "SF Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
   --radius: 12px;
 }
 
@@ -99,6 +99,11 @@ body {
   color: #ffd60a;
   line-height: 1.4;
 }
+/* 横幅图标已换成内联 SVG（U7）：尺寸由 svg 的 width/height 决定，颜色经
+   `currentColor` 承接这里的 color（授权横幅黄、访客横幅蓝）。 */
+.banner-icon svg {
+  display: block;
+}
 .banner-text {
   flex: 1;
 }
@@ -153,6 +158,13 @@ body {
 .search-icon {
   color: var(--muted);
   font-size: 18px;
+}
+/* 放大镜由 SF Symbols 码字换成内联 SVG（U7）。`pointer-events: none` 是必须的：
+   它落在拖拽区（`data-tauri-drag-region="deep"`）内，SVG 若吞掉指针事件，
+   从图标上按下就拖不动面板了 —— 原来的纯文本字形没有这个问题。 */
+.search-icon svg {
+  display: block;
+  pointer-events: none;
 }
 #search {
   flex: 1;
@@ -452,7 +464,9 @@ body {
 /* 「按什么」与「做什么」分色：快捷键是键帽（强调色文字 + 淡蓝底 + 描边），
    说明文字留在 --muted。用颜色而非字重区分，是因为提示条里塞了十来个按键，
    靠颜色扫读最快。`font-family: inherit` 是刻意的 —— 等宽字体（SF Mono 等）
-   对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。 */
+   对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。
+   Windows 上键帽文案已被 platform.ts 换成 `Ctrl+` / `Shift+` / `Enter` 纯文本（RW9），
+   inherit 在那里同样合适：与说明文字同族，也避开等宽字体对中文的回退差异。 */
 .hint kbd,
 .hint .keycap,
 .editor-hint kbd,

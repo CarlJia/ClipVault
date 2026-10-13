@@ -2,6 +2,10 @@
 //
 // 负责把后端返回的 DTO 渲染成 Raycast 风格的平铺列表 / 标签列表 / 类别列表。
 // 纯渲染，无 IPC；交互与状态由 main.ts 驱动。
+// （唯一的外部依赖是 platform.ts 的 `keys()` —— 一个纯函数，用来把行序号徽标的
+// ⌘1–9 换成 Windows 的 Ctrl+1–9。）
+
+import { keys } from "./platform";
 
 /** 单条剪贴板记录 DTO（对应 Rust `commands::EntryDto`）。 */
 export interface EntryDto {
@@ -83,6 +87,26 @@ const PIN_SVG =
   ".5.5 0 0 1 0-.707c.688-.688 1.673-.767 2.375-.72.343.023.692.077 1.013.16l3.134-3.133a2.772 " +
   '2.772 0 0 1-.04-.461c0-.43.108-1.022.589-1.503a.5.5 0 0 1 .353-.146z"/></svg>';
 
+/**
+ * 横幅图标（U7）：原来是 SF Symbols 私有区码点（U+1001FE 等），在 WebView2 / Windows
+ * 默认字体下必然是豆腐块。改内联 SVG —— 与 `PIN_SVG` 同样的理由与做法。
+ *
+ * 描边而非填充：横幅底色是半透明的（叠在毛玻璃面板上），填充图标的「挖空」得知道底色
+ * 才能画对，描边没这个问题。颜色仍由外层 `.banner-icon` 的 `color` 经 `currentColor` 承接
+ * （授权横幅是黄色、访客横幅是蓝色）。
+ */
+export const WARN_SVG =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" ' +
+  'stroke="currentColor" stroke-width="1.4" stroke-linejoin="round" stroke-linecap="round">' +
+  '<path d="M8 2.4 14.4 13.5H1.6z"/><path d="M8 6.7v3"/><path d="M8 11.6h.01"/></svg>';
+
+/** 访客模式横幅图标（「仅查看，不记录」→ 眼睛）。 */
+export const EYE_SVG =
+  '<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" fill="none" ' +
+  'stroke="currentColor" stroke-width="1.4" stroke-linecap="round">' +
+  '<path d="M1.4 8S4 3.6 8 3.6 14.6 8 14.6 8 12 12.4 8 12.4 1.4 8 1.4 8Z"/>' +
+  '<circle cx="8" cy="8" r="1.9"/></svg>';
+
 /** 渲染平铺记录列表。`selected` 为高亮行索引。 */
 export function renderEntries(
   container: HTMLElement,
@@ -112,7 +136,7 @@ export function renderEntries(
       const previewHtml = renderKindPreview(e, kind, pin);
       const idxBadge =
         i < 9
-          ? `<span class="row-index" title="⌘${i + 1} 直接选中">⌘${i + 1}</span>`
+          ? `<span class="row-index" title="${escapeHtml(keys(`⌘${i + 1}`))} 直接选中">${escapeHtml(keys(`⌘${i + 1}`))}</span>`
           : "";
       return `
       <div class="row row-kind-${escapeHtml(kind)}${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}" data-kind="${escapeHtml(kind)}">

@@ -5,7 +5,8 @@
 // 访客模式经后端持久化到 settings 表并同步共享原子 / 托盘；skip-once 为纯运行时。
 
 import { invoke } from "@tauri-apps/api/core";
-import type { EntryDto } from "./panel";
+import { WARN_SVG, type EntryDto } from "./panel";
+import { isWindows, keys, whenPlatformReady } from "./platform";
 
 /** `paste_entry` 的返回体：区分回贴成功分支与对应固定 toast 文案。 */
 export interface PasteResult {
@@ -46,6 +47,22 @@ async function isTrusted(): Promise<boolean> {
 export async function refreshAccessibilityBanner(
   banner: HTMLElement,
 ): Promise<void> {
+  // 文案里有修饰键（⌘V / Ctrl+V），等平台标识就绪再渲染。
+  await whenPlatformReady();
+
+  // Windows 上没有「辅助功能授权」这个概念（RW8）：后端 `check_accessibility` 恒为
+  // 已授权，横幅本就不会显示。这里显式短路是为了两件事：不让下面那个 15 秒自动复检
+  // 定时器空转，也不让 macOS 的系统设置深链与文案有任何机会漏到 Windows 上。
+  if (isWindows()) {
+    if (recheckTimer !== undefined) {
+      window.clearTimeout(recheckTimer);
+      recheckTimer = undefined;
+    }
+    banner.classList.add("hidden");
+    banner.innerHTML = "";
+    return;
+  }
+
   const trusted = await isTrusted();
 
   if (trusted) {
@@ -60,10 +77,10 @@ export async function refreshAccessibilityBanner(
 
   banner.classList.remove("hidden");
   banner.innerHTML = `
-    <span class="banner-icon">􀇾</span>
+    <span class="banner-icon">${WARN_SVG}</span>
     <div class="banner-body">
       <div class="banner-title">需要「辅助功能」权限才能自动回贴</div>
-      <div class="banner-sub">ClipVault 通过模拟 ⌘V 把条目粘到目标应用,需在系统设置中授权。</div>
+      <div class="banner-sub">ClipVault 通过模拟 ${keys("⌘V")} 把条目粘到目标应用,需在系统设置中授权。</div>
     </div>
     <div class="banner-actions">
       <button id="banner-open" class="banner-btn banner-btn-primary">打开系统设置</button>
@@ -92,7 +109,7 @@ export async function refreshAccessibilityBanner(
       const sub = banner.querySelector<HTMLElement>(".banner-sub");
       if (sub) {
         sub.textContent =
-          "已切换为「只写剪贴板」:回贴时内容仅写入剪贴板,请在目标应用手动 ⌘V。";
+          `已切换为「只写剪贴板」:回贴时内容仅写入剪贴板,请在目标应用手动 ${keys("⌘V")}。`;
       }
     });
 
@@ -159,22 +176,29 @@ export async function clearUndecryptable(): Promise<number> {
 }
 
 /**
- * 刷新「Keychain 不可用」横幅（plan U9）：Keychain 不可用时持续显示，
+ * 刷新「密钥托管不可用」横幅（plan U9）：数据密钥取不到时持续显示，
  * 提示加密区不可用；恢复后自动隐藏。
+ *
+ * 密钥托管的叫法分平台（RW8/RW9）：macOS 是 Keychain（系统钥匙串），Windows 是
+ * 凭据管理器 —— 后端命令名 `keychain_available` 保留，它在 Windows 上的语义就是
+ * 「凭据管理器是否可用」。
  */
 export async function refreshKeychainBanner(banner: HTMLElement): Promise<void> {
+  await whenPlatformReady();
   const ok = await keychainAvailable();
   if (ok) {
     banner.classList.add("hidden");
     banner.innerHTML = "";
     return;
   }
+  const store = isWindows() ? "凭据管理器" : "Keychain";
+  const storeWhere = isWindows() ? "凭据管理器" : "系统钥匙串";
   banner.classList.remove("hidden");
   banner.innerHTML = `
-    <span class="banner-icon">􀇾</span>
+    <span class="banner-icon">${WARN_SVG}</span>
     <div class="banner-body">
-      <div class="banner-title">⚠️ Keychain 不可用，加密区暂不可用</div>
-      <div class="banner-sub">无法读取或创建数据密钥；移入加密区与解密回贴将失败。请检查系统钥匙串访问权限。</div>
+      <div class="banner-title">${store} 不可用，加密区暂不可用</div>
+      <div class="banner-sub">无法读取或创建数据密钥；移入加密区与解密回贴将失败。请检查${storeWhere}访问权限。</div>
     </div>`;
 }
 

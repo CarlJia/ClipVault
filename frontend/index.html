@@ -16,7 +16,10 @@
              「标题栏」。`deep` 让空白处与放大镜图标都能拖；`<input>` 属可点击元素、
              Tauri 的 drag.js 会主动放行，故输入框的选词 / 光标不受影响。 -->
         <div class="search-row" data-tauri-drag-region="deep">
-          <span class="search-icon">􀊫</span>
+          <!-- 放大镜：原来是 SF Symbols 私有区码点（U+1002AB），在 WebView2 / Windows
+               默认字体下必然是豆腐块。改内联 SVG（U7）。`pointer-events: none`（见
+               styles.css）保证从图标上按下也能拖动面板，与原来的纯文本字形行为一致。 -->
+          <span class="search-icon"><svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="7" cy="7" r="4.4"/><path d="M10.4 10.4 14.2 14.2"/></svg></span>
           <input
             id="search"
             type="text"
