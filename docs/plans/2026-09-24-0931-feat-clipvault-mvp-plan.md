@@ -415,7 +415,7 @@ clipvault/                              (workspace root)
 - Keychain key 缺失时(如用户迁移到新机器),`U9` 立即生成新 key,而**不**尝试恢复旧条目——旧加密条目将不可解密,UI 提示「无法解密」而非崩溃。
 - 全局快捷键默认值 `⌥⌘V`,可在 first-run UI 提示时调整;`U4` 提供 first-run 引导面板。
 - 性能预算基线 5000 条 / 100MB SQLite,搜索响应 < 100ms;FTS5 在此量级典型 < 50ms。如果实测落入边界,`U5` 调整 schema trigram index 参数(留为 deferred detail)。
-- cargo-bundle 在 Apple Silicon 与 Intel 双架构上分别产出,然后用 `lipo` 合并为 `universal2`。`U11` 用 `cargo bundle --target universal2-apple-darwin`(如果 Apple toolchain 支持)。
+- Apple Silicon 与 Intel **各自独立出包**,不做 `lipo` 合并的 `universal2` `(session-settled: user-directed — chosen over universal2: 用户要求两个架构分开打包;体积不翻倍,CI 可用 matrix 并行编)`。`U11` 用 `cargo tauri build --target aarch64-apple-darwin|x86_64-apple-darwin`。
 - 测试与生产使用同一份 SQLite schema 与代码路径;`U2` 写出 `storage::test_helpers::open_test_db()` 工具函数。
 
 ### Sequencing(Milestones)
@@ -614,7 +614,7 @@ Markdown 仅当用户主动 `@[md]` 标记时启用,否则纯文本。
 - **Requirements.** R15。
 - **Dependencies.** U1–U10 全部完成(集成测试通过)。
 - **Files.** `packaging/codesign.sh`;`packaging/dmg.sh`;`README.md`;`app/Cargo.toml`(`bundle` 配置)。
-- **Approach.** `cargo bundle --target universal2-apple-darwin`(如 Apple toolchain 不支持则双架构分别 build)。`codesign.sh` 调 `codesign --force --deep --sign - <App.app>`(ad-hoc)。`dmg.sh` 用 `create-dmg`(homebrew) 或 `hdiutil` 拼装 DMG。README 包含:安装步骤、首次启动 Gatekeeper 拦截的两种放行方法(`右键打开`、`System Settings → Privacy & Security → Open Anyway`)、Accessibility 首次授权引导、`cargo tauri dev` 开发步骤、`cargo test --workspace` 测试。**特别声明:macOS 14+ Apple Silicon 设备上,Gatekeeper 对未 notarized 应用可能需要额外步骤(Settings → Privacy & Security → 滚动到底部「Open Anyway」)。** 用户首次安装时 README 顶部突出显示这一已知限制。**README 同时明确披露**:ClipVault 获取 Accessibility 权限后技术上能模拟任意按键事件(系统级 TCC 权限边界),但 ClipVault 代码路径仅限模拟 ⌘V;用户应仅在受信任环境下运行,在企业 MDM 管控 Mac 上使用前需确认安全策略允许。
+- **Approach.** 双架构**分别**打包,不做 `universal2` `(session-settled: user-directed — chosen over universal2: 用户要求按架构分开出包;产物不翻倍,CI 用 matrix 并行)`:`packaging/build.sh [native|arm64|x64]` 对应 `cargo tauri build --target aarch64-apple-darwin|x86_64-apple-darwin`,DMG 命名带架构后缀(`ClipVault_<版本>_arm64.dmg` / `ClipVault_<版本>_x64.dmg`)。`codesign.sh` 调 `codesign --force --deep --sign - <App.app>`(ad-hoc)。`dmg.sh` 用 `create-dmg`(homebrew) 或 `hdiutil` 拼装 DMG。README 包含:安装步骤、首次启动 Gatekeeper 拦截的两种放行方法(`右键打开`、`System Settings → Privacy & Security → Open Anyway`)、Accessibility 首次授权引导、`cargo tauri dev` 开发步骤、`cargo test --workspace` 测试。**特别声明:macOS 14+ Apple Silicon 设备上,Gatekeeper 对未 notarized 应用可能需要额外步骤(Settings → Privacy & Security → 滚动到底部「Open Anyway」)。** 用户首次安装时 README 顶部突出显示这一已知限制。**README 同时明确披露**:ClipVault 获取 Accessibility 权限后技术上能模拟任意按键事件(系统级 TCC 权限边界),但 ClipVault 代码路径仅限模拟 ⌘V;用户应仅在受信任环境下运行,在企业 MDM 管控 Mac 上使用前需确认安全策略允许。
 - **Test scenarios.**
   - `cargo bundle` 产出 `.app`。
   - `codesign -dv <App.app>` 显示 ad-hoc 签名。

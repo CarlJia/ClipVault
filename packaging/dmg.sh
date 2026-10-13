@@ -10,6 +10,10 @@
 #
 # 用法：
 #   packaging/dmg.sh [App路径] [输出DMG路径]
+#
+# 注意：本脚本不关心架构，默认输出名也是不带架构后缀的 `ClipVault.dmg`。
+# 正式发版请走 `packaging/build.sh arm64|x64` —— 它会按 `<triple>` 定位 .app，
+# 并把输出命名为 `ClipVault_<版本>_<架构>.dmg`（两个架构的包在 Release 里必须能区分）。
 
 set -euo pipefail
 

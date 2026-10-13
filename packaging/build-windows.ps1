@@ -1,6 +1,6 @@
 # ClipVault — Windows 打包脚本（U8）
 #
-# 与 packaging/build.sh 对称：那个负责 macOS 的 universal2 + ad-hoc 签名 + DMG，
+# 与 packaging/build.sh 对称：那个负责 macOS 的按架构打包（arm64 / x64）+ ad-hoc 签名 + DMG，
 # 这个负责 Windows 的 NSIS 安装包。两者共用同一份 tauri.conf.json 与前端产物。
 #
 # 流程：构建前端 → cargo tauri build --bundles nsis → 打印产物路径。
@@ -10,7 +10,7 @@
 #
 # 前置：
 #   - Rust（MSVC 工具链，rustup 默认的 x86_64-pc-windows-msvc）
-#   - cargo-tauri：cargo install tauri-cli --version "^2.11" --locked
+#   - cargo-tauri：cargo install tauri-cli --version "~2.11" --locked
 #   - Node.js（构建前端）
 #
 # 两点需要知道：

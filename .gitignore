@@ -4,6 +4,12 @@ node_modules/
 dist/
 *.pdb
 *.lock
+# Cargo.lock 必须提交：本仓库出的是可分发二进制，CI 打包要用与开发机同一棵依赖树。
+# 曾经忽略它，导致 CI 每次按 Cargo.toml 的 `version = "2"` 重新解析 tauri（解析到 2.12.3），
+# 而前端 package-lock.json 锁的是 @tauri-apps/api 2.11.1 —— `cargo tauri build` 的
+# major.minor 比对直接把 Windows 打包顶掉。前端有 package-lock.json（*.json 不受影响），
+# 这里补上 Rust 侧的对应物。
+!Cargo.lock
 .env
 .env.local
 .idea/

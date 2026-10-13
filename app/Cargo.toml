@@ -7,7 +7,14 @@ edition.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png", "macos-private-api"] }
+# tauri 与 @tauri-apps/api 必须停在同一个 major.minor 上：`cargo tauri build` 启动时会
+# 交叉比对两者的版本（tauri-cli 的 check_mismatched_packages），不一致直接报
+# "Found version mismatched Tauri packages" 并中止打包。Cargo 的 caret 语义意味着
+# `version = "2"` 会一路浮动到最新的 2.x（CI 上实际解析到 2.12.3），而前端
+# package-lock.json 锁的 @tauri-apps/api 是 2.11.1 —— 于是 Windows job 必挂。
+# 因此这里写 `~2.11`（= >=2.11.0, <2.12.0），前端 package.json 同样用 `~`。
+# 升级 tauri 时两边必须同一次改动一起抬。
+tauri = { version = "~2.11", features = ["tray-icon", "image-png", "macos-private-api"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clipvault-core = { path = "../clipvault-core" }

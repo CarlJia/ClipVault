@@ -15,13 +15,23 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 与本地开发用的 tauri-cli 大版本保持一致（本地 2.11.5）。
-  TAURI_CLI_VERSION: '^2.11'
+  # 与本地开发用的 tauri-cli 同一条线（本地 2.11.5）。这里必须是 `~` 而不是 `^`：
+  # `^2.11` 实际会装到 2.12.x，装出来的 CLI 就不在 tauri crate（`~2.11`）的线上了。
+  TAURI_CLI_VERSION: '~2.11'
 
 jobs:
   macos:
-    name: macOS（universal2 DMG）
+    name: macOS（${{ matrix.arch }} DMG）
     runs-on: macos-latest
+    strategy:
+      # 两个架构是可独立交付的产物，一个挂了不该拖住另一个。
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            rust-target: aarch64-apple-darwin
+          - arch: x64
+            rust-target: x86_64-apple-darwin
     steps:
       - uses: actions/checkout@v4
 
@@ -32,10 +42,10 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      # 两个架构都装好，packaging/build.sh 就会自动走 universal-apple-darwin
-      # （Intel + Apple Silicon 通吃）。
-      - name: 安装 universal2 目标
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      # arm64 runner 上编 x86_64 是交叉编译，但 Apple SDK 自带两份 slice、链接器也认
+      # 两个架构，不需要额外垫片，只要求 rustup 里装了对应 target。
+      - name: 安装 ${{ matrix.rust-target }} 目标
+        run: rustup target add ${{ matrix.rust-target }}
 
       - uses: actions/setup-node@v4
         with:
@@ -47,17 +57,17 @@ jobs:
         run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
 
       # 直接复用仓库里的打包脚本，而不是把步骤摊在 workflow 里：本地怎么打，CI 就怎么打，
-      # 唯一差别是 CI 装齐了两个 target（因而走 universal2）。
+      # 差别只有传进去的架构参数。
       - name: 打包（前端 → tauri build → ad-hoc 签名 → DMG）
-        run: packaging/build.sh
+        run: packaging/build.sh ${{ matrix.arch }}
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ClipVault-macos-universal2
+          name: ClipVault-macos-${{ matrix.arch }}
           if-no-files-found: error
           path: |
-            target/universal-apple-darwin/release/bundle/dmg/ClipVault.dmg
-            target/universal-apple-darwin/release/bundle/macos/ClipVault.app
+            target/${{ matrix.rust-target }}/release/bundle/dmg/ClipVault_*.dmg
+            target/${{ matrix.rust-target }}/release/bundle/macos/ClipVault.app
 
   windows:
     name: Windows（NSIS 安装包）
@@ -113,7 +123,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      # 独立成一个 job（而不是让两个平台各自往 Release 里塞）：两个 job 并发时
+      # 独立成一个 job（而不是让各平台/各架构自己往 Release 里塞）：它们并发跑时
       # 各自"没有就创建"会撞车。
       - uses: actions/download-artifact@v4
         with:
@@ -127,7 +137,7 @@ jobs:
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           # .app 是目录，不能作为 release asset —— Release 只放 DMG 与 NSIS 安装包
-          # （这两个 Artifacts 里都还有，供 CI 排障用）。
+          # （这两个 Artifacts 里都还有，供 CI 排障用）。两个架构的 DMG 都在这儿上去。
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "ClipVault $tag" --generate-notes
           gh release upload "$tag" dist/*.dmg dist/*.exe --clobber

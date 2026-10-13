@@ -28,7 +28,7 @@ ClipVault 常驻菜单栏，持续记录你复制过的纯文本，通过全局�
 
 ## 安装
 
-1. 从 DMG 安装：双击 `ClipVault.dmg`，把 `ClipVault.app` 拖入 `Applications`。
+1. 从 DMG 安装：双击对应架构的 DMG（Apple Silicon → `ClipVault_<版本>_arm64.dmg`，Intel → `ClipVault_<版本>_x64.dmg`），把 `ClipVault.app` 拖入 `Applications`。
 2. 首次启动会被 Gatekeeper 拦截（因为是 ad-hoc 签名）。按下面「Gatekeeper 放行」放行一次即可，以后正常双击。
 3. 首次运行会引导你授予 **Accessibility 权限**（用于回贴，见下文）。
 
@@ -145,7 +145,7 @@ ClipVault 默认全部离线，不做云同步、不上传任何数据（见下�
 
 ## 开发
 
-前置：macOS 13+、Rust（edition 2024 工具链）、Node.js（前端）、`cargo install tauri-cli --version "^2.0" --locked`。
+前置：macOS 13+、Rust（edition 2024 工具链）、Node.js（前端）、`cargo install tauri-cli --version "~2.11" --locked`。
 
 ```bash
 # 起开发模式（空浮层 + 菜单栏 + 全局快捷键）
@@ -162,31 +162,36 @@ cargo fmt --all -- --check
 
 ## 打包 / 发布
 
-```bash
-# 一键：前端构建 → cargo tauri build → ad-hoc 签名 → 打 DMG
-packaging/build.sh
-
-# 或分步执行：
-cargo tauri build                                  # 产 target/release/bundle/macos/ClipVault.app（+ dmg/）
-packaging/codesign.sh                              # ad-hoc 签名 + 验证 Signature=adhoc
-packaging/dmg.sh                                   # 用 create-dmg / hdiutil 打 DMG
-```
-
-产物：
-- `.app` → `target/release/bundle/macos/ClipVault.app`
-- `.dmg` → `target/release/bundle/dmg/ClipVault.dmg`
-
-### universal2（Intel + Apple Silicon 通吃）发布步骤
-
-发布正式版本时构建 universal2 二进制：
+两个架构**分别**打（不再做 universal2）：universal2 是把两份二进制 `lipo` 合并成一个 `.app`，对本项目只会让包体积近似翻倍；拆开后每个架构一个 DMG，用户按自己的机器下。（两种做法都得编两遍，matrix 只是让它并行。）
 
 ```bash
-rustup target add x86_64-apple-darwin aarch64-apple-darwin
-cargo tauri build --target universal-apple-darwin
-# 产物在 target/universal-apple-darwin/release/bundle/ 下
+packaging/build.sh arm64     # Apple Silicon（aarch64-apple-darwin）
+packaging/build.sh x64       # Intel（x86_64-apple-darwin）
+packaging/build.sh           # 不传参数 = 当前机器架构（开发日常）
 ```
 
-`packaging/build.sh` 会在两个架构 target 均已安装时自动走 universal2，否则退回当前机器的原生架构（并打印提示）。
+每个架构一条命令走完：前端构建 → `cargo tauri build --target <triple>` → ad-hoc 签名 → 打 DMG。
+
+产物（`<triple>` = `aarch64-apple-darwin` 或 `x86_64-apple-darwin`，`<arch>` = `arm64` 或 `x64`）：
+- `.app` → `target/<triple>/release/bundle/macos/ClipVault.app`
+- `.dmg` → `target/<triple>/release/bundle/dmg/ClipVault_<版本>_<arch>.dmg`
+
+或分步执行（下面以 arm64 为例）：
+
+```bash
+cargo tauri build --target aarch64-apple-darwin --bundles app   # 产 target/aarch64-apple-darwin/release/bundle/macos/ClipVault.app
+packaging/codesign.sh target/aarch64-apple-darwin/release/bundle/macos/ClipVault.app   # ad-hoc 签名 + 验证 Signature=adhoc
+packaging/dmg.sh target/aarch64-apple-darwin/release/bundle/macos/ClipVault.app ClipVault_0.1.0_arm64.dmg   # create-dmg / hdiutil（输出名随便取，build.sh 会带版本号+架构）
+```
+
+（`--bundles app` 只出 `.app`：`tauri.conf.json` 的 `targets: "all"` 会让 bundler 自己也产一个 DMG，
+和我们用 `dmg.sh` 打的混在同一个目录里，架构后缀写法还不一样。DMG 统一交给 `dmg.sh`。）
+
+交叉编译：Apple Silicon 上编 x86_64 需要 `rustup target add x86_64-apple-darwin`（Intel 上编 arm64 同理）。Apple SDK 自带两份架构 slice，不需要额外工具链。
+
+发版走 `.github/workflows/package.yml`：macOS job 用 matrix 并行跑这两个架构（产物 Artifact 分别是 `ClipVault-macos-arm64` / `ClipVault-macos-x64`），Windows job 跑 `packaging\build-windows.ps1` 出 NSIS 安装包，`release` job 把两个 DMG 与 `.exe` 一起挂到 `v*` tag 的 Release 上。
+
+> **版本约束**：`app/Cargo.toml` 的 `tauri` 与 `frontend/package.json` 的 `@tauri-apps/api` 必须停在**同一个 major.minor**——`cargo tauri build` 启动时会交叉校验，不一致直接报 `Found version mismatched Tauri packages` 并中止（Windows job 就栽在这儿）。所以两边都写成 `~2.11`（`^` 会浮到 2.12+，而 npm 侧锁的是 2.11.1），升级 tauri 时两处一起抬。`Cargo.lock` 因此纳入版本控制：CI 与开发机用同一棵依赖树。
 
 ---
 

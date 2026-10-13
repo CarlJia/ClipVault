@@ -506,17 +506,24 @@ README.md                             [改] Windows 安装/使用/限制/凭据�
   `bundle.icon` 加 `.ico`。`build-windows.ps1` 与 `build.sh` 对称:前端构建 → `cargo tauri build
   --bundles nsis`(显式只要 NSIS,`targets: "all"` 会连带给需要 WiX 的 MSI)→ 打印产物路径。
   CI 为单文件三 job(`macos` / `windows` / `release`):`v*` tag 触发 + `workflow_dispatch`,
-  macOS job 直接调既有 `packaging/build.sh`(装齐双架构 target 即自动走 universal2),
+  macOS job 用 matrix 按架构并行调 `packaging/build.sh arm64|x64`
+  `(session-settled: user-directed — chosen over universal2: 用户要求 Intel 与 Apple Silicon 分开打包)`,
   Windows job 调 `build-windows.ps1`;`release` job 用 runner 自带的 `gh` 把 `.dmg` 与 `.exe`
   挂到 Release。只用 `actions/*` 官方 action + runner 自带 `rustup`/`gh`,不引入第三方 action。
   **Windows job 额外跑 `cargo clippy -D warnings` 与 `cargo test`** —— 这是本仓库唯一
   能在 CI 上验证 `cfg(target_os = "windows")` 分支的地方(本地开发机是 macOS,那些分支
   根本不被编译),所以把 lint 与测试也放在这里,而不是只打包。为此 Windows job 需要先构建
   前端:`tauri-build` 的 build.rs 要求 `frontendDist` 目录已存在。
+  **版本必须两条线对齐**:`cargo tauri build` 启动时会交叉校验 Rust crate 与 NPM 包的
+  major.minor(`tauri-cli` 的 `check_mismatched_packages`),不一致直接中止。而 `version = "2"`
+  的 caret 语义会一路浮到最新 2.x(CI 上解析到 2.12.3),前端 `package-lock.json` 锁的却是
+  `@tauri-apps/api` 2.11.1 —— 这正是 Windows 打包首次失败的根因。修法:两侧都写 `~2.11`
+  (`app/Cargo.toml` / `frontend/package.json`)、`Cargo.lock` 纳入版本控制(此前被
+  `.gitignore` 的 `*.lock` 误伤),这样 CI 与开发机用同一棵依赖树。
 - **Test scenarios.** 无(CI 自身即验证)。
 - **Verification.** 本地:`python3 packaging/make_icons.py` 产出的 ICO 用一次性解析脚本结构校验
   (条目数 6、尺寸集合、偏移在文件范围内);`cargo tauri info` 确认 config 仍可解析。
-  CI:两个 job 绿、Artifacts 内可下载 `.dmg` 与 `.exe`。
+  CI:macOS 两个架构 job + Windows job 全绿、Artifacts 内可下载两个 `.dmg` 与 `.exe`。
 
 ### U9. 文档
 
