@@ -101,6 +101,9 @@ APP_COLOR = (63, 90, 168)
 # Windows 需要一套 16–256 的尺寸：16/32 出现在任务栏与资源管理器列表，
 # 48/64 是 exe 属性页与 Alt+Tab，128/256 是「大图标」视图。
 ICO_SIZES = (16, 32, 48, 64, 128, 256)
+# Windows 托盘图标尺寸：通知区在 100% DPI 下是 16×16、200% 下 32×32，由 shell 自行缩放。
+# 取 32 —— 与 icon.ico 的 32 档同源同色，缩到 16 是干净的 2:1。
+TRAY_WINDOWS_SIZE = 32
 
 
 def ico_pixels(size, color):
@@ -183,5 +186,13 @@ if __name__ == "__main__":
     with open(ico_path, "wb") as fh:
         fh.write(ico(ICO_SIZES, APP_COLOR))
 
+    # Windows 的彩色托盘图标（U6 / RW7）。必须彩色且**不能**当模板图用：
+    # 模板标志在 Windows 上没有意义，而黑色模板图在深色任务栏上根本看不见。
+    # 与 icon.ico 同色同字形，只是不带 16–256 那一套尺寸。
+    tray_path = os.path.join(repo_root, "app", "icons", "tray-windows.png")
+    with open(tray_path, "wb") as fh:
+        fh.write(render(TRAY_WINDOWS_SIZE, APP_COLOR))
+
     print(f"wrote master-color.png + master-template.png to {outdir}")
     print(f"wrote {ico_path} ({', '.join(str(s) for s in ICO_SIZES)})")
+    print(f"wrote {tray_path} ({TRAY_WINDOWS_SIZE}x{TRAY_WINDOWS_SIZE})")
