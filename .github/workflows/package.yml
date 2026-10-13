@@ -109,13 +109,22 @@ jobs:
       - name: 打包（前端 → tauri build → ad-hoc 签名 → DMG）
         run: packaging/build.sh ${{ matrix.arch }}
 
+      # 把要上传的产物收进一个固定布局的暂存目录，而不是直接传 bundle 下的两个路径：
+      # upload-artifact 按「上传路径的公共祖先」剥前缀，直接传会让 artifact 里出现
+      # dmg/ 与 macos/ 两层。更麻烦的是两个架构的 .app 同名，合并进 dist/ 时 x64 会
+      # 覆盖 arm64，留下一个架构都对不上的目录。这里按架构改名，布局也变成显式约定。
+      - name: 暂存产物
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.rust-target }}/release/bundle/dmg/ClipVault_*.dmg staging/
+          cp -R target/${{ matrix.rust-target }}/release/bundle/macos/ClipVault.app \
+            "staging/ClipVault_${{ matrix.arch }}.app"
+
       - uses: actions/upload-artifact@v4
         with:
           name: ClipVault-macos-${{ matrix.arch }}
           if-no-files-found: error
-          path: |
-            target/${{ matrix.rust-target }}/release/bundle/dmg/ClipVault_*.dmg
-            target/${{ matrix.rust-target }}/release/bundle/macos/ClipVault.app
+          path: staging/
 
   windows:
     name: Windows（NSIS 安装包）
@@ -209,6 +218,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      # 这个 job 只消费 Artifacts，所以**刻意不 checkout** —— 但 gh 默认要靠 .git 里的
+      # remote 推断仓库，缺了它会直接报 "failed to run git: fatal: not a git repository"。
+      # 所以下面每条 gh 命令都显式带 `--repo "$GITHUB_REPOSITORY"`（该变量由 Actions 注入）：
+      # 既不依赖 git 上下文，也省掉一次 checkout。
       # 独立成一个 job（而不是让各平台/各架构自己往 Release 里塞）：它们并发跑时
       # 各自"没有就创建"会撞车。
       - uses: actions/download-artifact@v4
@@ -222,9 +235,25 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          # .app 是目录，不能作为 release asset —— Release 只放 DMG 与 NSIS 安装包
-          # （这两个 Artifacts 里都还有，供 CI 排障用）。两个架构的 DMG 都在这儿上去。
-          gh release view "$tag" >/dev/null 2>&1 || \
-            gh release create "$tag" --title "ClipVault $tag" --generate-notes
-          gh release upload "$tag" dist/*.dmg dist/*.exe --clobber
-          gh release view "$tag" --json assets --jq 'assets[].name'
+          repo="${GITHUB_REPOSITORY}"
+
+          # .app 是目录，不能作为 release asset —— Release 只放 DMG 与 NSIS 安装包。
+          # 资产用 find 按后缀递归收集，**不去猜** artifact 合并后的目录层级：
+          # upload-artifact 是按上传路径的公共祖先剥前缀的，早先写的 dist/*.dmg
+          # 就因为这个静默匹配不到两个 DMG（只有根上的 .exe 会被传上去）。
+          # 用 while-read 攒数组而不是 mapfile：后者是 bash 4 才有的，留着 3.2 也能跑
+          # （本仓库的开发机是 macOS，自带 bash 3.2）。
+          assets=()
+          while IFS= read -r f; do assets+=("$f"); done \
+            < <(find dist -type f \( -name '*.dmg' -o -name '*.exe' \) | sort)
+          if (( ${#assets[@]} == 0 )); then
+            echo "错误：dist/ 下没有 .dmg/.exe —— 上游 artifact 的布局变了？" >&2
+            exit 1
+          fi
+          echo "待上传 ${#assets[@]} 个资产："
+          printf '  %s\n' "${assets[@]}"
+
+          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$repo" --title "ClipVault $tag" --generate-notes
+          gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber
+          gh release view "$tag" --repo "$repo" --json assets --jq 'assets[].name'
