@@ -53,6 +53,17 @@ Invoke-Step '[1/2] 安装前端依赖' {
 }
 
 Invoke-Step '[2/2] cargo tauri build --bundles nsis' {
+    # 先清掉上一次留下的安装包 —— 与 macOS 侧 build.sh 同样的理由，而且更必要：
+    # CI 的 target 缓存**包含 bundle 目录**，换版本号会让 Cargo.lock 变、缓存 key 变、
+    # restore-keys 前缀回退命中**上一版**的缓存，于是 bundle\nsis\ 里躺着上一个版本的
+    # `.exe`。上传侧是按 `nsis\*.exe` 通配收集的，旧文件会跟着进 artifact、最后被试着
+    # 挂到新版本的 Release 上（v0.2.0 那次 macOS 侧就这么混进去过；release job 的版本号
+    # 断言能拦住，但正确的做法是根本不产生它）。
+    $nsisDir = Join-Path $rootDir 'target\release\bundle\nsis'
+    if (Test-Path $nsisDir) {
+        Get-ChildItem -Path $nsisDir -Filter *.exe -ErrorAction SilentlyContinue |
+            Remove-Item -Force
+    }
     cargo tauri build --bundles nsis
 }
 
