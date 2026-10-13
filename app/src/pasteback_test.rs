@@ -4,7 +4,8 @@
 //! 这里只用 mock [`AccessibilityChecker`] / [`PasteBackend`] 断言
 //! [`perform_paste`] 的分支决策:是否写剪贴板、是否触达模拟、失败回退文案。
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
 
 use clipvault_core::ContentKind;
 use clipvault_core::Entry;
@@ -13,7 +14,7 @@ use clipvault_core::crypto::CryptoError;
 use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, CGEVENT_FAIL_MSG, InjectError, PasteBackend, PasteError, PasteOutcome,
-    WINDOW_SWITCHED_MSG, perform_paste,
+    WINDOW_SWITCHED_MSG, perform_paste, should_replace_target, wait_for_frontmost,
 };
 
 /// 固定返回布尔的 Accessibility mock。
@@ -462,4 +463,112 @@ fn vault_image_entry_decrypts_payload_before_write() {
     assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Image));
     assert_eq!(*backend.wrote_payload_len.borrow(), Some(raw_png.len()));
     assert!(*backend.simulated.borrow(), "图片 vault 解密后应模拟 ⌘V");
+}
+
+// ----------------------------------------------------------------
+// 焦点归还的有界等待（F2）：wait_for_frontmost 的平台无关决策
+// ----------------------------------------------------------------
+//
+// 真实激活（NSRunningApplication.activateWithOptions）与真实前台应用读取
+// 归 AE3 的 macOS 真机手动验收；这里只断言等待策略本身：命中即返回、
+// 异步到位能等到、始终不到位则在 max_wait 截止后放弃（调用方据此保留
+// 降级提示），且读不到前台应用时不会卡死或 panic。
+
+/// 第一次采样就命中 → 立即返回，且**只采样一次**（不做无谓 sleep）。
+#[test]
+fn wait_for_frontmost_returns_on_first_hit() {
+    let samples = Cell::new(0);
+    let ok = wait_for_frontmost(
+        || {
+            samples.set(samples.get() + 1);
+            Some(42)
+        },
+        42,
+        Duration::from_millis(200),
+        Duration::from_millis(1),
+    );
+
+    assert!(ok);
+    assert_eq!(samples.get(), 1, "已在前台时不应再轮询");
+}
+
+/// 目标稍后才回到前台（激活是异步的）→ 轮询到命中为止。
+#[test]
+fn wait_for_frontmost_polls_until_target_arrives() {
+    let samples = Cell::new(0);
+    let ok = wait_for_frontmost(
+        || {
+            samples.set(samples.get() + 1);
+            // 前两次采样是别的 App（面板刚隐藏时的旧前台），第三次才轮到目标。
+            if samples.get() >= 3 {
+                Some(7)
+            } else {
+                Some(99)
+            }
+        },
+        7,
+        Duration::from_millis(200),
+        Duration::from_millis(1),
+    );
+
+    assert!(ok);
+    assert_eq!(samples.get(), 3, "命中后应停止轮询");
+}
+
+/// 目标始终没回到前台 → 到 max_wait 截止后返回 false（不再阻塞回贴）。
+#[test]
+fn wait_for_frontmost_gives_up_after_max_wait() {
+    let started = Instant::now();
+    let ok = wait_for_frontmost(
+        || Some(99),
+        7,
+        Duration::from_millis(20),
+        Duration::from_millis(2),
+    );
+
+    assert!(!ok, "目标未回到前台时应超时返回 false");
+    assert!(
+        started.elapsed() >= Duration::from_millis(20),
+        "应真的等到 max_wait 截止"
+    );
+}
+
+/// 读不到前台应用（None）时按超时收敛，不 panic、不提前成功。
+#[test]
+fn wait_for_frontmost_handles_unknown_frontmost() {
+    let ok = wait_for_frontmost(
+        || None,
+        7,
+        Duration::from_millis(15),
+        Duration::from_millis(2),
+    );
+
+    assert!(!ok);
+}
+
+// ----------------------------------------------------------------
+// 回贴目标的记录策略（F2）：should_replace_target 的边界
+// ----------------------------------------------------------------
+//
+// 真实「前台应用是谁」由 macOS 提供（`NSWorkspace.frontmostApplication`），
+// 归 AE3 真机验收；这里只锁住覆盖策略这条纯逻辑——它是「面板已在前台时再按
+// 热键」这个常见操作的唯一防线。
+
+/// 面板已在前台时再按一次 ⌥⌘V：前台是 ClipVault 自己（pid 相同）→ 不覆盖，
+/// 否则回贴后的失焦比对会把「自己」当目标，把 Pasted 误报成 WindowSwitched。
+#[test]
+fn target_not_replaced_when_panel_is_frontmost() {
+    assert!(!should_replace_target(Some(42), 42));
+}
+
+/// 正常情形：前台是别的 App → 覆盖。
+#[test]
+fn target_replaced_when_other_app_is_frontmost() {
+    assert!(should_replace_target(Some(7), 42));
+}
+
+/// 读不到前台应用 → 保留原记录，不用 None 抹掉已有的真实目标。
+#[test]
+fn target_kept_when_frontmost_unknown() {
+    assert!(!should_replace_target(None, 42));
 }

@@ -12,7 +12,10 @@
         <div id="banner" class="banner hidden"></div>
         <div id="vault-banner" class="banner banner-vault hidden"></div>
         <div id="guest-notice" class="banner banner-guest hidden"></div>
-        <div class="search-row">
+        <!-- 拖拽区：面板无标题栏（decorations: false），顶部搜索条整条充当可拖拽的
+             「标题栏」。`deep` 让空白处与放大镜图标都能拖；`<input>` 属可点击元素、
+             Tauri 的 drag.js 会主动放行，故输入框的选词 / 光标不受影响。 -->
+        <div class="search-row" data-tauri-drag-region="deep">
           <span class="search-icon">􀊫</span>
           <input
             id="search"
@@ -26,7 +29,11 @@
         </div>
         <div id="tabs" class="tabs"></div>
         <div id="list" class="list"></div>
-        <div class="hint">↩ 粘贴 · ⌘1–9 直选 · 双击回贴 · ⌘E 备注 · ⌘P 置顶 · ⌘L 移入加密区 · ⌘O 在浏览器打开 URL · ⌘⇧V 加密区 · ⌘⇧G 访客 · ⌘⇧N 本次不记录 · esc 关闭</div>
+        <!-- 底部提示：快捷键用 <kbd> 包成键帽（强调色 + 淡底 + 描边），说明文字保持弱化色，
+             长条提示里靠颜色把「按什么」和「做什么」分开，扫读时先看到按键。
+             `双击` 是鼠标手势，用同款样式的 <span class="keycap">：<kbd> 语义上只表示键盘输入，
+             但视觉上要和键帽一致。括号里的补充说明用 .hint-note 再弱一层。 -->
+        <div class="hint"><kbd>↩</kbd> 粘贴 · <kbd>⌘1–9</kbd> 直选 · <span class="keycap">双击</span> 回贴 · <kbd>⌘E</kbd> 备注 · <kbd>⌘P</kbd> 置顶 · <kbd>⌘L</kbd> 移入加密区 · <kbd>⌘O</kbd> 在浏览器打开 URL · <kbd>⌘⇧V</kbd> 加密区<span class="hint-note">（内可选 <kbd>↩</kbd> 回贴 / <kbd>⌘E</kbd> 备注）</span> · <kbd>⌘⇧G</kbd> 访客 · <kbd>⌘⇧N</kbd> 本次不记录 · <kbd>esc</kbd> 关闭</div>
         <div id="toast" class="toast hidden"></div>
 
         <!-- 备注 / 标签编辑器（U6）。默认隐藏，⌘E 唤出。 -->
@@ -65,7 +72,7 @@
               </div>
             </div>
             <div class="editor-foot">
-              <span class="editor-hint">⌘S 保存 · esc 关闭</span>
+              <span class="editor-hint"><kbd>⌘S</kbd> 保存 · <kbd>esc</kbd> 关闭</span>
               <button id="editor-retry" class="editor-retry hidden">重试</button>
             </div>
           </div>
@@ -81,7 +88,7 @@
             <div class="vault-sub" id="vault-sub"></div>
             <div class="vault-list" id="vault-list"></div>
             <div class="editor-foot">
-              <span class="editor-hint">🔒 内容以 AES-256-GCM 加密 · esc 关闭</span>
+              <span class="editor-hint">🔒 内容以 AES-256-GCM 加密 · <kbd>↩</kbd> 回贴 · <kbd>⌘E</kbd> 备注 · <kbd>esc</kbd> 关闭</span>
               <button id="vault-clear" class="editor-retry hidden">清除不可解密条目</button>
             </div>
           </div>
@@ -102,7 +109,7 @@
               </div>
             </div>
             <div class="editor-foot">
-              <span class="editor-hint">⌘, 打开设置 · esc 关闭 · 改动即时生效,关闭时自动保存</span>
+              <span class="editor-hint"><kbd>⌘,</kbd> 打开设置 · <kbd>esc</kbd> 关闭 · 改动即时生效,关闭时自动保存</span>
             </div>
           </div>
         </div>

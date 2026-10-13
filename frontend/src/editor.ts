@@ -50,7 +50,8 @@ export function openEditor(entry: EntryDto, onSaved: (dto: EntryDto) => void): v
   onSavedCb = onSaved;
   tags = [...entry.tags];
   noteEl.value = entry.note;
-  previewEl.textContent = entry.content;
+  // 加密区条目的正文不下发前端（见 commands::list_vault），预览位置给出说明而非空白。
+  previewEl.textContent = entry.is_vault ? "🔒 加密内容（不预览）" : entry.content;
   updateCounter();
   renderChips();
   clearTimers();

@@ -47,8 +47,13 @@ body {
   flex-direction: column;
   height: 100%;
   background: var(--bg);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  /* 不要在 .panel 上用 backdrop-filter（含 -webkit- 前缀）。面板窗口是
+     `transparent: true`（tauri.conf.json）+ 页面根透明，WebKit 在这种组合下
+     建立的背景捕获层不可靠：`#search` 一拿到焦点（光标闪烁触发合成层重排）
+     捕获就塌陷成不透明底，面板表现为「变实心」，失焦后要等 Core Animation
+     节流重捕获（秒级）才恢复半透明。面板的半透明本就由 --bg 的 alpha 提供，
+     不依赖模糊；`.editor` 系列模态的 blur(6px) 不受影响（它模糊的是面板内容）。
+     上游同类：tauri-apps/tauri#12804、#15512。 */
   border-radius: var(--radius);
   border: 1px solid var(--border);
   overflow: hidden;
@@ -270,6 +275,70 @@ body {
   font-size: 11px;
 }
 
+/* ── 多类型条目预览（多类型 plan U5）─────────────────────────────
+   列表项按 `content_kind` 换预览块：image 缩略图 / file 文件名 /
+   rtf 徽标 / color 色块；text 沿用上面的纯文本布局。 */
+
+/* 图片行：缩略图在左，尺寸与文件大小在右，整行垂直居中。 */
+.row-image-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+/* 64×64 缩略图（U3 生成、R19 锁定尺寸）。按 1:1 显示不做二次缩放，
+   圆角 + 描边让浅色图在暗底上仍看得出边界。 */
+.row-thumb {
+  flex-shrink: 0;
+  display: block;
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+/* 无缩略图时的占位（R24：降级 48×48 仍超 10KB → 丢弃 thumb 字段）：
+   用文件大小文字顶上。尺寸沿用 .row-thumb，故**必须排在它之后**——
+   两条规则同为单类选择器、优先级相同，靠源序覆盖 `display: block`。 */
+.row-thumb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  line-height: 1.15;
+  color: var(--muted);
+  text-align: center;
+}
+/* 缩略图右侧的「宽×高 大小」文本。 */
+.row-image-meta {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--muted);
+}
+/* 文件行：文件名为主标题（完整路径降为副标题，见 .row-subtitle）。 */
+.row-file-name {
+  font-family: var(--font-ui);
+}
+/* RTF 行：没有可预览的正文，只有类型徽标。 */
+.row-rtf-badge {
+  font-family: var(--font-ui);
+}
+/* 颜色行：色块 + rgba 文本。 */
+.row-color-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.row-color-swatch {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
 /* Pin 徽标（U7）：pin.fill 风格内联 SVG，13×13。
    颜色经 CSS 自定义属性 --pin-color 承接：非选中行 muted、选中行 accent。 */
 .pin {
@@ -309,6 +378,15 @@ body {
 .chip-undec {
   background: rgba(255, 69, 58, 0.2);
   color: var(--danger);
+}
+/* 内容类型徽标（多类型 plan U5）：IMAGE / FILE / RTF / COLOR。
+   与类别、标签徽标并列，用更小的字号 + 字距做一个中性的「类型」标。 */
+.chip-kind {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
 }
 
 /* Keychain 不可用横幅（U9）：复用 .banner 的告警样式。 */
@@ -366,6 +444,33 @@ body {
   color: var(--muted);
   font-size: 11px;
   letter-spacing: 0.02em;
+  /* 提示条会折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
+     否则相邻两行的键帽会贴在一起。 */
+  line-height: 1.8;
+}
+
+/* 「按什么」与「做什么」分色：快捷键是键帽（强调色文字 + 淡蓝底 + 描边），
+   说明文字留在 --muted。用颜色而非字重区分，是因为提示条里塞了十来个按键，
+   靠颜色扫读最快。`font-family: inherit` 是刻意的 —— 等宽字体（SF Mono 等）
+   对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。 */
+.hint kbd,
+.hint .keycap,
+.editor-hint kbd,
+.editor-hint .keycap {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid rgba(10, 132, 255, 0.32);
+  border-radius: 4px;
+  background: rgba(10, 132, 255, 0.14);
+  color: #7ab8ff;
+  font-family: inherit;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* 括号里的补充说明再弱一层，不与主提示抢注意力。 */
+.hint-note {
+  color: rgba(154, 154, 162, 0.72);
 }
 
 /* Toast */
@@ -404,6 +509,11 @@ body {
 }
 .editor.hidden {
   display: none;
+}
+/* 备注编辑器可嵌套唤起于加密区模态之上（⌘⇧V → ⌘E）：三者 z-index 相同，
+   层级由 DOM 顺序决定，而 #editor 在 #vault 之前，故单独抬高一层。 */
+#editor {
+  z-index: 30;
 }
 
 .editor-card {
@@ -555,6 +665,8 @@ body {
 .editor-hint {
   font-size: 11px;
   color: var(--muted);
+  /* 与 .hint 同款键帽，行距同样要给键帽留出上下余量。 */
+  line-height: 1.8;
 }
 .editor-retry {
   border: 1px solid var(--danger);
@@ -600,10 +712,24 @@ body {
   padding: 8px 10px;
   border-radius: 8px;
   background: var(--surface);
+  cursor: pointer;
+}
+.vault-row:hover {
+  background: var(--selected);
+}
+/* 选中态（↑↓ / 单击）：与主列表 `.row.selected` 同一套视觉语义，
+   因为加密区条目同样可 ↩ 回贴、⌘E 编辑备注。 */
+.vault-row.selected {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--accent);
 }
 .vault-row.undecryptable {
   background: rgba(255, 69, 58, 0.1);
   border: 1px solid rgba(255, 69, 58, 0.28);
+}
+/* 选中优先于「无法解密」底色：红框仍在，底色调成选中色，选中位置才看得清。 */
+.vault-row.undecryptable.selected {
+  background: var(--selected);
 }
 .vault-note {
   margin-top: 4px;

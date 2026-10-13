@@ -258,17 +258,21 @@ export function renderFilterHeader(kind: "tag" | "category", name: string): stri
 /**
  * 渲染「加密区管理」列表（U9）。密文不下发，只展示元数据：类别、标签、备注、
  * 时间，以及是否可解密。不可解密的条目高亮警示，供用户「清除不可解密条目」。
+ *
+ * `selected` 为高亮行索引：加密区条目与主列表一样可键盘导航（↑↓）、
+ * `Enter` 回贴、`⌘E` 编辑备注，故需要选中态（AE5：移入加密区 → 选中 → Enter）。
  */
 export function renderVaultList(
   container: HTMLElement,
   entries: EntryDto[],
+  selected = 0,
 ): void {
   if (entries.length === 0) {
     container.innerHTML = `<div class="empty">加密区暂无条目</div>`;
     return;
   }
   container.innerHTML = entries
-    .map((e) => {
+    .map((e, i) => {
       const cat = `<span class="chip chip-cat">${escapeHtml(e.auto_category)}</span>`;
       const tags = e.tags
         .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
@@ -280,7 +284,7 @@ export function renderVaultList(
         ? `<div class="vault-note">${escapeHtml(e.note)}</div>`
         : "";
       return `
-      <div class="vault-row${e.is_decryptable ? "" : " undecryptable"}" data-id="${e.id}">
+      <div class="vault-row${e.is_decryptable ? "" : " undecryptable"}${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}">
         <div class="row-main">
           <div class="row-meta">${status}${cat}${tags}</div>
           ${noteLine}

@@ -66,5 +66,5 @@ packaging/build.sh
 
 ## 实施进度
 
-U1–U11 全部完成（`git log` 可见各 U 的 commit）。当前测试基线：app 53 passed + core 18 passed，
+U1–U11 全部完成（`git log` 可见各 U 的 commit）。当前测试基线：app 94 passed + core 22 passed，
 1 个 trigram 测试 ignored（依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。

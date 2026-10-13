@@ -19,7 +19,14 @@ base64 = "0.22"
 # U9：move_to_vault 的每条随机 salt（salted content_hash，避免明文指纹）。
 rand = "0.8"
 # 多类型 plan U3：图片缩略图生成（decode → resize → encode PNG → base64）。
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+# `tiff` 与捕获侧对齐：`capture` 在 PNG 缺失时回退读 `NSPasteboardTypeTIFF`
+# （mime = `image/tiff`），缺这个 decoder 时 `load_from_memory` 直接失败，
+# 该条 entry 就没有 thumb，UI 只能退化成文件大小文字（R19 要求图片必带缩略图）。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "tiff",
+] }
 
 # macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
 # - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。
@@ -44,6 +51,25 @@ objc2-core-graphics = { version = "0.3", features = [
 ] }
 # U9：Keychain 托管数据密钥（service = com.clipvault.data_key）。
 security-framework = "3"
+
+# Windows 原生绑定（多平台 plan U1 起）。仅在 Windows 目标上编译，与上面的 objc2 家族对称。
+# - 剪贴板：U1 采集（OpenClipboard / GetClipboardData / CF_HDROP / CF_DIB*）与
+#   U3 回贴（SetClipboardData 写回 CF_UNICODETEXT / CF_HDROP / 注册格式 PNG）。
+# - 选 `windows` crate 而非 `windows-sys`：前者把返回 BOOL 的 API 映射成 Result
+#   （省掉逐处 GetLastError 判定），并自带 INPUT / CREDENTIALW / DROPFILES / MSG
+#   等结构体定义 —— 手写 #[repr(C)] 布局正是 FFI 最容易出错的地方。0.61.3 已在
+#   依赖树内（tauri / wry / webview2-com 传递引入），不新解析第二个版本。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["custom-protocol"]

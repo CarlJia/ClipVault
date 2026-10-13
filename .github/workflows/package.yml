@@ -1,0 +1,134 @@
+name: Package
+
+# 触发：
+#   - 推 `v*` tag：构建两个平台并把产物挂到对应的 GitHub Release。
+#   - 手动（Actions → Package → Run workflow）：只构建并上传 Artifacts，不发 Release。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 顶层只给只读；只有 release job 需要写权限（创建 Release 与上传资产）。
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 与本地开发用的 tauri-cli 大版本保持一致（本地 2.11.5）。
+  TAURI_CLI_VERSION: '^2.11'
+
+jobs:
+  macos:
+    name: macOS（universal2 DMG）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # runner 上预装了 rustup/rustc，但仍然显式安装一次：CI 的可复现性不该依赖
+      # runner 镜像的默认值。clippy/rustfmt 由 profile minimal 之外单独指定。
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # 两个架构都装好，packaging/build.sh 就会自动走 universal-apple-darwin
+      # （Intel + Apple Silicon 通吃）。
+      - name: 安装 universal2 目标
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装 tauri-cli
+        run: cargo install tauri-cli --version "$TAURI_CLI_VERSION" --locked
+
+      # 直接复用仓库里的打包脚本，而不是把步骤摊在 workflow 里：本地怎么打，CI 就怎么打，
+      # 唯一差别是 CI 装齐了两个 target（因而走 universal2）。
+      - name: 打包（前端 → tauri build → ad-hoc 签名 → DMG）
+        run: packaging/build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipVault-macos-universal2
+          if-no-files-found: error
+          path: |
+            target/universal-apple-darwin/release/bundle/dmg/ClipVault.dmg
+            target/universal-apple-darwin/release/bundle/macos/ClipVault.app
+
+  windows:
+    name: Windows（NSIS 安装包）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # cargo 的 build.rs（tauri-build）要求 tauri.conf.json 的 frontendDist 目录存在，
+      # 所以下面的 clippy / test 之前必须先有 frontend/dist。
+      - name: 构建前端（cargo 的 build.rs 需要 frontendDist 存在）
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
+      # 下面两步是这个 workflow 存在的主要理由：本地开发机是 macOS，
+      # cfg(target_os = "windows") 的分支在那里**根本不会被编译**，所以 Windows 目标的
+      # 整树编译与 lint 只能在 CI 上验证。
+      - name: clippy（Windows 目标）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（Windows 目标）
+        run: cargo test --workspace
+
+      - name: 安装 tauri-cli
+        run: cargo install tauri-cli --version "$env:TAURI_CLI_VERSION" --locked
+
+      - name: 打包（前端 → tauri build --bundles nsis）
+        run: packaging/build-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipVault-windows-nsis
+          if-no-files-found: error
+          path: target/release/bundle/nsis/*.exe
+
+  release:
+    name: 发布到 GitHub Release
+    needs: [macos, windows]
+    # 只有 tag 推送才发版；手动触发时到此为止，产物留在 Artifacts 里。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 独立成一个 job（而不是让两个平台各自往 Release 里塞）：两个 job 并发时
+      # 各自"没有就创建"会撞车。
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 挂载产物到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # .app 是目录，不能作为 release asset —— Release 只放 DMG 与 NSIS 安装包
+          # （这两个 Artifacts 里都还有，供 CI 排障用）。
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "ClipVault $tag" --generate-notes
+          gh release upload "$tag" dist/*.dmg dist/*.exe --clobber
+          gh release view "$tag" --json assets --jq 'assets[].name'

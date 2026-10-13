@@ -8,9 +8,10 @@
 //!
 //! ## 平台边界
 //!
-//! `poll_first_non_empty` 在非 macOS 平台返回 `None`,便于跨平台 CI;
-//! `Watcher::process` 仍是异步签名,在 mock / unit test 中可直接喂
-//! `Captured { ... }` 跳过 NSPasteboard 读取。
+//! `poll_first_non_empty` 每个目标平台各有一份实现:macOS 读 `NSPasteboard`,
+//! Windows 读 Win32 剪贴板格式(见下方 `mod win`),其余平台返回 `None`。
+//! 三者的签名与契约完全一致,`Watcher::process` 及下游全部平台无关;
+//! 单元测试只驱动 `Watcher::process` 与纯转换函数,不触碰真实剪贴板。
 //!
 //! ## 多类型优先级
 //!
@@ -243,10 +244,274 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
     None
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn poll_first_non_empty(_change_count: i64, _prev_change_count: i64) -> Option<Captured> {
     None
 }
+
+// ---------------------------------------------------------------
+// Windows 真实读取（U1）
+// ---------------------------------------------------------------
+
+/// 单次剪贴板轮询的 Windows 实现。
+///
+/// 与 macOS 侧同一契约,但格式映射不同 —— Win32 剪贴板是一组编号格式,没有
+/// `NSPasteboard` 那种「同一份内容挂多种类型」之外的额外约定:
+///
+/// | 优先级 | 剪贴板格式 | macOS 对应物 | 产出的 kind |
+/// |---|---|---|---|
+/// | 1 | `CF_HDROP` | `NSFilenamesPboardType` | File |
+/// | 2 | 注册格式 `PNG` | `NSPasteboardTypePNG` | Image(`image/png`) |
+/// | 3 | `CF_DIBV5` / `CF_DIB` | `NSPasteboardTypeTIFF`(同为「非 PNG 的位图回退」) | Image(`image/png`,转码后) |
+/// | 4 | 注册格式 `Rich Text Format` | `NSPasteboardTypeRTF` | Rtf |
+/// | 5 | `CF_UNICODETEXT` | `NSPasteboardTypeString` | Text |
+///
+/// 两处**刻意的差异**:
+/// - 图片回退到 DIB 后转码成 PNG 再落库(macOS 保留 TIFF 原样)。理由:Windows 上
+///   只有 DIB 的复制源非常多,而 `thumbnail.rs` / 前端 `<img>` / `payload` 三处下游
+///   都按 PNG 消费,保留 DIB 会让这些条目没有缩略图。转码细节见 [`crate::winclip`]。
+/// - **不产生 `Color` 条目**:Win32 剪贴板没有颜色类型(颜色通常以文本或应用私有格式
+///   出现),因此 `ContentKind::Color` 在 Windows 采集侧永远不会被构造。前端 `color`
+///   行的渲染分支保留不动 —— 它服务的是历史库里的 macOS 条目与可跨平台拷贝的同一份库文件。
+#[cfg(target_os = "windows")]
+mod win {
+    use std::sync::OnceLock;
+    use std::time::Duration;
+
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard, RegisterClipboardFormatW,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::{CF_DIB, CF_DIBV5, CF_HDROP, CF_UNICODETEXT};
+    use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
+    use windows::core::PCWSTR;
+
+    use super::{Captured, png_dimensions};
+
+    /// `OpenClipboard` 的有限重试次数。
+    ///
+    /// 剪贴板是进程级独占资源,别的应用(另一家剪贴板管理器、正在复制的下载工具)会短暂
+    /// 持有它。此时 `OpenClipboard` 直接失败 —— 真实占用通常只持续几毫秒,所以在这里
+    /// 做几次短重试,比把整轮采集丢掉(下一个 100ms 才回来)体验好得多。上界刻意压得
+    /// 很小:采集跑在 tokio 任务里,阻塞超过一个轮询周期就会挤压下一轮。
+    ///
+    /// 写侧(`pasteback::imp_win`)用的是同一份实现但更宽裕的预算 —— 那边的调用由用户
+    /// 操作触发,宁可多等几十毫秒也不要把剪贴板写失败。
+    pub(crate) const OPEN_ATTEMPTS: u32 = 5;
+    pub(crate) const OPEN_RETRY_DELAY: Duration = Duration::from_millis(8);
+
+    /// 二进制格式的读取字节上限。`CF_DIB` 是**未压缩**位数据,`winclip` 的像素上限
+    /// (2500 万像素)反推出来约 100MB,这里留一点余量;超过这个体积的 DIB 不可能
+    /// 通过转码,提前放弃以免白拷一份到内存。
+    const MAX_DIB_READ_BYTES: usize = 110 * 1024 * 1024;
+    /// 已经是成品格式(PNG / RTF / 文本)的读取上限。watcher 的 25MB payload 上限
+    /// 会再筛一次,这里只挡住明显异常的体量。
+    const MAX_BINARY_READ_BYTES: usize = 64 * 1024 * 1024;
+
+    /// 读剪贴板:`changeCount` 未增长即返回 `None`,与 macOS 侧判据一致。
+    pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option<Captured> {
+        if change_count <= prev_change_count {
+            return None;
+        }
+        if !open_clipboard_with_retry(OPEN_ATTEMPTS, OPEN_RETRY_DELAY) {
+            // 剪贴板被别的进程占着:本轮放弃,下一轮再来(不报错、不影响序列号推进)。
+            return None;
+        }
+        // 全部探测在同一次 Open/Close 之间完成:临界区里反复开关既慢,又给别人留出
+        // 插队抢走剪贴板、让我们读到半新半旧内容的窗口。
+        let captured = first_non_empty();
+        // `CloseClipboard` 失败没有可挽回的后续动作,忽略返回值,但**必须**调用 ——
+        // 不关闭会让全系统无法使用剪贴板。
+        let _ = unsafe { CloseClipboard() };
+        captured
+    }
+
+    /// 有限重试地打开剪贴板。成功返回 `true`；全部失败返回 `false`。
+    ///
+    /// 读写两侧共用([`crate::pasteback`] 的写路径也调它),所以重试预算由调用方给。
+    /// `hwnd` 传 `NULL` 表示归当前任务所有(不需要窗口句柄)。
+    pub(crate) fn open_clipboard_with_retry(attempts: u32, retry_delay: Duration) -> bool {
+        for attempt in 0..attempts {
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                return true;
+            }
+            if attempt + 1 < attempts {
+                std::thread::sleep(retry_delay);
+            }
+        }
+        false
+    }
+
+    /// 按优先级取首个非空格式。必须在已打开的剪贴板临界区内调用。
+    fn first_non_empty() -> Option<Captured> {
+        read_files()
+            .or_else(read_image)
+            .or_else(read_rtf)
+            .or_else(read_text)
+    }
+
+    /// `CF_HDROP`:资源管理器「复制」的文件列表。
+    fn read_files() -> Option<Captured> {
+        let handle = unsafe { GetClipboardData(CF_HDROP.0 as u32) }.ok()?;
+        // 直接把剪贴板给的 HGLOBAL 当 `HDROP` 用。**不要**调 `DragFinish`:
+        // 那个句柄归剪贴板所有,释放它会破坏系统剪贴板内容。
+        let hdrop = HDROP(handle.0);
+        // ifile 传 0xFFFFFFFF 时返回条目数。
+        let count = unsafe { DragQueryFileW(hdrop, 0xFFFF_FFFF, None) };
+        if count == 0 {
+            return None;
+        }
+
+        let mut paths = Vec::with_capacity(count as usize);
+        for index in 0..count {
+            // lpszfile 传 NULL 时返回该路径所需字符数(不含结尾 NUL)。
+            let need = unsafe { DragQueryFileW(hdrop, index, None) };
+            if need == 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; need as usize + 1];
+            let written = unsafe { DragQueryFileW(hdrop, index, Some(&mut buf)) };
+            if written == 0 {
+                continue;
+            }
+            buf.truncate(written as usize);
+            paths.push(String::from_utf16_lossy(&buf));
+        }
+        if paths.is_empty() {
+            return None;
+        }
+
+        // 与 macOS 侧同义:canonicalize 成功用规范路径,失败保留原串并标 `resolved = false`。
+        // Windows 的 canonicalize 返回 `\\?\` 扩展长度前缀,入库前剥掉(见 winclip)。
+        let mut all_resolved = true;
+        let resolved = paths
+            .iter()
+            .map(|p| match std::fs::canonicalize(p) {
+                Ok(canonical) => {
+                    crate::winclip::strip_verbatim_prefix(&canonical.to_string_lossy())
+                }
+                Err(_) => {
+                    all_resolved = false;
+                    p.clone()
+                }
+            })
+            .collect();
+        Some(Captured::file(resolved, all_resolved))
+    }
+
+    /// 图片:优先注册格式 `PNG`,回退 `CF_DIBV5` → `CF_DIB`。
+    fn read_image() -> Option<Captured> {
+        // 浏览器、截图工具、图像编辑器通常直接挂一份合法 PNG,零转码。
+        if let Some(format) = png_format()
+            && let Some(bytes) = read_bytes(format, MAX_BINARY_READ_BYTES)
+            && !bytes.is_empty()
+        {
+            let (w, h) = png_dimensions(&bytes).unwrap_or((0, 0));
+            return Some(Captured::image("image/png", bytes, w, h));
+        }
+
+        // 回退:裸位数据。`CF_DIBV5` 带 alpha 掩码,优先于 `CF_DIB`。
+        // 顺带说明:系统会在 `CF_BITMAP` 与 `CF_DIB` 之间自动转换,所以只挂
+        // `CB_BITMAP` 的复制源也能在这里读到 DIB。
+        for format in [CF_DIBV5.0 as u32, CF_DIB.0 as u32] {
+            if let Some(bytes) = read_bytes(format, MAX_DIB_READ_BYTES)
+                && let Some((png, width, height)) = crate::winclip::dib_to_png(&bytes)
+            {
+                return Some(Captured::image("image/png", png, width, height));
+            }
+        }
+        None
+    }
+
+    /// RTF:注册格式 `Rich Text Format`(Word / WordPad / 多数富文本编辑器)。
+    fn read_rtf() -> Option<Captured> {
+        let format = rtf_format()?;
+        let bytes = read_bytes(format, MAX_BINARY_READ_BYTES)?;
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(Captured::rtf(bytes))
+    }
+
+    /// 纯文本兜底。`CF_UNICODETEXT` 一定存在:系统会在 `CF_TEXT` / `CF_OEMTEXT` /
+    /// `CF_UNICODETEXT` 之间自动转换,所以只挂旧格式的复制源也能读到。
+    fn read_text() -> Option<Captured> {
+        let bytes = read_bytes(CF_UNICODETEXT.0 as u32, MAX_BINARY_READ_BYTES)?;
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        // 结尾的 NUL 是格式的一部分,不是内容。
+        let text = String::from_utf16_lossy(&units);
+        Some(Captured::text(text.trim_end_matches('\0')))
+    }
+
+    /// 读一个剪贴板格式的全部字节。
+    ///
+    /// 拿到的是**全局内存句柄**,所有权仍归剪贴板:只锁不释放(释放会破坏剪贴板)。
+    /// 注意到不了 `max_bytes` 的格式直接判为不可用,避免把异常巨大的数据拷进内存。
+    fn read_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
+        unsafe {
+            // 格式不存在时 `GetClipboardData` 返回 Err,这正是「这个优先级没内容」的信号。
+            let handle = GetClipboardData(format).ok()?;
+            let hglobal = HGLOBAL(handle.0);
+            let ptr = GlobalLock(hglobal);
+            if ptr.is_null() {
+                return None;
+            }
+            let len = GlobalSize(hglobal);
+            let bytes = if len > 0 && len <= max_bytes {
+                Some(std::slice::from_raw_parts(ptr as *const u8, len).to_vec())
+            } else {
+                None
+            };
+            // 返回值忽略:对 GMEM_MOVEABLE 内存,最后一次 `GlobalUnlock` 会返回 FALSE
+            // 并把 last error 置为 NO_ERROR(这是成功),windows-rs 把它映射成 Err。
+            // 因此这里不能把 Err 当失败处理。
+            let _ = GlobalUnlock(hglobal);
+            bytes
+        }
+    }
+
+    /// 注册格式 `PNG` 的编号(进程内缓存一次)。
+    ///
+    /// 写侧(`pasteback::imp_win`)也用:回贴图片时除 `CF_DIB` 外要挂一份注册格式 `PNG`,
+    /// 让现代应用拿到带 alpha 的原图。缓存只此一份,免得两端各自注册、各自缓存。
+    pub(crate) fn png_format() -> Option<u32> {
+        static CACHE: OnceLock<Option<u32>> = OnceLock::new();
+        *CACHE.get_or_init(|| register_format("PNG"))
+    }
+
+    /// 注册格式 `Rich Text Format` 的编号(进程内缓存一次)。
+    ///
+    /// 用注册名而不是 `CF_RTF` 常量:后者从来不是一个标准剪贴板格式编号,
+    /// 富文本一律通过 `RegisterClipboardFormatW("Rich Text Format")` 挂载。
+    pub(crate) fn rtf_format() -> Option<u32> {
+        static CACHE: OnceLock<Option<u32>> = OnceLock::new();
+        *CACHE.get_or_init(|| register_format("Rich Text Format"))
+    }
+
+    fn register_format(name: &str) -> Option<u32> {
+        let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+        // 失败返回 0。这个调用是全局原子表查询,成功与否与当前剪贴板内容无关,
+        // 所以可以在临界区里安全调用。
+        match unsafe { RegisterClipboardFormatW(PCWSTR(wide.as_ptr())) } {
+            0 => None,
+            id => Some(id),
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use win::poll_first_non_empty;
+
+/// 写侧(`pasteback` 的 Windows 实现)复用同一个「有限重试地打开剪贴板」。
+///
+/// 剪贴板临界区的获取策略只留一处,免得读写两侧各写一份重试逻辑、各自漂移出不同的
+/// 超时行为。重试预算由调用方给:采集侧压得紧(不能阻塞一个轮询周期),写侧可以从容些。
+#[cfg(target_os = "windows")]
+pub(crate) use win::{open_clipboard_with_retry, png_format, rtf_format};
 
 // ---------------------------------------------------------------
 // macOS helpers

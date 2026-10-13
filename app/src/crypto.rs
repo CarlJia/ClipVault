@@ -11,6 +11,9 @@
 //!     mock provider 驱动）。
 //!   - [`KeychainKeyProvider`]（**仅 macOS**）：用 `security-framework` 从 Keychain
 //!     读取/创建 `service = com.clipvault.data_key` 的 32 字节数据密钥，进程内缓存。
+//!   - [`CredentialKeyProvider`]（**仅 Windows**，U4）：从 Windows 凭据管理器读取/创建
+//!     `TargetName = ClipVault/data_key` 的同一份 32 字节密钥，缓存策略与 macOS 侧一致。
+//!     两端密钥**互不相通**（各存各的系统凭据库），但密码学完全一致。
 //!   - [`salted_content_hash`]：加密区条目的 `content_hash` 用 `hash(random_salt ||
 //!     id)`，使该列不再是明文的可枚举指纹（KTD4 / plan U9）。
 
@@ -61,14 +64,15 @@ pub trait Encryptor: Send + Sync {
 pub trait Decryptor: Send + Sync {
     fn decrypt(&self, stored_content: &str, nonce: &[u8]) -> Result<String, CryptoError>;
     /// 解密 vault 二进制 payload（U4 multi-type plan）。
-    /// 默认实现：base64 解码后调 [`crypto::decrypt`]。子类可重写以处理
-    /// 未 base64 编码的原始密文 BLOB。
+    ///
+    /// 默认实现：把 `stored_bytes` 当作**原始** GCM 密文直接解密——即
+    /// [`Encryptor::encrypt_bytes`] 默认实现的逆运算。`payload` 是 BLOB 列，
+    /// 密文不需要 base64（对比文本 `content` 走 base64 是为了在 TEXT 列保持
+    /// UTF-8 合法），故这里**不做** base64 解码。
     fn decrypt_bytes(&self, stored_bytes: &[u8], nonce: &[u8]) -> Result<Vec<u8>, CryptoError> {
         let key = self.data_key()?;
         let nonce_arr: [u8; NONCE_LEN] = nonce.try_into().map_err(|_| CryptoError::Decrypt)?;
-        let s = std::str::from_utf8(stored_bytes).map_err(|_| CryptoError::Decrypt)?;
-        let ciphertext = B64.decode(s).map_err(|_| CryptoError::Decrypt)?;
-        crypto::decrypt(&key, &ciphertext, &nonce_arr)
+        crypto::decrypt(&key, stored_bytes, &nonce_arr)
     }
     /// Subclass hook: give trait impls access to the underlying key provider
     /// for default-impl reuse. Concrete [`VaultCipher`] wires its own
@@ -221,4 +225,182 @@ pub use keychain::KeychainKeyProvider;
 #[cfg(target_os = "macos")]
 pub fn default_vault_cipher() -> VaultCipher<KeychainKeyProvider> {
     VaultCipher::new(KeychainKeyProvider::new())
+}
+
+// ================================================================
+// Windows：凭据管理器数据密钥（U4 / KTD13）
+// ================================================================
+
+/// Windows 侧的数据密钥托管。
+///
+/// 与 macOS 的关键差异：**两端各存各的密钥，互不相通**。同一份 SQLite 库文件在两台
+/// 机器之间手工拷贝后，加密区条目在另一端解不开（钥匙在各自的系统凭据库里）。
+/// 这是刻意的 —— 密钥从不离开本机，换来的代价就是库文件不便携，README 里已写明。
+/// 密码学本身两端完全一致（同 AES-256-GCM、同 12 字节 nonce、同 v1 密文布局）。
+#[cfg(target_os = "windows")]
+mod cred {
+    use std::sync::Mutex;
+
+    use windows::Win32::Security::Credentials::{
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW, CredWriteW,
+    };
+    use windows::core::{HRESULT, PCWSTR, PWSTR};
+
+    use super::{CryptoError, KEY_LEN, KeyProvider};
+
+    /// 凭据条目的 TargetName。与 macOS 侧 Keychain 的 service 名
+    /// （`com.clipvault.data_key`）是同一角色的两个平台写法。
+    const TARGET: &str = "ClipVault/data_key";
+    /// `ERROR_NOT_FOUND`（1168）：凭据库里还没有这个条目 → 首次使用，需要创建。
+    /// 与 macOS 侧的 `errSecItemNotFound` 对应。
+    const ERROR_NOT_FOUND: u32 = 1168;
+
+    /// 进程内数据密钥缓存。只缓存成功结果；凭据库不可用时**不**缓存，以便恢复后
+    /// （用户重新登录、组策略放开）下次调用能重试成功、前端横幅自行消失。
+    static CACHE: Mutex<Option<[u8; KEY_LEN]>> = Mutex::new(None);
+
+    /// 从 Windows 凭据管理器读取或首次创建 32 字节数据密钥的 [`KeyProvider`]。
+    ///
+    /// **选凭据管理器而不是"自己用 DPAPI 加密一个密钥文件"**，是因为它是 Keychain
+    /// generic password 的直接对应物：同样按 (target, user) 寻址、同样由系统加密保管、
+    /// 同样不需要应用自管密钥文件及其文件权限。`CRED_PERSIST_LOCAL_MACHINE` 是关键的一笔：
+    /// 它保证密钥**不随漫游配置文件**同步到别的机器（凭据管理器默认会漫游，
+    /// 那样密钥就跑出了本机，与 F3 的设计相悖）。
+    pub struct CredentialKeyProvider {
+        user: String,
+    }
+
+    impl CredentialKeyProvider {
+        /// user = 当前登录用户名（`%USERNAME%`），取不到时回退到固定串。
+        pub fn new() -> Self {
+            let user = std::env::var("USERNAME").unwrap_or_else(|_| "clipvault".to_string());
+            Self { user }
+        }
+    }
+
+    impl Default for CredentialKeyProvider {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl KeyProvider for CredentialKeyProvider {
+        fn data_key(&self) -> Result<[u8; KEY_LEN], CryptoError> {
+            if let Some(key) = *CACHE.lock().expect("key cache poisoned") {
+                return Ok(key);
+            }
+            let key = load_or_create(&self.user)?;
+            *CACHE.lock().expect("key cache poisoned") = Some(key);
+            Ok(key)
+        }
+    }
+
+    /// 读不到条目与读失败是两件事：前者要创建，后者要如实报错（不静默新建密钥 ——
+    /// 那会让原本可解密的条目永久解不开）。
+    enum ReadError {
+        NotFound,
+        Other(String),
+    }
+
+    fn load_or_create(user: &str) -> Result<[u8; KEY_LEN], CryptoError> {
+        match read() {
+            Ok(bytes) => bytes.as_slice().try_into().map_err(|_| {
+                CryptoError::KeyUnavailable("凭据管理器中的数据密钥长度异常".to_string())
+            }),
+            Err(ReadError::NotFound) => {
+                use rand::RngCore as _;
+                let mut key = [0u8; KEY_LEN];
+                rand::rngs::OsRng.fill_bytes(&mut key);
+                write(user, &key)
+                    .map_err(|e| CryptoError::KeyUnavailable(format!("写入凭据管理器失败：{e}")))?;
+                Ok(key)
+            }
+            Err(ReadError::Other(detail)) => Err(CryptoError::KeyUnavailable(format!(
+                "读取凭据管理器失败：{detail}"
+            ))),
+        }
+    }
+
+    /// 按 TargetName 读取。**不需要用户名**：Windows 凭据只以 TargetName 为索引
+    /// （`UserName` 是随凭据一起存的元数据，不参与查找）。这与 macOS 不同 ——
+    /// Keychain generic password 是按 (service, account) 二元组索引的。
+    /// 两者的**隔离性**没有区别：Windows 凭据库本身就是按登录用户隔离的。
+    fn read() -> Result<Vec<u8>, ReadError> {
+        let target = wide(TARGET);
+        let mut ptr: *mut CREDENTIALW = std::ptr::null_mut();
+        unsafe {
+            if let Err(e) = CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None, &mut ptr) {
+                return Err(if e.code() == HRESULT::from_win32(ERROR_NOT_FOUND) {
+                    ReadError::NotFound
+                } else {
+                    // 其余都是失败（凭据库被策略禁用、条目属于别的用户等），如实上报。
+                    ReadError::Other(e.to_string())
+                });
+            }
+            if ptr.is_null() {
+                return Err(ReadError::NotFound);
+            }
+            // 返回的 CREDENTIALW 及其 bloc 由 CredFree 释放（不是 free/GlobalFree）。
+            let cred = &*ptr;
+            let bytes = if cred.CredentialBlobSize == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(cred.CredentialBlob, cred.CredentialBlobSize as usize)
+                    .to_vec()
+            };
+            CredFree(ptr as *const core::ffi::c_void);
+            Ok(bytes)
+        }
+    }
+
+    fn write(user: &str, key: &[u8; KEY_LEN]) -> windows::core::Result<()> {
+        let mut target = wide(TARGET);
+        let mut user_wide = wide(user);
+        let mut blob = key.to_vec();
+        let credential = CREDENTIALW {
+            Type: CRED_TYPE_GENERIC,
+            TargetName: PWSTR(target.as_mut_ptr()),
+            UserName: PWSTR(user_wide.as_mut_ptr()),
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            ..Default::default()
+        };
+        // flags 传 0：不做 CRED_PRESERVE_CREDENTIAL_BLOB 之类的特殊保留语义。
+        unsafe { CredWriteW(&credential, 0) }
+    }
+
+    /// UTF-16 + NUL 结尾（Win32 宽字符字符串的通用形式）。
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use cred::CredentialKeyProvider;
+
+/// 构造真机默认的 vault 加解密器（Windows 凭据管理器数据密钥）。
+#[cfg(target_os = "windows")]
+pub fn default_vault_cipher() -> VaultCipher<CredentialKeyProvider> {
+    VaultCipher::new(CredentialKeyProvider::new())
+}
+
+/// 系统凭据库当前是否可用（macOS Keychain / Windows 凭据管理器）。
+///
+/// 加密区的可用性判据，供 `commands::keychain_available` 与启动校验共用。首次调用可能
+/// 触发密钥创建；成功后进程内缓存，所以这个探测是廉价的。
+///
+/// 直接问 provider 而不是走 `VaultCipher`：`VaultCipher` 同时实现了 `Encryptor` 与
+/// `Decryptor`，两者都有 `data_key`，走它反而需要在调用点消歧义。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn system_key_available() -> bool {
+    use clipvault_core::crypto::KeyProvider as _;
+    #[cfg(target_os = "macos")]
+    {
+        KeychainKeyProvider::new().data_key().is_ok()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        CredentialKeyProvider::new().data_key().is_ok()
+    }
 }

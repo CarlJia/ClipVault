@@ -28,9 +28,37 @@ const VAULT_ENCRYPTED: i32 = 1;
 const VAULT_PENDING: i32 = 2;
 
 /// Default database file location.
+///
+/// 按平台分派到各自的系统惯例位置：macOS 是 `~/Library/Application Support/ClipVault/`，
+/// Windows 是 `%APPDATA%\ClipVault\`（即 `C:\Users\<user>\AppData\Roaming\ClipVault\`）。
+/// 之所以两端各用各的惯例、而不是自己造一个统一的路径，是因为放在系统约定的位置，
+/// 备份/迁移工具与用户才能按预期找到它。
+///
+/// 注意这只是**位置**不同：库文件格式、schema 与迁移完全相同，两端的库可以互相打开。
+/// 唯一不通用的是加密区条目的密钥 —— 它存在各自的系统凭据库里，见 `crate::crypto`。
 pub fn default_db_path() -> PathBuf {
-    let home = std::env::var("HOME").expect("HOME environment variable must be set on macOS");
-    PathBuf::from(home).join("Library/Application Support/ClipVault/clipvault.db")
+    resolve_data_dir(
+        cfg!(target_os = "windows"),
+        std::env::var("HOME").ok(),
+        std::env::var("APPDATA").ok(),
+    )
+    .join("ClipVault")
+    .join("clipvault.db")
+}
+
+/// 数据根目录的平台分派。
+///
+/// 抽成纯函数是为了让 **Windows 分支也能在 macOS 上被单测覆盖**：路径写错是那种
+/// "编译得过、跑起来才发现库建到了别处"的问题，而当前开发机是 macOS，
+/// `cfg!` 的另一个分支在真机上永远不会被执行到。三个入参都是显式的，测试直接喂值。
+fn resolve_data_dir(is_windows: bool, home: Option<String>, appdata: Option<String>) -> PathBuf {
+    if is_windows {
+        let appdata = appdata.expect("APPDATA environment variable must be set on Windows");
+        PathBuf::from(appdata)
+    } else {
+        let home = home.expect("HOME environment variable must be set");
+        PathBuf::from(home).join("Library/Application Support")
+    }
 }
 
 /// The `Storage` struct wraps a shared SQLite connection.
@@ -663,7 +691,37 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::test_helpers::open_test_db;
+    use super::{PathBuf, resolve_data_dir, test_helpers::open_test_db};
+
+    #[test]
+    fn data_dir_uses_appdata_on_windows() {
+        // Windows 分支在当前开发机（macOS）上永远不会被执行到，只能这样覆盖。
+        let dir = resolve_data_dir(
+            true,
+            Some("/Users/me".into()),
+            Some(r"C:\Users\me\AppData\Roaming".into()),
+        );
+        assert_eq!(dir, PathBuf::from(r"C:\Users\me\AppData\Roaming"));
+    }
+
+    #[test]
+    fn data_dir_uses_application_support_on_macos() {
+        let dir = resolve_data_dir(false, Some("/Users/me".into()), Some("ignored".into()));
+        assert_eq!(dir, PathBuf::from("/Users/me/Library/Application Support"));
+    }
+
+    #[test]
+    #[should_panic(expected = "APPDATA")]
+    fn data_dir_without_appdata_panics_on_windows() {
+        // 缺环境变量时宁可当场炸掉也不要静默落到当前工作目录（那会把库建到随机位置）。
+        resolve_data_dir(true, Some("/Users/me".into()), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "HOME")]
+    fn data_dir_without_home_panics_on_macos() {
+        resolve_data_dir(false, None, None);
+    }
 
     #[tokio::test]
     async fn insert_select_roundtrip() {
@@ -1029,7 +1087,70 @@ mod tests {
             b"\x89PNG ORIGINAL BYTES" as &[u8],
             "payload 应被加密,与明文不同"
         );
-        // ciphertext 在列里仍是 base64 编码,解码后才与原文不同。
+
+        // 真正的 round trip：用 `payload_nonce` 解 `payload` 必须还原原始字节。
+        // 回贴走的正是这条路（`paste_entry` → `perform_paste` → `decrypt_payload`）。
+        use crate::crypto::Decryptor as _;
+        let nonce = entry.payload_nonce.clone().unwrap();
+        let plain = cipher
+            .decrypt_bytes(stored_payload, &nonce)
+            .expect("vault 图片 payload 应能用 payload_nonce 解密");
+        assert_eq!(plain, b"\x89PNG ORIGINAL BYTES");
+    }
+
+    #[tokio::test]
+    async fn vault_binary_nonce_columns_are_independent() {
+        // 多类型 plan U4/U6 回归：vault 二进制条目的 payload 由 `payload_nonce`
+        // 列保护，与保护文本 content 的 `nonce` 列是两个独立的 12 字节值
+        // （见 `Storage::encrypt_into_vault`）。回贴时 `paste_entry` 必须取
+        // `Entry::payload_nonce`；若误用 `get_vault_nonce()`（读 `nonce` 列），
+        // GCM 认证必然失败 → 每次都报「加密条目解密失败」。
+        use crate::crypto::{Decryptor as _, VaultCipher};
+        use clipvault_core::crypto::KeyProvider;
+
+        struct FixedKey([u8; 32]);
+        impl KeyProvider for FixedKey {
+            fn data_key(&self) -> Result<[u8; 32], clipvault_core::crypto::CryptoError> {
+                Ok(self.0)
+            }
+        }
+
+        let db = open_test_db();
+        let cipher = VaultCipher::new(FixedKey([9u8; 32]));
+        let id = db
+            .insert_entry_binary(
+                "vimg-nonce",
+                "image",
+                Some("image/png"),
+                b"\x89PNG NONCE COLUMN TEST",
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        db.move_to_vault(id, &cipher).await.unwrap();
+
+        let entry = db.get_by_id(id).await.unwrap().unwrap();
+        let payload = entry.payload.clone().unwrap();
+        let payload_nonce = entry.payload_nonce.clone().expect("payload_nonce 必须写入");
+        let content_nonce = db
+            .get_vault_nonce(id)
+            .await
+            .unwrap()
+            .expect("nonce 列（文本 content 的 nonce）必须写入");
+
+        assert_ne!(
+            payload_nonce, content_nonce,
+            "payload_nonce 与 nonce 必须是两个独立随机值"
+        );
+        assert!(
+            cipher.decrypt_bytes(&payload, &content_nonce).is_err(),
+            "用 nonce 列的值解 payload 必须失败：这正是误用 get_vault_nonce 的症状"
+        );
+        assert_eq!(
+            cipher.decrypt_bytes(&payload, &payload_nonce).unwrap(),
+            b"\x89PNG NONCE COLUMN TEST"
+        );
     }
 
     #[tokio::test]

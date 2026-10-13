@@ -80,15 +80,11 @@ fn main() {
                 panel_opacity: panel_opacity.clone(),
             });
 
-            // 3.5 U9：启动时校验加密区条目的可解密性（仅 macOS 且 Keychain 可用）。
-            //     Keychain 不可用时**跳过**（不误标 is_decryptable=0），由横幅提示。
-            #[cfg(target_os = "macos")]
+            // 3.5 U9：启动时校验加密区条目的可解密性（macOS / Windows 且系统凭据库可用）。
+            //     凭据库不可用时**跳过**（不误标 is_decryptable=0），由横幅提示。
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
-                use clipvault_core::crypto::KeyProvider;
-                if clipvault::crypto::KeychainKeyProvider::new()
-                    .data_key()
-                    .is_ok()
-                {
+                if clipvault::crypto::system_key_available() {
                     let storage_for_verify = storage.clone();
                     tauri::async_runtime::spawn(async move {
                         let cipher = clipvault::crypto::default_vault_cipher();

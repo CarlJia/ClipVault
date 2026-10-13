@@ -20,6 +20,7 @@ pub mod storage;
 pub mod thumbnail;
 pub mod tray;
 pub mod watcher;
+pub mod winclip;
 
 #[cfg(test)]
 mod commands_test;
@@ -37,3 +38,5 @@ mod privacy_test;
 mod search_test;
 #[cfg(test)]
 mod watcher_test;
+#[cfg(test)]
+mod winclip_test;

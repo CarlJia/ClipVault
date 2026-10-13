@@ -6,9 +6,10 @@
 //!
 //! 轮询间隔取 100ms：平均检测延迟约 50ms、峰值 ≤ 100ms，满足 R1 的 < 200ms 预算。
 //!
-//! macOS 之外的平台没有 `NSPasteboard`，`poll_change` 返回 `None`，
-//! 便于在任意平台跑确定性单元测试（测试只驱动 [`Watcher::process`] 与
-//! [`should_dedup`]，不触碰真实剪贴板）。
+//! 剪贴板来源按平台取:macOS 读 `NSPasteboard.changeCount`,Windows 读
+//! `GetClipboardSequenceNumber()` —— 两者都是单调递增的剪贴板序列号,判据同一套。
+//! 其余平台 `poll_change` 返回 `None`,便于在任意平台跑确定性单元测试（测试只驱动
+//! [`Watcher::process`] 与 [`should_dedup`]，不触碰真实剪贴板）。
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -119,10 +120,29 @@ impl Watcher {
         capture::poll_first_non_empty(change_count, prev)
     }
 
-    /// 非 macOS 平台无 `NSPasteboard`,始终返回 `None`。
-    #[cfg(not(target_os = "macos"))]
+    /// 非 macOS / 非 Windows 平台没有剪贴板序列号,始终返回 `None`。
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn poll_change(&self) -> Option<Captured> {
         None
+    }
+
+    /// 读取剪贴板变化(Windows 实现 / U1)。
+    ///
+    /// `GetClipboardSequenceNumber()` 与 macOS 的 `NSPasteboard.changeCount` 是同一
+    /// 语义:一个单调递增的剪贴板序列号,任何进程写入剪贴板都会让它增长。因此下面
+    /// 的 `swap` 与判据与 macOS 版逐字对应(含「无论是否捕获成功序列号都推进」)。
+    ///
+    /// 两点差异值得写下来:
+    /// - 返回值是 `u32`,这里提升为 `i64` 以复用同一个 `last_change_count` 字段。
+    /// - 序列号拿不到时返回 `0`(如调用方不在交互式窗口站)。此时会因为初值 `-1` 而
+    ///   被判为「增长了」从而空跑一次 `poll_first_non_empty` —— 与 macOS 侧同样情形
+    ///   的行为一致(读一次、什么都没有、返回 `None`),没有额外代价。
+    #[cfg(target_os = "windows")]
+    fn poll_change(&self) -> Option<Captured> {
+        let change_count =
+            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() } as i64;
+        let prev = self.last_change_count.swap(change_count, Ordering::SeqCst);
+        capture::poll_first_non_empty(change_count, prev)
     }
 
     /// 处理一次多类型捕获:去重 + skip-once + 访客模式过滤 + 25MB 上限 +

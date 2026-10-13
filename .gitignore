@@ -6,3 +6,4 @@ dist/
 *.lock
 .env
 .env.local
+.idea/

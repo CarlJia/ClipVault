@@ -119,15 +119,19 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
                 .metadata_json
                 .as_deref()
                 .and_then(extract_thumb_from_metadata);
+            let is_vault = e.is_vault;
             EntryDto {
                 id: e.id,
-                content: e.content,
+                // 加密区条目的 `content` 是密文，一律不下发前端：UI 只按元数据
+                // （类别 / 标签 / 备注 / 时间）渲染，解密与回贴全程留在后端
+                // （`paste_entry` 解密后写剪贴板）。
+                content: if is_vault { String::new() } else { e.content },
                 note: e.note,
                 auto_category: e.auto_category,
                 tags,
                 is_pinned: e.is_pinned,
                 pinned_at: e.pinned_at,
-                is_vault: e.is_vault,
+                is_vault,
                 is_decryptable: e.is_decryptable,
                 created_at: e.created_at,
                 content_kind: e.content_kind,
@@ -228,9 +232,13 @@ pub fn check_accessibility() -> bool {
 }
 
 /// 关闭（隐藏）主面板。前端 `Esc` 调用。
+///
+/// Esc 是「我不贴了」：隐藏面板的同时必须把键盘焦点交还唤出面板前的前台 App，
+/// 否则用户回到编辑器 / 浏览器时输入框已失去光标，得再点一次才能继续打字或
+/// 手动 ⌘V（`pasteback::hide_panel_and_restore_focus`）。
 #[tauri::command]
 pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
-    window.hide().map_err(|e| e.to_string())
+    crate::pasteback::hide_panel_and_restore_focus(&window)
 }
 
 /// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
@@ -278,8 +286,12 @@ pub const ERR_MISSING_ACCESSIBILITY: &str = "missing-accessibility";
 /// U8 完成:Accessibility 门控 + NSPasteboard 写入 + CGEvent ⌘V 回贴。
 ///
 /// 流程:读条目 → [`crate::pasteback::perform_paste`](每调用重校验授权 →
-/// vault 接缝 → 写剪贴板 → 隐藏面板 → 模拟 ⌘V → 失焦比对)。真实 CGEvent
-/// 注入放在 `spawn_blocking`,避免 ~200ms 的按键 + 焦点等待阻塞 async executor。
+/// vault 接缝 → 写剪贴板 → 隐藏面板并**把激活权交还唤出面板前的前台 App**、
+/// 有界等待它真的回到前台 → 模拟 ⌘V → 失焦比对)。真实 CGEvent 注入放在
+/// `spawn_blocking`,避免按键注入 + 焦点归还的等待阻塞 async executor。
+///
+/// 失焦比对的目标取自 [`crate::pasteback::target_bundle_id`]——热键 / 托盘在
+/// 显示面板**之前**记录的那个前台应用(见 `pasteback::capture_target_app`)。
 #[tauri::command]
 pub async fn paste_entry(
     id: i64,
@@ -293,11 +305,14 @@ pub async fn paste_entry(
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("entry {id} 不存在"))?;
 
-    #[cfg(target_os = "macos")]
+    // macOS 与 Windows 的编排完全一致，只有后端类型不同（`RealPasteBackend` 是按平台
+    // 选定的别名），所以这里是**一份**实现而不是两份。其余平台走下面的降级分支。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         use crate::pasteback::{
-            CGEVENT_FAIL_MSG, MacosBackend, NO_ACCESSIBILITY_MSG, PasteError, PasteOutcome,
-            RealAccessibilityChecker, VAULT_DECRYPT_FAIL_MSG, WINDOW_SWITCHED_MSG, perform_paste,
+            CGEVENT_FAIL_MSG, NO_ACCESSIBILITY_MSG, PasteError, PasteOutcome,
+            RealAccessibilityChecker, RealPasteBackend, VAULT_DECRYPT_FAIL_MSG,
+            WINDOW_SWITCHED_MSG, perform_paste,
         };
 
         // 加密区条目：不可解密（如迁移机器后旧 key 丢失）直接拒绝，避免把密文贴出。
@@ -315,24 +330,20 @@ pub async fn paste_entry(
             None
         };
         let payload_nonce = if entry.is_vault && entry.content_kind != "text" {
-            // 多类型 plan U4:binary vault 条目需要 payload_nonce 才能解密 payload BLOB。
-            // 现有 get_vault_nonce 读 entries.nonce 列;此处复用同一函数
-            // (content_kind 已确保 kind 与 nonce 列对应:nonce 保护文本 content,
-            //  payload_nonce 保护 payload BLOB)。
-            state
-                .storage
-                .get_vault_nonce(id)
-                .await
-                .map_err(|e| e.to_string())?
+            // 多类型 plan U4/U6：binary vault 条目的 payload BLOB 由独立的
+            // `payload_nonce` 列保护（与保护文本 content 的 `nonce` 列不是同一个值，
+            // 见 `Storage::encrypt_into_vault`）。该值已随 `get_by_id` 的
+            // `ENTRY_COLS` 读出，直接用 `entry.payload_nonce`，不要读 `nonce` 列。
+            entry.payload_nonce.clone()
         } else {
             None
         };
 
-        let prev = crate::hotkey::last_frontmost();
+        let prev = crate::pasteback::target_bundle_id();
         let win = window.clone();
         let outcome = tauri::async_runtime::spawn_blocking(move || {
             let checker = RealAccessibilityChecker;
-            let backend = MacosBackend::new(win);
+            let backend = RealPasteBackend::new(win);
             // Keychain 数据密钥解密器；非 vault 条目不会触达它（不会命中 Keychain）。
             let decryptor = crate::crypto::default_vault_cipher();
             perform_paste(
@@ -382,14 +393,17 @@ pub async fn paste_entry(
             }
             Err(PasteError::MissingAccessibility) => Err(ERR_MISSING_ACCESSIBILITY.to_string()),
             Err(PasteError::VaultDecryptFailed) => Err(VAULT_DECRYPT_FAIL_MSG.to_string()),
-            Err(PasteError::UnsupportedPlatform) => Err("回贴仅支持 macOS".to_string()),
+            // `perform_paste` 从不构造这个变体（它是给"没有回贴能力的平台"准备的），
+            // 走到这里说明平台 gating 出了错。文案不再写死 macOS —— 这句话在 Windows 上
+            // 会是纯粹的误导。
+            Err(PasteError::UnsupportedPlatform) => Err("当前平台不支持自动回贴".to_string()),
         }
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (&entry, &window);
-        Err("回贴仅支持 macOS".to_string())
+        Err("当前平台不支持自动回贴".to_string())
     }
 }
 
@@ -530,30 +544,33 @@ pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Resu
 // 加密区 / Vault（U9 / R12）
 // ----------------------------------------------------------------
 
-/// Keychain 数据密钥当前是否可用（读取或首次创建成功）。
+/// 系统凭据库中的数据密钥当前是否可用（读取或首次创建成功）。
 ///
 /// 前端据此决定是否显示「⚠️ Keychain 不可用，加密区不可用」横幅（plan U9）。
-/// 首次调用可能触发密钥创建（`SecItemAdd`）；成功后进程内缓存。
+/// 首次调用可能触发密钥创建；成功后进程内缓存。
+///
+/// 命令名保留 `keychain_available`（前端已在用），但在 Windows 上它的语义是
+/// **Windows 凭据管理器是否可用** —— 二者是同一角色的两个平台实现
+/// （见 `crypto` 模块的 `CredentialKeyProvider`）。
 #[tauri::command]
 pub fn keychain_available() -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        use clipvault_core::crypto::KeyProvider;
-        crate::crypto::KeychainKeyProvider::new().data_key().is_ok()
+        crate::crypto::system_key_available()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         false
     }
 }
 
-/// 把一条明文条目移入加密区（AES-GCM 加密 + Keychain 密钥）。
+/// 把一条明文条目移入加密区（AES-GCM 加密 + 系统凭据库托管的密钥）。
 ///
-/// Keychain 不可用时返回 `Err`，条目保持明文未加密（plan U9：绝不静默写明文进
+/// 密钥不可用时返回 `Err`，条目保持明文未加密（plan U9：绝不静默写明文进
 /// vault）；前端据此弹 toast + 展示横幅。
 #[tauri::command]
 pub async fn move_to_vault(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         let cipher = crate::crypto::default_vault_cipher();
         state
@@ -562,14 +579,15 @@ pub async fn move_to_vault(id: i64, state: State<'_, AppState>) -> Result<(), St
             .await
             .map_err(|e| e.to_string())
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = (id, state);
         Err("加密区仅支持 macOS".to_string())
     }
 }
 
-/// 列出加密区条目（元数据；`content` 已清空，不外泄密文）。供 Settings 加密区管理。
+/// 列出加密区条目（元数据；`content` 已由 [`to_dtos`] 清空，不外泄密文）。
+/// 供「加密区管理」模态渲染：条目同样可 ↩ 回贴（走 `paste_entry` 解密）、⌘E 备注。
 #[tauri::command]
 pub async fn list_vault(state: State<'_, AppState>) -> Result<Vec<EntryDto>, String> {
     let entries = state
@@ -577,12 +595,7 @@ pub async fn list_vault(state: State<'_, AppState>) -> Result<Vec<EntryDto>, Str
         .list_vault_entries()
         .await
         .map_err(|e| e.to_string())?;
-    let mut dtos = to_dtos(&state, entries).await?;
-    for d in &mut dtos {
-        // 密文不下发前端；UI 按 is_decryptable / note / 类别 / 时间展示。
-        d.content = String::new();
-    }
-    Ok(dtos)
+    to_dtos(&state, entries).await
 }
 
 /// 批量删除不可解密的加密区条目（`is_decryptable=0`）。返回删除条数（plan U9）。

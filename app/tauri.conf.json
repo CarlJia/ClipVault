@@ -28,24 +28,34 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+      "csp": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
     }
   },
   "bundle": {
     "active": true,
     "category": "Productivity",
-    "shortDescription": "macOS 纯文本剪贴板管理器",
-    "longDescription": "ClipVault 常驻菜单栏，持续记录纯文本剪贴板历史，支持全局快捷键呼出、FTS5 搜索、自动类别、自由标签、备注、Pin 置顶、AES-GCM 加密区与访客模式，默认不联网。",
+    "shortDescription": "剪贴板管理器",
+    "longDescription": "ClipVault 常驻菜单栏 / 托盘，持续记录剪贴板历史（文本 / 图片 / 文件 / RTF），支持全局快捷键呼出、FTS5 搜索、自动类别、自由标签、备注、Pin 置顶、AES-GCM 加密区与访客模式，默认不联网。",
     "copyright": "Copyright 2026 ClipVault Team. All rights reserved.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
       "icons/128x128@2x.png",
-      "icons/icon.icns"
+      "icons/icon.icns",
+      "icons/icon.ico"
     ],
     "targets": "all",
     "macOS": {
       "minimumSystemVersion": "13.0"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "languages": [
+          "SimpChinese",
+          "English"
+        ]
+      }
     }
   }
 }

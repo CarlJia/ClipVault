@@ -33,6 +33,7 @@ import {
   skipNextCopy,
 } from "./settings";
 import {
+  closeEditor,
   isEditorOpen,
   openEditor,
   setEditorCloseHandler,
@@ -82,6 +83,11 @@ const vaultListEl = document.querySelector<HTMLDivElement>("#vault-list")!;
 const vaultSubEl = document.querySelector<HTMLDivElement>("#vault-sub")!;
 const vaultCloseEl = document.querySelector<HTMLButtonElement>("#vault-close")!;
 const vaultClearEl = document.querySelector<HTMLButtonElement>("#vault-clear")!;
+// 加密区模态内的条目状态：列表 + 选中索引 + 选中行元素缓存。
+// 加密区条目同样要能选中回贴 / 编辑备注（AE5），故与主列表并列维护一套选中态。
+let vaultEntries: EntryDto[] = [];
+let vaultSelected = 0;
+let vaultSelectedEl: HTMLElement | null = null;
 
 // 设置模态元素（U12）。⌘, 唤出,托盘菜单也可触发。
 const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
@@ -298,26 +304,44 @@ async function activateIndex(idx: number): Promise<void> {
   await pasteEntry(entries[idx]);
 }
 
-/** 回贴一条记录:任何非抛错路径都隐藏面板(AE3 / AE7 / ⌘N / 双击),
- *  因为内容已经在剪贴板里、用户的回贴动作已经完成;只有真正报错
- *  (vault解密失败等)才保留面板让用户处理。 */
+/** 回贴前收起所有浮层（加密区模态 / 备注编辑器）。
+ *
+ *  回贴是「面板的一次性动作」：无论成功（后端直接隐藏面板）还是降级
+ *  （内容已在剪贴板），用户都不会再回到模态里，留着它只会挡住下一次唤出，
+ *  并让「看得见的是模态、敲进去的是搜索框」。故在每个回贴入口前统一收起。 */
+function dismissOverlays(): void {
+  if (isVaultOpen()) closeVault();
+  if (isEditorOpen()) closeEditor();
+}
+
+/** 回贴一条记录：面板**显不显示由后端按回贴结果决定**，前端不再插手。
+ *
+ *  - `pasted`：后端已隐藏面板、把 ⌘V 落到目标应用，并把键盘焦点还了回去；
+ *  - `window_switched` / `clipboard_only` / `no_accessibility`：内容已在剪贴板
+ *    但没能自动回贴，后端保持面板可见，前端只负责把提示（toast / 授权横幅）
+ *    显示在这个仍然可见的面板上。
+ *
+ *  这里曾无条件再调一次 `hide_panel`，把后端刚显示出来的降级提示立刻藏掉：
+ *  用户既看不到 toast，焦点又被多抢了一次（面板藏在 WebView 里，藏了就没提示）。
+ *  真正报错（vault 解密失败等）仍保留面板让用户处理。 */
 async function pasteEntry(e: EntryDto): Promise<void> {
+  // 入口即收起浮层：主列表 ↩ / ⌘1–9 / 双击，以及加密区模态内的 ↩ / 双击，
+  // 都走这里，不需要各自记得关闭自己的模态。
+  dismissOverlays();
   try {
     const r = await invoke<PasteResult>("paste_entry", { id: e.id });
-    // 任何成功/降级分支:关面板 + 给出适当 toast/横幅。
     if (r.status === "no_accessibility") {
-      // 未授权:内容已进剪贴板,但无法自动回贴。亮授权横幅 + 提示可手动 ⌘V。
+      // 未授权：内容已进剪贴板，但无法自动回贴。亮授权横幅 + 提示可手动 ⌘V。
+      // 面板保持可见；Esc 关闭时后端会把焦点还回原应用，再手动 ⌘V 即可。
       await refreshAccessibilityBanner(bannerEl);
       toast(r.message);
     } else if (r.status !== "pasted") {
-      // window_switched / clipboard_only:内容已在剪贴板,后端已重新显示面板。
-      // 关掉面板(用户的回贴动作已完成),toast 引导手动 ⌘V。
+      // window_switched / clipboard_only：后端已重新显示面板，toast 引导手动 ⌘V。
       toast(r.message);
     } else {
-      // "pasted":后端已隐藏面板并把 ⌘V 落到目标应用,无需额外提示。
+      // "pasted"：后端已隐藏面板并把 ⌘V 落到目标应用，无需额外提示。
       toast(r.message);
     }
-    await invoke("hide_panel");
   } catch (err) {
     const msg = String(err);
     if (msg.includes("missing-accessibility")) {
@@ -398,7 +422,10 @@ async function openVault(): Promise<void> {
   vaultEl.classList.remove("hidden");
   try {
     const items = await listVault();
-    renderVaultList(vaultListEl, items);
+    vaultEntries = items;
+    if (vaultSelected >= vaultEntries.length) vaultSelected = vaultEntries.length - 1;
+    if (vaultSelected < 0) vaultSelected = 0;
+    paintVaultList();
     const undec = items.filter((x) => !x.is_decryptable).length;
     vaultSubEl.textContent =
       items.length === 0
@@ -406,16 +433,91 @@ async function openVault(): Promise<void> {
         : `共 ${items.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
     vaultClearEl.classList.toggle("hidden", undec === 0);
   } catch (err) {
+    vaultEntries = [];
+    vaultSelectedEl = null;
     vaultListEl.innerHTML = `<div class="empty">加载加密区失败：${String(err)}</div>`;
   }
 }
 
+/** 渲染加密区列表并重建选中行缓存。全量重画，仅在数据变化时调用。 */
+function paintVaultList(): void {
+  renderVaultList(vaultListEl, vaultEntries, vaultSelected);
+  vaultSelectedEl = vaultListEl.querySelector<HTMLElement>(".vault-row.selected");
+}
+
+/** 加密区选中切换的增量路径：仅调整 .selected class，不重建 DOM。 */
+function applyVaultSelectionPatch(idx: number): void {
+  if (idx < 0 || idx >= vaultEntries.length) return;
+  const target = vaultListEl.children[idx] as HTMLElement | undefined;
+  if (!target) return;
+  if (vaultSelectedEl && vaultSelectedEl !== target) vaultSelectedEl.classList.remove("selected");
+  target.classList.add("selected");
+  vaultSelectedEl = target;
+  target.scrollIntoView({ block: "nearest" });
+}
+
+function moveVaultSelection(delta: number): void {
+  if (vaultEntries.length === 0) return;
+  const next = Math.min(Math.max(vaultSelected + delta, 0), vaultEntries.length - 1);
+  if (next === vaultSelected) return;
+  vaultSelected = next;
+  applyVaultSelectionPatch(vaultSelected);
+}
+
+const currentVaultEntry = (): EntryDto | undefined => vaultEntries[vaultSelected];
+
+/**
+ * 回贴当前选中的加密区条目（↩ / 双击）。后端 `paste_entry` 负责解密 +
+ * 写剪贴板 + 模拟 ⌘V，与非加密条目同一路径（AE5）。
+ * 不可解密的条目（Keychain 密钥缺失 / 变更）直接提示，不发起回贴。
+ */
+async function pasteVaultEntry(): Promise<void> {
+  const e = currentVaultEntry();
+  if (!e) return;
+  if (!e.is_decryptable) {
+    toast("该条目无法解密：Keychain 密钥缺失或已变更，密文无法还原");
+    return;
+  }
+  // 收起模态交给 pasteEntry 的 dismissOverlays()：所有回贴入口行为一致。
+  await pasteEntry(e);
+}
+
+/** ⌘E：在加密区内编辑选中条目的备注 / 标签，保存后就地重绘该行。 */
+function editVaultNote(): void {
+  const e = currentVaultEntry();
+  if (!e) return;
+  openEditor(e, (dto) => {
+    const idx = vaultEntries.findIndex((x) => x.id === dto.id);
+    if (idx >= 0) {
+      vaultEntries[idx] = dto;
+      paintVaultList();
+    }
+  });
+}
+
 function closeVault(): void {
   vaultEl.classList.add("hidden");
+  vaultSelectedEl = null;
   searchEl.focus();
 }
 
 vaultCloseEl.addEventListener("click", closeVault);
+// 加密区条目选中 / 双击回贴：与主列表同样的鼠标语义（单击选中，双击回贴）。
+vaultListEl.addEventListener("click", (ev) => {
+  const row = (ev.target as HTMLElement).closest<HTMLElement>(".vault-row");
+  if (!row) return;
+  const idx = Number(row.dataset.index);
+  if (!Number.isInteger(idx)) return;
+  vaultSelected = idx;
+  applyVaultSelectionPatch(idx);
+});
+vaultListEl.addEventListener("dblclick", (ev) => {
+  // 单击已把 vaultSelected 指向被双击的行，这里直接回贴当前选中项。
+  const row = (ev.target as HTMLElement).closest<HTMLElement>(".vault-row");
+  if (row) vaultSelected = Number(row.dataset.index);
+  ev.preventDefault();
+  void pasteVaultEntry();
+});
 vaultClearEl.addEventListener("click", () => {
   void (async () => {
     try {
@@ -543,11 +645,38 @@ listEl.addEventListener("dblclick", (ev) => {
 document.addEventListener("keydown", (ev) => {
   // 编辑器打开时，列表快捷键让位给编辑器（其 Esc / ⌘S 已在 editor.ts 处理）。
   if (isEditorOpen()) return;
-  // 加密区模态打开时，仅处理 Esc 关闭。
+  // 加密区模态打开时：仅处理 Esc / 导航 / 回贴 / 备注，其余列表快捷键让位。
   if (isVaultOpen()) {
     if (ev.key === "Escape") {
       ev.preventDefault();
       closeVault();
+      return;
+    }
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      moveVaultSelection(1);
+      return;
+    }
+    if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      moveVaultSelection(-1);
+      return;
+    }
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      void pasteVaultEntry();
+      return;
+    }
+    if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
+      ev.preventDefault();
+      editVaultNote();
+      return;
+    }
+    // ⌘⇧V：再次按下收起加密区模态（与主列表的唤出键同键来回）。
+    if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
+      ev.preventDefault();
+      closeVault();
+      return;
     }
     return;
   }
@@ -644,8 +773,11 @@ document.addEventListener("keydown", (ev) => {
   }
 });
 
-// 面板每次被唤出（窗口获得焦点）时：聚焦搜索框、复检权限、刷新列表。
+// 面板每次被唤出（窗口获得焦点）时：回到主列表、聚焦搜索框、复检权限、刷新列表。
+// 收起加密区模态：面板被隐藏（热键 / 托盘）时模态可能仍处于打开态，而搜索框已获焦点，
+// 保持模态会让「看得见的是加密区、敲进去的是搜索框」，故每次唤出都从主列表开始。
 window.addEventListener("focus", () => {
+  closeVault();
   searchEl.focus();
   searchEl.select();
   void refreshAccessibilityBanner(bannerEl);
@@ -661,7 +793,9 @@ window.addEventListener("focus", () => {
 renderTabs();
 searchEl.focus();
 // 编辑器 Esc 关闭后把焦点交还搜索框 / 列表。
+// 若编辑器是从加密区模态内唤起的（⌘⇧V → ⌘E），焦点留在模态里：搜索框在模态之下。
 setEditorCloseHandler(() => {
+  if (isVaultOpen()) return;
   searchEl.focus();
 });
 // U12：托盘「设置…」菜单触发后端 `emit("open-settings")`，前端转呼 openSettings()。
