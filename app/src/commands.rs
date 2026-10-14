@@ -395,6 +395,13 @@ pub async fn paste_entry(
             }),
             Ok(PasteOutcome::WindowSwitched) => {
                 // 面板已被隐藏;重新显示以便用户看到手动 ⌘V 的提示。
+                //
+                // **这里刻意不重新定位面板（KTD7 / R5）**：本分支不是「唤出」——回贴后
+                // 目标 App 已回到前台，「焦点屏」会变成目标 App 所在屏，若在此重定位
+                // 面板会在用户眼前跨屏跳动。面板留在唤出时的位置。
+                // （唤出时的定位与 `tauri.conf.json` 的 `center:true` 的关系：`center`
+                // 只在窗口创建时生效一次，每次都定位到焦点屏的重定位会覆盖它，故
+                // `center:true` 原样保留、不删。）
                 let _ = window.show();
                 let _ = window.set_focus();
                 Ok(PasteResult {
@@ -403,6 +410,7 @@ pub async fn paste_entry(
                 })
             }
             Ok(PasteOutcome::ClipboardOnly) => {
+                // 同 WindowSwitched：降级提示不是唤出，不重定位（KTD7 / R5）。
                 let _ = window.show();
                 let _ = window.set_focus();
                 Ok(PasteResult {
@@ -413,6 +421,7 @@ pub async fn paste_entry(
             Ok(PasteOutcome::NoAccessibilityClipboardOnly) => {
                 // 未授权:内容已在剪贴板,但没能自动回贴。重新显示面板,
                 // 前端据 status 亮授权横幅并提示可手动 ⌘V。
+                // 同 WindowSwitched：降级提示不是唤出，不重定位（KTD7 / R5）。
                 let _ = window.show();
                 let _ = window.set_focus();
                 Ok(PasteResult {

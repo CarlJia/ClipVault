@@ -318,7 +318,7 @@ mod imp {
         for (_, id, action, _) in hotkeys.iter() {
             if id.signature == hotkey_id.signature && id.id == hotkey_id.id {
                 if *action == HotkeyAction::OpenPanel {
-                    crate::tray::show_panel(app);
+                    crate::panel::show_panel(app);
                 } else {
                     // 未来新增全局 action 时在这里处理（现在只支持 OpenPanel）。
                     eprintln!("[hotkey] 未实现的全局 action: {:?}", action);
@@ -847,7 +847,7 @@ mod imp_win {
                 if let Some(action) = id_map.get(&id)
                     && *action == HotkeyAction::OpenPanel
                 {
-                    crate::tray::show_panel(&app);
+                    crate::panel::show_panel(&app);
                 }
             }
             unsafe {

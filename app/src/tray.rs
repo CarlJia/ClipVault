@@ -172,24 +172,10 @@ pub fn set_state(app: &AppHandle, state: TrayState) {
     }
 }
 
-/// 显示并聚焦主面板。
-///
-/// **全应用唯一的「唤出面板」入口**：热键回调（`hotkey.rs`）与托盘的菜单 / 左键
-/// 点击都走这里，从而保证「**先**记录回贴目标、**再**显示面板」的顺序在两处一致
-/// ——顺序反了就会把目标记成 ClipVault 自己（见
-/// [`crate::pasteback::capture_target_app`]），此后的回贴都会误判为「目标窗口已切换」。
-pub(crate) fn show_panel(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
-        crate::pasteback::capture_target_app();
-        let _ = window.show();
-        let _ = window.set_focus();
-    }
-}
-
 /// 托盘菜单事件分发。
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
-        "open" => show_panel(app),
+        "open" => crate::panel::show_panel(app),
         "skip_once" => {
             if let Some(state) = app.try_state::<AppState>() {
                 crate::privacy::set_skip_next(&state.skip_next);
@@ -222,10 +208,10 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             }
         }
         // 加密区（U9）/ 关于面板（后续）暂先打开主面板占位。
-        "vault" | "about" => show_panel(app),
+        "vault" | "about" => crate::panel::show_panel(app),
         // 设置(U12)：托盘没有 UI，唤出主面板后发事件让前端打开设置模态。
         "settings" => {
-            show_panel(app);
+            crate::panel::show_panel(app);
             // emit 失败不影响窗口已显示；前端 listen 见 §main.ts openSettings 入口。
             let _ = app.emit("open-settings", ());
         }
@@ -245,7 +231,7 @@ fn on_tray_icon_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
         ..
     } = event
     {
-        show_panel(tray.app_handle());
+        crate::panel::show_panel(tray.app_handle());
     }
 }
 
