@@ -248,8 +248,21 @@ mod imp {
     /// 主线程 run loop 中被回调使用的 AppHandle。
     static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
 
-    /// 已注册热键表：HotkeyRef + EventHotKeyID + HotkeyAction。
-    static HOTKEYS: Mutex<Vec<(HotkeyRef, EventHotKeyID, HotkeyAction)>> = Mutex::new(Vec::new());
+    /// 已注册热键表：`(Carbon ref, 热键 id, 语义 action, 当前 combo)`。
+    ///
+    /// **存 combo 是为了「按 action 替换」**：`register` 先注册新 combo、
+    /// 成功后再注销同 action 的旧 combo，从而不存在「先清空、再注册、失败后
+    /// 一个热键都不剩」的窗口（U2 code review P0：conflict 后永久失去全局热键）。
+    /// 存 combo 也让「改回同一个 combo」短路成 no-op（否则 Carbon 会返回
+    /// 「已注册」错误，被误报为冲突）。
+    static HOTKEYS: Mutex<Vec<(HotkeyRef, EventHotKeyID, HotkeyAction, KeyCombo)>> =
+        Mutex::new(Vec::new());
+
+    /// 串行化 `register` 的整段「查重 → 注册 → 替换旧条目」。
+    ///
+    /// `set_hotkey` 命令在 await 之后调用 `apply_global_hotkey`，两个并发命令
+    /// 可能在不同 runtime 线程同时进入，导致同一 action 注册出两条热键。
+    static REGISTER_LOCK: Mutex<()> = Mutex::new(());
 
     /// 进程内自增 hotkey id（保证 EventHotKeyID.id 在同一进程内不重复）。
     static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
@@ -290,7 +303,7 @@ mod imp {
 
         // 用 signature + id 查找 action。
         let hotkeys = HOTKEYS.lock().unwrap();
-        for (_, id, action) in hotkeys.iter() {
+        for (_, id, action, _) in hotkeys.iter() {
             if id.signature == hotkey_id.signature && id.id == hotkey_id.id {
                 if *action == HotkeyAction::OpenPanel {
                     crate::tray::show_panel(app);
@@ -304,15 +317,33 @@ mod imp {
         0
     }
 
-    /// 注册一个全局热键。重复调用会为每次提供的新 combo 创建新条目（id 自增）。
+    /// 注册（或替换）某个 action 的全局热键。
     ///
-    /// `register(app, action, combo) -> Result<(), ConflictReason>`
+    /// **替换语义**（U2 code review P0 修复）：
+    /// 1. 同一 `(action, combo)` 已在注册中 → no-op 返回 `Ok`，不碰 Carbon。
+    /// 2. 否则先注册新 combo；**成功之后**才注销同 action 的旧 combo。
+    ///    注册失败时旧条目原样保留 —— 用户不会因一次冲突失去这个 action 的全局热键。
+    ///
+    /// 整段由 [`REGISTER_LOCK`] 串行化，避免并发命令为同一 action 注册出两条热键。
     pub fn register(
         app: &AppHandle,
         action: HotkeyAction,
         combo: &KeyCombo,
     ) -> Result<(), ConflictReason> {
         use super::ConflictReason;
+        let _guard = REGISTER_LOCK.lock().unwrap();
+
+        // 1. 已用同一 combo 注册过？no-op。
+        {
+            let hotkeys = HOTKEYS.lock().unwrap();
+            if hotkeys
+                .iter()
+                .any(|(_, _, a, c)| *a == action && c == combo)
+            {
+                return Ok(());
+            }
+        }
+
         // 保存 AppHandle 供回调使用。
         let _ = APP_HANDLE.set(app.clone());
 
@@ -334,6 +365,7 @@ mod imp {
             id,
         };
 
+        let mut raw_ref: EventHotKeyRef = std::ptr::null_mut();
         unsafe {
             let target = GetApplicationEventTarget();
 
@@ -363,25 +395,39 @@ mod imp {
                 *guard = Some(HandlerRef(handler_ref));
             }
 
-            let mut raw_ref: EventHotKeyRef = std::ptr::null_mut();
             let status =
                 RegisterEventHotKey(keycode, carbon_mask, hot_key_id, target, 0, &mut raw_ref);
             if status != 0 {
+                // 旧条目原样保留（本函数什么都没改）。
                 return Err(ConflictReason::Taken(format!("Carbon status {status}")));
             }
+        }
 
-            // 注册成功：写入 Vec。
+        // 2. 注册成功：先取出同 action 的旧条目，写入新条目，再在锁外注销旧条目。
+        let old_refs: Vec<EventHotKeyRef> = {
             let mut hotkeys = HOTKEYS.lock().unwrap();
-            hotkeys.push((HotkeyRef(raw_ref), hot_key_id, action));
+            let old: Vec<EventHotKeyRef> = hotkeys
+                .iter()
+                .filter(|(_, _, a, _)| *a == action)
+                .map(|(r, _, _, _)| r.0)
+                .collect();
+            hotkeys.retain(|(_, _, a, _)| *a != action);
+            hotkeys.push((HotkeyRef(raw_ref), hot_key_id, action, *combo));
+            old
+        };
+        for old in old_refs {
+            unsafe {
+                UnregisterEventHotKey(old);
+            }
         }
 
         Ok(())
     }
 
-    /// 注销所有已注册的热键。
+    /// 注销所有已注册的热键（应用退出路径）。
     pub fn unregister_all() {
         let mut hotkeys = HOTKEYS.lock().unwrap();
-        for (ref_, _, _) in hotkeys.drain(..) {
+        for (ref_, _, _, _) in hotkeys.drain(..) {
             unsafe {
                 UnregisterEventHotKey(ref_.0);
             }
@@ -480,6 +526,16 @@ mod imp_win {
     static PUMP: Mutex<Option<Pump>> = Mutex::new(None);
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+    /// 主线程侧「当前应当注册的热键」真值表：`action → (热键 id, combo)`。
+    ///
+    /// 与 macOS 的 `HOTKEYS` 同角色 —— 让 `register` 能按 action 替换
+    /// （先注册新 combo、成功后再注销旧 id），而不是「先 Quit 整个 pump、
+    /// 再注册」。后者在注册失败时会让用户永久失去全局热键。
+    static REGISTERED: Mutex<Option<HashMap<HotkeyAction, (i32, KeyCombo)>>> = Mutex::new(None);
+
+    /// 串行化 `register` 的整段「查重 → 注册 → 注销旧 id」。
+    static REGISTER_LOCK: Mutex<()> = Mutex::new(());
+
     /// 热键 id 自增计数器（进程内唯一）。
     static NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
@@ -548,41 +604,88 @@ mod imp_win {
         }
     }
 
-    /// 注册一个全局热键（通道式）。
+    /// 注册（或替换）某个 action 的全局热键（通道式）。
+    ///
+    /// **替换语义**（与 macOS 侧一致）：
+    /// 1. 同一 `(action, combo)` 已注册 → no-op `Ok`。
+    /// 2. 否则先注册新 id；**成功之后**才注销同 action 的旧 id ——
+    ///    注册失败时旧热键原样保留。
     pub fn register(
         app: &AppHandle,
         action: HotkeyAction,
         combo: &KeyCombo,
     ) -> Result<(), ConflictReason> {
-        // 确保 pump 线程在运行。
+        let _guard = REGISTER_LOCK.lock().unwrap();
+
+        // 1. 已用同一 combo 注册过？no-op。
+        {
+            let registered = REGISTERED.lock().unwrap();
+            if let Some(map) = registered.as_ref()
+                && let Some((_, existing)) = map.get(&action)
+                && existing == combo
+            {
+                return Ok(());
+            }
+        }
+
+        // 2. 确保 pump 线程在运行。
         ensure_pump(app)?;
 
-        // 发 Register 消息。
-        let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
-        let pump = pump_guard
-            .as_ref()
-            .ok_or_else(|| ConflictReason::Taken("pump not initialized".to_string()))?;
+        // 3. 注册新 id。
+        let new_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        {
+            let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+            let pump = pump_guard
+                .as_ref()
+                .ok_or_else(|| ConflictReason::Taken("pump not initialized".to_string()))?;
+            let (reply_tx, reply_rx) = mpsc::channel();
+            pump.tx
+                .send(PumpMsg::Register {
+                    id: new_id,
+                    combo: combo.clone(),
+                    action,
+                    reply: reply_tx,
+                })
+                .map_err(|_| ConflictReason::Taken("pump channel closed".to_string()))?;
+            drop(pump_guard);
+            reply_rx
+                .recv_timeout(REPLY_TIMEOUT)
+                .map_err(|_| ConflictReason::Taken("pump reply timeout".to_string()))??;
+        }
 
-        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (reply_tx, reply_rx) = mpsc::channel();
+        // 4. 注册成功：注销同 action 的旧 id（若有），再更新真值表。
+        let old_id = {
+            let mut registered = REGISTERED.lock().unwrap();
+            let map = registered.get_or_insert_with(HashMap::new);
+            map.insert(action, (new_id, *combo)).map(|(id, _)| id)
+        };
+        if let Some(old_id) = old_id {
+            unregister_id(old_id);
+        }
 
-        pump.tx
-            .send(PumpMsg::Register {
-                id,
-                combo: combo.clone(),
-                action,
-                reply: reply_tx,
-            })
-            .map_err(|_| ConflictReason::Taken("pump channel closed".to_string()))?;
-
-        drop(pump_guard);
-
-        reply_rx
-            .recv_timeout(REPLY_TIMEOUT)
-            .map_err(|_| ConflictReason::Taken("pump reply timeout".to_string()))?
+        Ok(())
     }
 
-    /// 注销所有已注册热键（fire-and-forget）。
+    /// 注销指定 id 的热键（fire-and-forget，等待 pump 确认）。
+    fn unregister_id(id: i32) {
+        let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+        if let Some(pump) = pump_guard.as_ref() {
+            let (reply_tx, reply_rx) = mpsc::channel();
+            if pump
+                .tx
+                .send(PumpMsg::Unregister {
+                    id,
+                    reply: reply_tx,
+                })
+                .is_ok()
+            {
+                drop(pump_guard);
+                let _ = reply_rx.recv_timeout(REPLY_TIMEOUT);
+            }
+        }
+    }
+
+    /// 注销所有已注册热键并停掉消息泵（应用退出路径）。
     pub fn unregister_all() {
         let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
         if let Some(ref pump) = *pump_guard {
@@ -598,6 +701,7 @@ mod imp_win {
             }
         }
         STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+        *REGISTERED.lock().unwrap() = None;
     }
 
     /// 消息泵主体：在子线程中运行，接收主线程发来的 PumpMsg 并执行。

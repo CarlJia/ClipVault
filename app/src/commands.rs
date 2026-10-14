@@ -589,74 +589,49 @@ pub fn get_hotkeys(state: State<'_, AppState>) -> String {
 /// 4. `persist_hotkeys` 持久化到 `settings` 表
 /// 5. `apply_hotkeys` 更新 in-memory slot
 ///
-/// U2 会在这里加入 `apply_global_hotkey` 调用以完成 live re-register。
+/// 设置某个 action 的快捷键。
+///
+/// 写路径（**注册先于落库**，U2 code review P0/P1 修复）：
+/// 1. `parse_set_hotkey_args`：action 字符串 + JSON combo → `(action, combo)`；
+///    任一非法值在此直接返回 `Err`，不触碰状态。
+/// 2. 构造新 map（仅内存副本，未生效）。
+/// 3. 若改的是全局热键（`OpenPanel`）：先 `apply_global_hotkey` 注册到 OS。
+///    注册失败（冲突 / 不支持的键）→ 直接返回 `Err`，**库与内存 slot 均未改动**，
+///    用户的旧热键继续可用（这正是 R4 要求的「保持原绑定」）。
+/// 4. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
 #[tauri::command]
 pub async fn set_hotkey(
     action: String,
     combo: serde_json::Value,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use clipvault_core::keymap::{CharKind, HotkeyAction, KeyCombo, Mods};
+    use clipvault_core::keymap::HotkeyAction;
 
-    // 1. 把 action string → enum
-    let action =
-        HotkeyAction::from_json_str(&action).ok_or_else(|| format!("unknown action '{action}'"))?;
+    // 1. 解析入参（纯函数，可单测）。
+    let (action, new_combo) = crate::keymap::parse_set_hotkey_args(&action, &combo)?;
 
-    // 2. 从 JSON Value 提取 mods + key
-    let combo_obj = combo.as_object().ok_or("combo must be a JSON object")?;
-
-    // mods
-    let mods_array = combo_obj
-        .get("mods")
-        .and_then(|v| v.as_array())
-        .ok_or("combo.mods must be an array")?;
-    let mut mods = Mods::empty();
-    for m in mods_array {
-        let s = m.as_str().ok_or("mods elements must be strings")?;
-        match s {
-            "meta" => mods |= Mods::META,
-            "shift" => mods |= Mods::SHIFT,
-            "alt" => mods |= Mods::ALT,
-            "ctrl" => mods |= Mods::CTRL,
-            _ => return Err(format!("unknown modifier '{s}'")),
-        }
-    }
-
-    // key — 拒绝 null（modifier-only）
-    let key_value = combo_obj.get("key").ok_or("combo.key is required")?;
-    if key_value.is_null() {
-        return Err("modifier-only combos are not allowed".to_string());
-    }
-    let key_str = key_value.as_str().ok_or("combo.key must be a string")?;
-    let key =
-        CharKind::from_json_str(key_str).ok_or_else(|| format!("unrecognised key '{key_str}'"))?;
-
-    let new_combo = KeyCombo { mods, key };
-
-    // 3. 更新 map
-    let map = {
+    // 2. 构造新 map（内存副本）。
+    let new_map = {
         let mut map = state.keymap.read().unwrap().clone();
         map.actions.insert(action, new_combo);
         map
     };
 
-    // 4. 持久化 + 更新 slot
-    crate::keymap::set_hotkey(&state.storage, &state.keymap, &map)
-        .await
-        .map_err(|e| e.to_string())?;
-
-    // 5. U2：live re-register 全局热键（若改的是 OpenPanel）。
-    //    Clippy 报 collapsible_if 但实际并不触发（外层是 `if`，内层是 `if let`，
-    //    rust-clippy 的 collapsible_if 不合并 `if let`）；保留 `#[allow]` 避免后续
-    //    toolchain 升级误报。`clippy::collapsible_else_if` 也不适用（else 是动作注释）。
-    #[allow(clippy::collapsible_if)]
+    // 3. 全局热键：先注册到 OS，失败即返回，不改任何状态。
     if action == HotkeyAction::OpenPanel {
-        if let Err(e) = crate::keymap::apply_global_hotkey(&state.app, &map) {
-            // 注册失败不阻止命令返回（已在内存中更新）；冲突由前端 toast 提示。
-            // settings 表已在 step 4 持久化，故本次绑定在库中可见。
-            // 用户需再改一次才能重试，或重启后回落。
-            eprintln!("[keymap] apply_global_hotkey 失败：{e}");
+        crate::keymap::apply_global_hotkey(&state.app, &new_map).map_err(|e| e.to_string())?;
+    }
+
+    // 4. 持久化 + 更新内存 slot。
+    //
+    // 若持久化失败而全局热键已在 step 3 注册，则尽力把 OS 侧退回旧 combo，
+    // 避免「热键生效了但库里还是旧值」的不一致。
+    if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &new_map).await {
+        if action == HotkeyAction::OpenPanel {
+            let old_map = state.keymap.read().unwrap().clone();
+            let _ = crate::keymap::apply_global_hotkey(&state.app, &old_map);
         }
+        return Err(e.to_string());
     }
 
     Ok(())
