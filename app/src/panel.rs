@@ -3,7 +3,7 @@
 //! 本模块持有**全应用唯一的「唤出面板」入口** [`show_panel`]：热键回调与托盘（菜单 /
 //! 左键点击）都只调用它，因此「先记录回贴目标、再定位到焦点屏、然后显示」这条顺序由
 //! 代码结构而不是注释保证（KTD9 / R4）。定位的判据算术是平台无关的纯函数（U1），
-//! macOS 适配层见 [`imp_macos`]，Windows 适配层在 U3 落地。
+//! macOS 适配层见 [`imp_macos`]，Windows 适配层见 [`imp_win`]（两端共享同一套判据）。
 //!
 //! macOS 上「点击面板之外」的表现是**面板窗口失去 key 状态**（`NSWindow`
 //! `resignKey`）：点别的 App 的窗口、点桌面、拉开托盘菜单都会触发。Tauri 把它
@@ -265,11 +265,11 @@ fn place_panel(window: &tauri::WebviewWindow) -> bool {
     imp_macos::place(window)
 }
 
-/// Windows：U2 先落一个「尽力而为」的空实现（本次不定位），让整树在 Windows 目标上编译
-/// 得过；U3 把它替换成基于 `GetForegroundWindow` / `GetCursorPos` 的真实适配。
+/// Windows：真实实现见 [`imp_win`]（U3 把 U2 的桩替换成基于 `GetForegroundWindow` /
+/// `GetCursorPos` 的适配，判据算术与 macOS 同源）。
 #[cfg(target_os = "windows")]
-fn place_panel(_window: &tauri::WebviewWindow) -> bool {
-    false
+fn place_panel(window: &tauri::WebviewWindow) -> bool {
+    imp_win::place(window)
 }
 
 /// 其余平台：不定位，面板留在原位（plan 的 Deferred：Linux 等平台沿用 `#[cfg]` 降级）。
@@ -282,7 +282,8 @@ fn place_panel(_window: &tauri::WebviewWindow) -> bool {
 ///
 /// 「静默降级」是本链路最大的风险（Risks）：拿不到 `MainThreadMarker`、取不到
 /// `NSWindow` 等都会保留原位置而没有任何测试会红，这条日志是可观测信号。
-#[cfg(target_os = "macos")]
+/// macOS 与 Windows 两个适配层共用（两侧的失败路径都靠它留痕）。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn log_skip_once(path: &'static str, detail: &str) {
     static LOGGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = LOGGED.lock().unwrap();
@@ -398,6 +399,171 @@ mod imp_macos {
         // `show()` 在主线程上是同步的；直接在 `show()` 之前同步落位，避免 tao 的
         // `set_outer_position` 走 `dispatch_async` 造成「先画旧位置一帧」（KTD3）。
         ns.setFrameTopLeftPoint(NSPoint::new(x, y));
+        true
+    }
+}
+
+/// Windows 定位适配层（U3）：全程**物理像素**，落位用 `set_position(PhysicalPosition)`。
+///
+/// 与 macOS 同源：先用 [`focused_source`] 判自指、按 [`select_display`] 选屏、再用
+/// [`centered_offset`] 算居中偏移；差异只在两处取数（Win32 vs AppKit）与坐标系
+/// （物理像素 vs AppKit 点、y 向下 vs y 向上）。取数走
+/// `GetForegroundWindow` / `GetWindowThreadProcessId` / `GetWindowRect` / `GetCursorPos`，
+/// 四个 API 都在已启用的 `Win32_UI_WindowsAndMessaging` feature 下，**不新增 feature**
+/// （`MonitorFromWindow` / `GetMonitorInfoW` 在未启用的 `Win32_Graphics_Gdi` 下，故选屏
+/// 交给 Tauri 的 `monitor_from_point`，见 `app/Cargo.toml`）。
+///
+/// # 线程模型
+///
+/// 本适配层由 `app/src/hotkey.rs` 自建的消息泵线程调用，**不是主线程**。因此只用线程
+/// 安全的 Tauri API（`available_monitors` / `monitor_from_point` / `primary_monitor` /
+/// `set_position`，内部向事件循环投递消息并等应答），**不引入任何主线程假设**，也不碰
+/// AppKit 那套（`MainThreadMarker` / `NSScreen`）。
+#[cfg(target_os = "windows")]
+mod imp_win {
+    use tauri::PhysicalPosition;
+    use windows::Win32::Foundation::{HWND, POINT, RECT};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetCursorPos, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    };
+
+    use super::{
+        Display, FocusSource, PANEL_SIZE, Point, Rect, centered_offset, focused_source,
+        log_skip_once, select_display,
+    };
+
+    /// 当前前台窗口；无前台窗口（例如刚失去激活）时为 `None`。
+    fn foreground_window() -> Option<HWND> {
+        // SAFETY: `GetForegroundWindow` 无参数、无副作用；返回裸 `HWND`，用
+        // `is_invalid()` 判空（无前台窗口时返回空句柄）。
+        let hwnd = unsafe { GetForegroundWindow() };
+        (!hwnd.is_invalid()).then_some(hwnd)
+    }
+
+    /// 窗口所属进程号，换算成与 `focused_source` 的入参同型的 `i32`。
+    ///
+    /// `GetWindowThreadProcessId` 的出参是 `Option<*mut u32>`：传 `Some(&mut pid)`，
+    /// 它写入 pid 并返回线程号（这里不用）。`pid == 0` 视为取不到。
+    fn window_process_id(hwnd: HWND) -> Option<i32> {
+        let mut pid = 0u32;
+        // SAFETY: 出参指向本栈上有效的 `u32`；该 API 只写这一个值。
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        (pid != 0).then_some(pid as i32)
+    }
+
+    /// 前台窗口矩形（物理像素，虚拟屏全局坐标）；取不到时为 `None`。
+    ///
+    /// 这是 R1「Windows 取前台窗口所在屏」的唯一取数路径：把整块矩形交给
+    /// [`select_display`]，由它取中心点判包含——只判自指而不取矩形，就会退化成
+    /// 「面板跟着鼠标跑」。
+    fn window_rect(hwnd: HWND) -> Option<Rect> {
+        let mut raw = RECT::default();
+        // SAFETY: 出参指向本栈上有效的 `RECT`。
+        if unsafe { GetWindowRect(hwnd, &mut raw) }.is_err() {
+            return None;
+        }
+        // `RECT` 是「左上 / 右下」两角，换算成 `(x, y, w, h)`。
+        Some(Rect {
+            x: raw.left as f64,
+            y: raw.top as f64,
+            w: (raw.right - raw.left) as f64,
+            h: (raw.bottom - raw.top) as f64,
+        })
+    }
+
+    /// 鼠标位置（物理像素）；取不到时为 `None`。
+    fn cursor_point() -> Option<Point> {
+        let mut raw = POINT::default();
+        // SAFETY: 出参指向本栈上有效的 `POINT`。
+        if unsafe { GetCursorPos(&mut raw) }.is_err() {
+            return None;
+        }
+        Some(Point {
+            x: raw.x as f64,
+            y: raw.y as f64,
+        })
+    }
+
+    /// 由 Tauri 的 `Monitor` 构造 U1 的 `Display`（全程物理像素）。
+    ///
+    /// `bounds`（`position` × `size`）供选屏判包含；`work`（`work_area`，已扣任务栏）
+    /// 供落位居中（R6）。负原点的副屏同样成立——这些值本就是虚拟屏全局坐标。
+    fn display_of(monitor: &tauri::Monitor) -> Display {
+        let pos = monitor.position();
+        let size = monitor.size();
+        let work = monitor.work_area();
+        Display {
+            bounds: Rect {
+                x: pos.x as f64,
+                y: pos.y as f64,
+                w: size.width as f64,
+                h: size.height as f64,
+            },
+            work: Rect {
+                x: work.position.x as f64,
+                y: work.position.y as f64,
+                w: work.size.width as f64,
+                h: work.size.height as f64,
+            },
+        }
+    }
+
+    /// 定位面板并在目标工作区内居中。返回本次是否真的改了位置。
+    pub(super) fn place(window: &tauri::WebviewWindow) -> bool {
+        let Ok(monitors) = window.available_monitors() else {
+            log_skip_once("no-monitors", "取不到显示器列表，保留面板原位置");
+            return false;
+        };
+        if monitors.is_empty() {
+            log_skip_once("no-monitors", "取不到显示器列表，保留面板原位置");
+            return false;
+        }
+        let displays: Vec<Display> = monitors.iter().map(display_of).collect();
+
+        // 前台窗口 → 进程号 → 自指判定（R2 / R2a）。前台是别的应用时用前台窗口矩形，
+        // 是 ClipVault 自己（托盘菜单弹出 / 面板已持焦点）或取不到进程号时退到鼠标屏。
+        let self_pid = std::process::id() as i32;
+        let front = foreground_window();
+        let front_pid = front.and_then(window_process_id);
+        let cursor = cursor_point();
+        let focused = match focused_source(front_pid, self_pid) {
+            FocusSource::Frontmost => front.and_then(window_rect),
+            FocusSource::Cursor => None,
+        };
+
+        let selected = select_display(focused, cursor, &displays);
+
+        // 目标显示器：判据选中的下标与 `monitors` 一一对应（两者同序同长），直接取该块。
+        // 不用 `monitor_from_point` 再问一次系统：那条路要投递到事件循环并阻塞等应答，
+        // 而本函数跑在热键消息泵线程上，多一次往返只会拖慢热键响应，结果却与直接索引
+        // 完全相同。两个输入都取不到（`selected` 为 `None`）时回退主屏（R3）。
+        let target = match selected {
+            Some(i) => monitors
+                .get(i)
+                .map(|m| (m.scale_factor(), displays[i].work)),
+            None => window
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| (m.scale_factor(), display_of(&m).work)),
+        };
+        let Some((scale, work)) = target else {
+            log_skip_once("no-display", "解析不出目标显示器，保留面板原位置");
+            return false;
+        };
+
+        // 面板逻辑尺寸按目标屏 `scale_factor` 换算成物理像素（Windows 全程物理像素）。
+        let window_size = (PANEL_SIZE.0 * scale, PANEL_SIZE.1 * scale);
+        let (dx, dy) = centered_offset(work, window_size);
+        // Windows 用左上原点、y 向下，`centered_offset` 的偏移可直接相加，无需 AppKit
+        // 式的 y 翻转（`appkit_frame_origin` 只对 macOS 有意义，故不在此处出现）。
+        let x = (work.x + dx).round() as i32;
+        let y = (work.y + dy).round() as i32;
+
+        if window.set_position(PhysicalPosition::new(x, y)).is_err() {
+            log_skip_once("set-position-failed", "set_position 失败，保留面板原位置");
+            return false;
+        }
         true
     }
 }
