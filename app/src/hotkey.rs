@@ -505,16 +505,16 @@ fn mods_to_win32(mods: clipvault_core::keymap::Mods) -> u32 {
     use clipvault_core::keymap::Mods;
     let mut mask = 0u32;
     if mods.contains(Mods::ALT) {
-        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0 as u32;
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0;
     }
     if mods.contains(Mods::CTRL) {
-        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 as u32;
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0;
     }
     if mods.contains(Mods::SHIFT) {
-        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0 as u32;
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0;
     }
     if mods.contains(Mods::META) {
-        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN.0 as u32;
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN.0;
     }
     mask
 }
@@ -688,7 +688,7 @@ mod imp_win {
             pump.tx
                 .send(PumpMsg::Register {
                     id: new_id,
-                    combo: combo.clone(),
+                    combo: *combo,
                     action,
                     reply: reply_tx,
                 })
@@ -741,10 +741,10 @@ mod imp_win {
 
         // join pump thread.
         let mut pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
-        if let Some(p) = pump_guard.take() {
-            if let Some(h) = p.handle {
-                let _ = h.join();
-            }
+        if let Some(p) = pump_guard.take()
+            && let Some(h) = p.handle
+        {
+            let _ = h.join();
         }
         STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
         *REGISTERED.lock().unwrap() = None;
@@ -842,16 +842,13 @@ mod imp_win {
                 }
                 break;
             }
-            match msg.message {
-                WM_HOTKEY => {
-                    let id = msg.wParam.0 as i32;
-                    if let Some(action) = id_map.get(&id) {
-                        if *action == HotkeyAction::OpenPanel {
-                            crate::tray::show_panel(&app);
-                        }
-                    }
+            if msg.message == WM_HOTKEY {
+                let id = msg.wParam.0 as i32;
+                if let Some(action) = id_map.get(&id)
+                    && *action == HotkeyAction::OpenPanel
+                {
+                    crate::tray::show_panel(&app);
                 }
-                _ => {}
             }
             unsafe {
                 let _ = TranslateMessage(&msg);
