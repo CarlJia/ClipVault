@@ -449,26 +449,12 @@ body {
   line-height: 1;
 }
 
-/* 底部提示行 */
-.hint {
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  /* 提示条会折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
-     否则相邻两行的键帽会贴在一起。 */
-  line-height: 1.8;
-}
-
 /* 「按什么」与「做什么」分色：快捷键是键帽（强调色文字 + 淡蓝底 + 描边），
    说明文字留在 --muted。用颜色而非字重区分，是因为提示条里塞了十来个按键，
    靠颜色扫读最快。`font-family: inherit` 是刻意的 —— 等宽字体（SF Mono 等）
    对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。
    Windows 上键帽文案已被 platform.ts 换成 `Ctrl+` / `Shift+` / `Enter` 纯文本（RW9），
    inherit 在那里同样合适：与说明文字同族，也避开等宽字体对中文的回退差异。 */
-.hint kbd,
-.hint .keycap,
 .editor-hint kbd,
 .editor-hint .keycap {
   display: inline-block;
@@ -480,11 +466,6 @@ body {
   font-family: inherit;
   font-size: 10px;
   white-space: nowrap;
-}
-
-/* 括号里的补充说明再弱一层，不与主提示抢注意力。 */
-.hint-note {
-  color: rgba(154, 154, 162, 0.72);
 }
 
 /* Toast */
@@ -679,7 +660,8 @@ body {
 .editor-hint {
   font-size: 11px;
   color: var(--muted);
-  /* 与 .hint 同款键帽，行距同样要给键帽留出上下余量。 */
+  /* 编辑器提示行可能折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
+     否则相邻两行的键帽会贴在一起。 */
   line-height: 1.8;
 }
 .editor-retry {
@@ -794,6 +776,93 @@ body {
   cursor: pointer;
   border: none;
 }
-.slider:focus::-webkit-slider-thumb {
-  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+/* ---------------------------------------------------------------- */
+/* 快捷键设置区块（U4）                                              */
+/* ---------------------------------------------------------------- */
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-section-title {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.hotkey-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hotkey-group-title {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+.hotkey-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hotkey-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.hotkey-row-label {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text);
+  min-width: 140px;
+}
+
+.hotkey-row-combo {
+  min-width: 80px;
+  text-align: center;
+}
+
+.hotkey-row-combo kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid rgba(10, 132, 255, 0.32);
+  border-radius: 4px;
+  background: rgba(10, 132, 255, 0.14);
+  color: #7ab8ff;
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.hotkey-row.recording .hotkey-row-combo kbd {
+  animation: hotkey-recording 1s ease-in-out infinite alternate;
+}
+
+@keyframes hotkey-recording {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.hotkey-rebind {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hotkey-rebind:hover {
+  background: var(--surface-hover);
 }

@@ -17,10 +17,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use clipvault::commands::{self, AppState};
-use clipvault::hotkey;
 use clipvault::panel;
 use clipvault::privacy;
 use clipvault::storage::{Storage, default_db_path};
@@ -57,6 +57,7 @@ fn main() {
             let guest_mode = Arc::new(AtomicBool::new(false));
             let skip_next = Arc::new(AtomicBool::new(false));
             let panel_opacity = Arc::new(AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY));
+            let keymap = Arc::new(RwLock::new(clipvault_core::keymap::HotkeyMap::default_map()));
 
             // 2.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
             //     使重启后 watcher / 托盘 / 前端与上次状态一致。
@@ -72,16 +73,27 @@ fn main() {
             )
             .unwrap_or(privacy::DEFAULT_PANEL_OPACITY);
 
-            // 3. 注册 IPC 共享状态。
+            // 2.7 U1：从 settings 表加载持久化的快捷键映射到 slot，
+            //     使重启后 panel 内快捷键与全局热键与上次一致。
+            let initial_keymap = tauri::async_runtime::block_on(
+                clipvault::keymap::boot_load_hotkeys(&storage, &keymap),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("[clipvault] boot_load_hotkeys 失败：{e}，使用默认映射");
+                clipvault_core::keymap::HotkeyMap::default_map()
+            });
+
+            // 注册 IPC 共享状态（在 apply_global_hotkey 之前，因为 apply 需要 AppState.app）。
             app.manage(AppState {
                 storage: storage.clone(),
                 guest_mode: guest_mode.clone(),
                 skip_next: skip_next.clone(),
                 panel_opacity: panel_opacity.clone(),
+                keymap: keymap.clone(),
+                app: app.handle().clone(),
             });
 
-            // 3.5 U9：启动时校验加密区条目的可解密性（macOS / Windows 且系统凭据库可用）。
-            //     凭据库不可用时**跳过**（不误标 is_decryptable=0），由横幅提示。
+            // 3.5 U9：启动时校验加密区条目的可解密性
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if clipvault::crypto::system_key_available() {
@@ -105,8 +117,10 @@ fn main() {
             // 5. 菜单栏托盘（反映启动时加载到的访客模式状态）。
             tray::build_tray(app.handle(), initial_guest)?;
 
-            // 6. Carbon 全局热键 ⌥⌘V。
-            hotkey::register(app.handle());
+            // 6. U2：全局热键 re-register（boot 时从 settings 表加载的 initial_keymap）。
+            if let Err(e) = clipvault::keymap::apply_global_hotkey(app.handle(), &initial_keymap) {
+                eprintln!("[clipvault] apply_global_hotkey 失败：{e}（热键可能不生效）");
+            }
 
             Ok(())
         })
@@ -127,6 +141,8 @@ fn main() {
             commands::set_skip_next,
             commands::get_panel_opacity,
             commands::set_panel_opacity,
+            commands::get_hotkeys,
+            commands::set_hotkey,
             commands::keychain_available,
             commands::move_to_vault,
             commands::list_vault,

@@ -6,9 +6,20 @@
 // 后续单元接管的动作在此仅调用类型化 IPC 桩并给出 toast 提示：
 // Enter→paste_entry(U8)、⌘E→open_note_editor(U6)、⌘P→toggle_pin(U7)。
 
+// 纯副作用 import：styles.css 不被任何模块引用，只能靠它进入 Vite 的依赖图，
+// 否则构建产物里不会出现 CSS 资产（面板/模态全部无样式）。删掉这一行不会报错，
+// 只会静默失去全部样式 —— 别顺手清理「看起来没人用」的这一行。
 import "./styles.css";
+
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import {
+  dispatchHotkeyAction,
+  handleVaultKey,
+  loadKeymap,
+  matches,
+  registerKeymapHandlers,
+} from "./keymap";
 import {
   type CategoryInfo,
   type EntryDto,
@@ -30,6 +41,7 @@ import {
   moveToVault,
   refreshAccessibilityBanner,
   refreshKeychainBanner,
+  renderHotkeysSection,
   setGuestMode,
   setPanelOpacity,
   skipNextCopy,
@@ -557,6 +569,8 @@ async function openSettings(): Promise<void> {
   opacityEl.value = String(v);
   opacityValueEl.textContent = `${v}%`;
   settingsEl.classList.remove("hidden");
+  // 渲染快捷键区块（U4）
+  void renderHotkeysSection();
   // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。
   searchEl.focus();
 }
@@ -646,45 +660,41 @@ listEl.addEventListener("dblclick", (ev) => {
   void activate();
 });
 
+// U3: 启动后从 get_hotkeys IPC 拉取快捷键映射。
+// 注册 handlers（需要 activate/moveSelection 等 closure）。
+registerKeymapHandlers({
+  activate,
+  moveSelection,
+  editNote,
+  togglePin,
+  moveCurrentToVault,
+  openUrlAction,
+  openVault,
+  toggleGuestMode,
+  triggerSkipOnce,
+  openSettings,
+  closeSettings,
+  currentEntry,
+});
+void loadKeymap();
+
 document.addEventListener("keydown", (ev) => {
   // 编辑器打开时，列表快捷键让位给编辑器（其 Esc / ⌘S 已在 editor.ts 处理）。
   if (isEditorOpen()) return;
-  // 加密区模态打开时：仅处理 Esc / 导航 / 回贴 / 备注，其余列表快捷键让位。
+  // 加密区模态打开时：handleVaultKey 处理。
   if (isVaultOpen()) {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      closeVault();
+    if (
+      handleVaultKey(ev, {
+        closeVault,
+        moveVaultSelection,
+        pasteVaultEntry,
+        editVaultNote,
+      })
+    )
       return;
-    }
-    if (ev.key === "ArrowDown") {
-      ev.preventDefault();
-      moveVaultSelection(1);
-      return;
-    }
-    if (ev.key === "ArrowUp") {
-      ev.preventDefault();
-      moveVaultSelection(-1);
-      return;
-    }
-    if (ev.key === "Enter") {
-      ev.preventDefault();
-      void pasteVaultEntry();
-      return;
-    }
-    if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
-      ev.preventDefault();
-      editVaultNote();
-      return;
-    }
-    // ⌘⇧V：再次按下收起加密区模态（与主列表的唤出键同键来回）。
-    if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
-      ev.preventDefault();
-      closeVault();
-      return;
-    }
     return;
   }
-  // 设置模态打开时,仅处理 Esc 关闭(U12)。
+  // 设置模态打开时，仅处理 Esc 关闭(U12)。
   if (isSettingsOpen()) {
     if (ev.key === "Escape") {
       ev.preventDefault();
@@ -692,34 +702,14 @@ document.addEventListener("keydown", (ev) => {
     }
     return;
   }
-  if (ev.key === "Escape") {
+  // 数据驱动匹配
+  const action = matches(ev);
+  if (action) {
     ev.preventDefault();
-    void invoke("hide_panel");
+    dispatchHotkeyAction(action);
     return;
   }
-  if (ev.key === "ArrowDown") {
-    ev.preventDefault();
-    moveSelection(1);
-    return;
-  }
-  if (ev.key === "ArrowUp") {
-    ev.preventDefault();
-    moveSelection(-1);
-    return;
-  }
-  if (ev.key === "Enter") {
-    ev.preventDefault();
-    void activate();
-    return;
-  }
-  // ⌘O：URL 类别条目在默认浏览器打开（U7 + R20）。
-  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && (ev.key === "o" || ev.key === "O")) {
-    ev.preventDefault();
-    const e = currentEntry();
-    if (e) void openUrlAction(e);
-    return;
-  }
-  // ⌘1 – ⌘9：直接选中并回贴列表中第 N 条（不带 Shift，避免撞其它组合）。
+  // ⌘1 – ⌘9：直接选中并回贴列表中第 N 条（保留，不在 keymap 中）。
   if (
     (ev.metaKey || ev.ctrlKey) &&
     !ev.shiftKey &&
@@ -729,51 +719,6 @@ document.addEventListener("keydown", (ev) => {
   ) {
     ev.preventDefault();
     void activateIndex(Number(ev.key) - 1);
-    return;
-  }
-  // ⌘⇧V：打开加密区管理（放在 ⌘E 之前判断，避免与其它组合冲突）。
-  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
-    ev.preventDefault();
-    void openVault();
-    return;
-  }
-  // ⌘,：打开设置(U12)。
-  if (
-    (ev.metaKey || ev.ctrlKey) &&
-    !ev.shiftKey &&
-    !ev.altKey &&
-    ev.key === ","
-  ) {
-    ev.preventDefault();
-    void openSettings();
-    return;
-  }
-  // ⌘⇧G：切换访客模式（U10 / R10）。
-  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "g" || ev.key === "G")) {
-    ev.preventDefault();
-    void toggleGuestMode();
-    return;
-  }
-  // ⌘⇧N：本次不记录（U10 / R11），一次性。
-  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "n" || ev.key === "N")) {
-    ev.preventDefault();
-    void triggerSkipOnce();
-    return;
-  }
-  if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
-    ev.preventDefault();
-    editNote();
-    return;
-  }
-  if ((ev.metaKey || ev.ctrlKey) && (ev.key === "p" || ev.key === "P")) {
-    ev.preventDefault();
-    void togglePin();
-    return;
-  }
-  // ⌘L：把当前条目移入加密区。
-  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && (ev.key === "l" || ev.key === "L")) {
-    ev.preventDefault();
-    void moveCurrentToVault();
   }
 });
 

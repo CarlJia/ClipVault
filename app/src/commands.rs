@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use clipvault_core::Entry;
@@ -30,6 +31,9 @@ pub struct AppState {
     pub guest_mode: Arc<AtomicBool>,
     pub skip_next: Arc<AtomicBool>,
     pub panel_opacity: Arc<AtomicU32>,
+    pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
+    /// U2：AppHandle，用于 apply_global_hotkey 和 hotkey::register。
+    pub app: tauri::AppHandle,
 }
 
 /// 单条剪贴板记录的前端 DTO。
@@ -563,6 +567,74 @@ pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Resu
     crate::privacy::set_panel_opacity(&state.storage, &state.panel_opacity, opacity)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ----------------------------------------------------------------
+// HotkeyMap（U1）
+// ----------------------------------------------------------------
+
+/// 读取当前快捷键映射（JSON 字符串）。以运行时共享 slot 为准。
+#[tauri::command]
+pub fn get_hotkeys(state: State<'_, AppState>) -> String {
+    let map = state.keymap.read().unwrap();
+    clipvault_core::keymap::serialize(&map)
+}
+
+/// 设置某个 action 的快捷键。
+///
+/// 写路径：
+/// 1. 把 `serde_json::Value` 解析为 `KeyCombo`
+/// 2. 验证：非空 combo（modifier-only 拒绝）、key 存在
+/// 3. 更新 `HotkeyMap` 中对应 action
+/// 4. `persist_hotkeys` 持久化到 `settings` 表
+/// 5. `apply_hotkeys` 更新 in-memory slot
+///
+/// 设置某个 action 的快捷键。
+///
+/// 写路径（**注册先于落库**，U2 code review P0/P1 修复）：
+/// 1. `parse_set_hotkey_args`：action 字符串 + JSON combo → `(action, combo)`；
+///    任一非法值在此直接返回 `Err`，不触碰状态。
+/// 2. 构造新 map（仅内存副本，未生效）。
+/// 3. 若改的是全局热键（`OpenPanel`）：先 `apply_global_hotkey` 注册到 OS。
+///    注册失败（冲突 / 不支持的键）→ 直接返回 `Err`，**库与内存 slot 均未改动**，
+///    用户的旧热键继续可用（这正是 R4 要求的「保持原绑定」）。
+/// 4. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
+#[tauri::command]
+pub async fn set_hotkey(
+    action: String,
+    combo: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use clipvault_core::keymap::HotkeyAction;
+
+    // 1. 解析入参（纯函数，可单测）。
+    let (action, new_combo) = crate::keymap::parse_set_hotkey_args(&action, &combo)?;
+
+    // 2. 构造新 map（内存副本）。
+    let new_map = {
+        let mut map = state.keymap.read().unwrap().clone();
+        map.actions.insert(action, new_combo);
+        map
+    };
+
+    // 3. 全局热键：先注册到 OS，失败即返回，不改任何状态。
+    if action == HotkeyAction::OpenPanel {
+        crate::keymap::apply_global_hotkey(&state.app, &new_map).map_err(|e| e.to_string())?;
+    }
+
+    // 4. 持久化 + 更新内存 slot。
+    //
+    // 若持久化失败而全局热键已在 step 3 注册，则尽力把 OS 侧退回旧 combo，
+    // 避免「热键生效了但库里还是旧值」的不一致。
+    if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &new_map).await {
+        if action == HotkeyAction::OpenPanel {
+            let old_map = state.keymap.read().unwrap().clone();
+            let _ = crate::keymap::apply_global_hotkey(&state.app, &old_map);
+        }
+        return Err(e.to_string());
+    }
+
+    Ok(())
 }
 
 // ----------------------------------------------------------------
