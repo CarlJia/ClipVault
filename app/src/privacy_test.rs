@@ -162,7 +162,7 @@ async fn panel_opacity_default_value() {
     assert_eq!(
         privacy::load_panel_opacity(&storage).await.unwrap(),
         78,
-        "全新库应缺省 78% (与 styles.css --bg 0.78 对齐)"
+        "全新库应缺省 78% (与 styles.css --panel-alpha 0.78 对齐)"
     );
 }
 

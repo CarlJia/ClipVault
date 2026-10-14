@@ -67,7 +67,7 @@ fn main() {
             .unwrap_or(false);
 
             // 2.6 U12：从 settings 表加载持久化的面板透明度到原子，
-            //     使重启后前端启动即把 `--bg` CSS 变量对齐到上次状态。
+            //     使重启后前端启动即把 `--panel-alpha` CSS 变量对齐到上次状态。
             let _initial_opacity = tauri::async_runtime::block_on(
                 clipvault::privacy::boot_load_panel_opacity(&storage, &panel_opacity),
             )

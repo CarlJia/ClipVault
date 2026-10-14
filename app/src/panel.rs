@@ -94,8 +94,10 @@ pub(crate) enum FocusSource {
 /// - 取不到前台进程号（`None`）→ 也取 `Cursor`：鼠标位置通常仍在，这是与 R3
 ///   一致的一档，**不得**因此直接跳到主显示器。
 ///
-/// 不复用 [`crate::pasteback::should_replace_target`]：它的 `None` 语义是
-/// 「视同自己、保留旧目标」，与这里的三态判定不同。
+/// 谓词与 [`crate::pasteback::should_replace_target`] 同形（`Some(pid) if pid != self_pid`），
+/// 但两者表达的是不同的东西：那边的 `false` 混着「是自己是」与「取不到进程号」两种情形
+/// （都要保留旧目标），这里要把它们分成「前台是别的应用」与「取不到」两档、由调用方各自
+/// 处置。摆放判据要能独立演进，故不复用那个谓词。
 pub(crate) fn focused_source(front_pid: Option<i32>, self_pid: i32) -> FocusSource {
     match front_pid {
         Some(pid) if pid != self_pid => FocusSource::Frontmost,
@@ -256,27 +258,24 @@ pub(crate) fn show_panel(app: &AppHandle) {
     let _ = window.set_focus();
 }
 
-/// 按焦点分档解析目标屏并把面板居中过去。macOS 真实实现见 [`imp_macos`]。
+/// 按焦点分档解析目标屏并把面板居中过去。macOS 实现见 [`imp_macos`]，Windows 见 [`imp_win`]。
 ///
-/// 返回本次是否真的改了窗口位置（`false` = 保留原位置）。调用方 [`show_panel`] 不依赖
-/// 这个返回值——定位失败不影响唤出（R3），但保留返回值让「是否定位」可被断言 / 记录。
+/// 定位失败一律内部消化（各自的失败路径留一条 [`log_skip_once`]），调用方 [`show_panel`]
+/// 不关心成败——定位失败不影响唤出（R3）。
 #[cfg(target_os = "macos")]
-fn place_panel(window: &tauri::WebviewWindow) -> bool {
-    imp_macos::place(window)
+fn place_panel(window: &tauri::WebviewWindow) {
+    imp_macos::place(window);
 }
 
-/// Windows：真实实现见 [`imp_win`]（U3 把 U2 的桩替换成基于 `GetForegroundWindow` /
-/// `GetCursorPos` 的适配，判据算术与 macOS 同源）。
+/// Windows：基于 `GetForegroundWindow` / `GetCursorPos` 的适配，判据算术与 macOS 同源。
 #[cfg(target_os = "windows")]
-fn place_panel(window: &tauri::WebviewWindow) -> bool {
-    imp_win::place(window)
+fn place_panel(window: &tauri::WebviewWindow) {
+    imp_win::place(window);
 }
 
 /// 其余平台：不定位，面板留在原位（plan 的 Deferred：Linux 等平台沿用 `#[cfg]` 降级）。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn place_panel(_window: &tauri::WebviewWindow) -> bool {
-    false
-}
+fn place_panel(_window: &tauri::WebviewWindow) {}
 
 /// 按路径去重的调试日志：同一失败路径只在首次打一条，避免每次唤出刷屏。
 ///
@@ -286,11 +285,14 @@ fn place_panel(_window: &tauri::WebviewWindow) -> bool {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn log_skip_once(path: &'static str, detail: &str) {
     static LOGGED: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
-    let mut seen = LOGGED.lock().unwrap();
-    if seen.contains(&path) {
-        return;
+    {
+        let mut seen = LOGGED.lock().unwrap();
+        if seen.contains(&path) {
+            return;
+        }
+        seen.push(path);
     }
-    seen.push(path);
+    // 先放锁再写 stderr：日志路径不值得让别的线程等 I/O。
     eprintln!("clipvault: 面板定位跳过（{path}）：{detail}");
 }
 
@@ -332,14 +334,19 @@ mod imp_macos {
         Point { x: p.x, y: p.y }
     }
 
-    /// 由 `NSScreen.screens` 构造显示器列表：`frame` 供选屏、`visibleFrame` 供落位。
+    /// 由一块 `NSScreen` 构造 [`Display`]：`frame` 供选屏、`visibleFrame` 供落位。
+    fn display_of(screen: &NSScreen) -> Display {
+        Display {
+            bounds: rect_of(screen.frame()),
+            work: rect_of(screen.visibleFrame()),
+        }
+    }
+
+    /// 由 `NSScreen.screens` 构造显示器列表。
     fn displays(mtm: MainThreadMarker) -> Vec<Display> {
         NSScreen::screens(mtm)
             .iter()
-            .map(|screen| Display {
-                bounds: rect_of(screen.frame()),
-                work: rect_of(screen.visibleFrame()),
-            })
+            .map(|screen| display_of(&screen))
             .collect()
     }
 
@@ -368,38 +375,34 @@ mod imp_macos {
         match select_display(focused, cursor, displays) {
             Some(i) => displays.get(i).copied(),
             None => NSScreen::mainScreen(mtm)
-                .map(|screen| Display {
-                    bounds: rect_of(screen.frame()),
-                    work: rect_of(screen.visibleFrame()),
-                })
+                .map(|screen| display_of(&screen))
                 .or_else(|| displays.first().copied()),
         }
     }
 
-    /// 定位并在主线程上同步生效。返回本次是否真的改了位置。
-    pub(super) fn place(window: &tauri::WebviewWindow) -> bool {
+    /// 定位并在主线程上同步生效。
+    pub(super) fn place(window: &tauri::WebviewWindow) {
         // `NSScreen.mainScreen` / `screens` 需要 `MainThreadMarker`（KTD3）；三条唤出路径
         // （Carbon 回调、托盘菜单、托盘左键）本来就在主线程，这里只是显式校验。
         let Some(mtm) = MainThreadMarker::new() else {
             log_skip_once("not-main-thread", "不在主线程，保留面板原位置");
-            return false;
+            return;
         };
         let screens = displays(mtm);
         let Some(display) = pick_display(mtm, &screens) else {
             log_skip_once("no-screen", "取不到任何显示器，保留面板原位置");
-            return false;
+            return;
         };
         let offset = centered_offset(display.work, PANEL_SIZE);
         let (x, y) = appkit_frame_origin(offset, display.work, PANEL_SIZE);
 
         let Some(ns) = ns_window(window) else {
             log_skip_once("no-ns-window", "取不到 NSWindow，保留面板原位置");
-            return false;
+            return;
         };
         // `show()` 在主线程上是同步的；直接在 `show()` 之前同步落位，避免 tao 的
         // `set_outer_position` 走 `dispatch_async` 造成「先画旧位置一帧」（KTD3）。
         ns.setFrameTopLeftPoint(NSPoint::new(x, y));
-        true
     }
 }
 
@@ -508,15 +511,13 @@ mod imp_win {
         }
     }
 
-    /// 定位面板并在目标工作区内居中。返回本次是否真的改了位置。
-    pub(super) fn place(window: &tauri::WebviewWindow) -> bool {
-        let Ok(monitors) = window.available_monitors() else {
-            log_skip_once("no-monitors", "取不到显示器列表，保留面板原位置");
-            return false;
-        };
+    /// 定位面板并在目标工作区内居中。
+    pub(super) fn place(window: &tauri::WebviewWindow) {
+        // 取不到显示器列表与列表为空走同一条降级路径，故一并判定。
+        let monitors = window.available_monitors().unwrap_or_default();
         if monitors.is_empty() {
             log_skip_once("no-monitors", "取不到显示器列表，保留面板原位置");
-            return false;
+            return;
         }
         let displays: Vec<Display> = monitors.iter().map(display_of).collect();
 
@@ -549,7 +550,7 @@ mod imp_win {
         };
         let Some((scale, work)) = target else {
             log_skip_once("no-display", "解析不出目标显示器，保留面板原位置");
-            return false;
+            return;
         };
 
         // 面板逻辑尺寸按目标屏 `scale_factor` 换算成物理像素（Windows 全程物理像素）。
@@ -562,9 +563,7 @@ mod imp_win {
 
         if window.set_position(PhysicalPosition::new(x, y)).is_err() {
             log_skip_once("set-position-failed", "set_position 失败，保留面板原位置");
-            return false;
         }
-        true
     }
 }
 

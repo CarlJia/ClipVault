@@ -31,7 +31,7 @@ pub const GUEST_MODE_KEY: &str = "guest_mode";
 /// 面板透明度在 `settings` 表中的键名（U12）。
 pub const PANEL_OPACITY_KEY: &str = "panel_opacity";
 
-/// 面板透明度默认值，与前端 `styles.css` `--bg` 默认 0.78 对齐。
+/// 面板透明度默认值，与前端 `styles.css` 的 `--panel-alpha` 默认 0.78（`--bg` 由它派生）对齐。
 pub const DEFAULT_PANEL_OPACITY: u32 = 78;
 
 /// 面板透明度下限。再低就几乎看不清内容，slider 范围与后端 clamp 都卡到这里。
@@ -101,7 +101,7 @@ pub fn set_skip_next(flag: &AtomicBool) {
 //
 // 与访客模式同形：单一事实来源 = 共享 `Arc<AtomicU32>`；`settings` 表只做
 // 持久化层。`AtomicU32` 选用 `0..=100` 整数百分比，与前端 slider 同域，省去
-// 浮点转换；CSS 应用处再换算 `v / 100` 写入 `--bg` 变量。
+// 浮点转换；CSS 应用处再换算 `v / 100` 写入 `--panel-alpha` 变量。
 //
 // 不与 watcher 共享——opacity 是纯 UI 状态，没人消费它，仅作
 // `get_panel_opacity` / `set_panel_opacity` 命令的快速读写槽。
@@ -152,7 +152,7 @@ pub async fn set_panel_opacity(
 }
 
 /// 启动路径：从 `settings` 表加载面板透明度 → 写入共享原子 → 返回该值
-/// （供启动后前端一次性对齐 `--bg` CSS 变量）。在 spawn watcher 前调用。
+/// （供启动后前端一次性对齐 `--panel-alpha` CSS 变量）。在 spawn watcher 前调用。
 pub async fn boot_load_panel_opacity(storage: &Storage, flag: &AtomicU32) -> SqliteResult<u32> {
     let opacity = load_panel_opacity(storage).await?;
     apply_panel_opacity(flag, opacity);
