@@ -41,6 +41,11 @@ export function isWindows(): boolean {
   return os === "windows";
 }
 
+/** 当前是否 Linux。 */
+export function isLinux(): boolean {
+  return os === "linux";
+}
+
 /** 修饰键/按键符号 → Windows 写法的映射。 */
 const KEY_LABELS: ReadonlyArray<readonly [string, string]> = [
   ["⌘", "Ctrl+"],

@@ -36,6 +36,7 @@ import {
   moveToVault,
   refreshAccessibilityBanner,
   refreshKeychainBanner,
+  renderHotkeysSection,
   setGuestMode,
   setPanelOpacity,
   skipNextCopy,
@@ -563,6 +564,8 @@ async function openSettings(): Promise<void> {
   opacityEl.value = String(v);
   opacityValueEl.textContent = `${v}%`;
   settingsEl.classList.remove("hidden");
+  // 渲染快捷键区块（U4）
+  void renderHotkeysSection();
   // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。
   searchEl.focus();
 }

@@ -794,6 +794,93 @@ body {
   cursor: pointer;
   border: none;
 }
-.slider:focus::-webkit-slider-thumb {
-  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+/* ---------------------------------------------------------------- */
+/* 快捷键设置区块（U4）                                              */
+/* ---------------------------------------------------------------- */
+
+.settings-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-section-title {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.hotkey-group {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hotkey-group-title {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+}
+
+.hotkey-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.hotkey-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.hotkey-row-label {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text);
+  min-width: 140px;
+}
+
+.hotkey-row-combo {
+  min-width: 80px;
+  text-align: center;
+}
+
+.hotkey-row-combo kbd {
+  display: inline-block;
+  padding: 1px 6px;
+  border: 1px solid rgba(10, 132, 255, 0.32);
+  border-radius: 4px;
+  background: rgba(10, 132, 255, 0.14);
+  color: #7ab8ff;
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.hotkey-row.recording .hotkey-row-combo kbd {
+  animation: hotkey-recording 1s ease-in-out infinite alternate;
+}
+
+@keyframes hotkey-recording {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.hotkey-rebind {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.hotkey-rebind:hover {
+  background: var(--surface-hover);
 }

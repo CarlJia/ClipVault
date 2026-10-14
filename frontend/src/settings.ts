@@ -6,7 +6,14 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { WARN_SVG, type EntryDto } from "./panel";
-import { isWindows, keys, whenPlatformReady } from "./platform";
+import { isWindows, isLinux, keys, whenPlatformReady } from "./platform";
+import {
+  localizedCombo,
+  parseKeyCombo,
+  reloadKeymap,
+  setHotkey,
+  type HotkeyAction,
+} from "./keymap";
 
 /** `paste_entry` 的返回体：区分回贴成功分支与对应固定 toast 文案。 */
 export interface PasteResult {
@@ -232,6 +239,214 @@ export async function setPanelOpacity(v: number): Promise<number> {
     return await invoke<number>("set_panel_opacity", { opacity: v });
   } catch {
     return -1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 快捷键设置区块（U4）
+// ---------------------------------------------------------------------------
+
+/** Toast 提示（复用 index.html 的 #toast 元素）。 */
+function showToast(msg: string): void {
+  const toastEl = document.getElementById("toast");
+  if (!toastEl) return;
+  toastEl.textContent = msg;
+  toastEl.classList.remove("hidden");
+  if ((toastEl as HTMLElement & { _timer?: number })._timer !== undefined) {
+    window.clearTimeout((toastEl as HTMLElement & { _timer: number })._timer);
+  }
+  const timer = window.setTimeout(() => {
+    toastEl.classList.add("hidden");
+  }, 2500);
+  (toastEl as HTMLElement & { _timer?: number })._timer = timer;
+}
+
+/** action → 中文标签 */
+const ACTION_LABELS: Record<HotkeyAction, string> = {
+  open_panel: "唤出主面板",
+  paste: "粘贴选中条目",
+  edit_note: "编辑备注 / 标签",
+  toggle_pin: "切换置顶",
+  move_to_vault: "移入加密区",
+  open_url: "在浏览器打开 URL",
+  open_vault: "打开加密区管理",
+  toggle_guest_mode: "切换访客模式",
+  skip_once: "本次不记录",
+  open_settings: "打开设置",
+  close: "关闭面板",
+  move_up: "上移选中",
+  move_down: "下移选中",
+};
+
+// 分组定义
+const GLOBAL_ACTIONS: HotkeyAction[] = ["open_panel"];
+const PANEL_ACTIONS: HotkeyAction[] = [
+  "paste",
+  "edit_note",
+  "toggle_pin",
+  "move_to_vault",
+  "open_url",
+  "open_vault",
+  "toggle_guest_mode",
+  "skip_once",
+  "open_settings",
+  "close",
+  "move_up",
+  "move_down",
+];
+
+/** 当前录制态；null 表示未在录制。 */
+let recordingAction: HotkeyAction | null = null;
+/** 当前录制态的 keydown 监听器清理函数。 */
+let recordingCleanup: (() => void) | null = null;
+
+/**
+ * 开始录制指定 action 的新快捷键。
+ * - 全局 keydown 监听持续有效直到 capture 或 cancel。
+ * - Escape 或再次点击「取消」退出录制。
+ * - 有效按键 parseKeyCombo 后调用 setHotkey IPC。
+ */
+function startRecording(action: HotkeyAction): void {
+  cancelRecording(); // 确保没有残留监听
+
+  recordingAction = action;
+  const row = document.querySelector<HTMLElement>(`[data-action="${action}"]`);
+  if (row) row.classList.add("recording");
+  const kbd = row?.querySelector<HTMLElement>(".hotkey-row-combo kbd");
+  if (kbd) kbd.textContent = "请按新键…";
+
+  const btn = row?.querySelector<HTMLButtonElement>(".hotkey-rebind");
+  if (btn) btn.textContent = "取消";
+
+  const onKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      cancelRecording();
+      return;
+    }
+
+    // 忽略纯修饰键
+    if (
+      (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey) &&
+      ["Meta", "Control", "Shift", "Alt"].includes(ev.key)
+    ) {
+      return;
+    }
+
+    ev.preventDefault();
+    ev.stopPropagation();
+
+    const combo = parseKeyCombo(ev);
+    if (!combo) return;
+
+    void (async () => {
+      const result = await setHotkey(action, combo);
+      cancelRecording();
+      if (!result.ok) {
+        showToast(`重绑失败：${result.err}，已回退到原绑定`);
+        return;
+      }
+      // 刷新前端 in-memory keymap
+      await reloadKeymap();
+      // 刷新本行显示
+      refreshRow(action);
+    })();
+  };
+
+  document.addEventListener("keydown", onKeyDown, { capture: true });
+  recordingCleanup = () => document.removeEventListener("keydown", onKeyDown, { capture: true });
+}
+
+/** 取消当前录制态，清理监听器，恢复 UI。 */
+function cancelRecording(): void {
+  if (recordingCleanup) {
+    recordingCleanup();
+    recordingCleanup = null;
+  }
+  if (recordingAction !== null) {
+    const row = document.querySelector<HTMLElement>(`[data-action="${recordingAction}"]`);
+    if (row) row.classList.remove("recording");
+    const btn = row?.querySelector<HTMLButtonElement>(".hotkey-rebind");
+    if (btn) btn.textContent = "重绑";
+    recordingAction = null;
+  }
+}
+
+/** 刷新单行 combo 显示（从 keymap 最新状态）。 */
+async function refreshRow(action: HotkeyAction): Promise<void> {
+  const mod = await import("./keymap");
+  const combo = mod.currentKeyMap?.actions[action];
+  if (!combo) return;
+  const row = document.querySelector<HTMLElement>(`[data-action="${action}"]`);
+  if (!row) return;
+  const kbd = row.querySelector<HTMLElement>(".hotkey-row-combo kbd");
+  if (kbd) kbd.textContent = mod.localizedCombo(combo);
+}
+
+/**
+ * 渲染快捷键设置区块。
+ * 在 openSettings() 末尾调用；Linux 上隐藏全局热键组。
+ */
+export async function renderHotkeysSection(): Promise<void> {
+  await whenPlatformReady();
+
+  const globalGroup = document.getElementById("hotkey-group-global");
+  const globalList = document.getElementById("hotkey-list-global");
+  const panelList = document.getElementById("hotkey-list-panel");
+
+  if (!globalList || !panelList) return;
+
+  // Linux 隐藏全局热键组
+  if (globalGroup) {
+    globalGroup.classList.toggle("hidden", isLinux());
+  }
+
+  // 等待 keymap 就绪（最多轮询 1s）
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  let km: any = null;
+  await new Promise<void>((resolve) => {
+    let attempts = 0;
+    const iv = setInterval(async () => {
+      const mod = await import("./keymap");
+      km = mod;
+      if (mod.currentKeyMap || attempts >= 20) {
+        clearInterval(iv);
+        resolve();
+      }
+      attempts++;
+    }, 50);
+  });
+
+  const comboMap = km?.currentKeyMap?.actions;
+
+  function renderRow(action: HotkeyAction): string {
+    const combo = comboMap?.[action];
+    const comboText = combo ? localizedCombo(combo) : "—";
+    return `<li class="hotkey-row" data-action="${action}">
+  <span class="hotkey-row-label">${ACTION_LABELS[action]}</span>
+  <span class="hotkey-row-combo"><kbd>${comboText}</kbd></span>
+  <button class="hotkey-rebind">重绑</button>
+</li>`;
+  }
+
+  globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
+  panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");
+
+  // 绑定重绑按钮
+  for (const list of [globalList, panelList]) {
+    for (const btn of list.querySelectorAll<HTMLButtonElement>(".hotkey-rebind")) {
+      btn.addEventListener("click", () => {
+        const row = btn.closest<HTMLElement>(".hotkey-row");
+        const action = row?.dataset.action as HotkeyAction | undefined;
+        if (!action) return;
+        if (recordingAction === action) {
+          cancelRecording();
+        } else {
+          startRecording(action);
+        }
+      });
+    }
   }
 }
 

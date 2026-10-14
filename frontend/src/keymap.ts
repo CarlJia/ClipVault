@@ -9,6 +9,7 @@
 // - handleVaultKey(ev)  加密区模态内 keydown（保留原有逻辑）
 
 import { invoke } from "@tauri-apps/api/core";
+import { keys } from "./platform";
 
 // ---------------------------------------------------------------------------
 // TS 类型 —— 与 clipvault_core::keymap 一一对应
@@ -53,7 +54,7 @@ export interface HotkeyMap {
 // ---------------------------------------------------------------------------
 
 // 启动时为空；loadKeymap() / reloadKeymap() 填充后生效。
-let currentKeyMap: HotkeyMap | null = null;
+export let currentKeyMap: HotkeyMap | null = null;
 
 // ---------------------------------------------------------------------------
 // parseKeyCombo — 从 KeyboardEvent 反向构建 KeyCombo
@@ -208,6 +209,97 @@ export async function loadKeymap(): Promise<void> {
  */
 export async function reloadKeymap(): Promise<void> {
   await loadKeymap();
+}
+
+// ---------------------------------------------------------------------------
+// setHotkey — IPC 写 + 返回 discriminated union（U4）
+// ---------------------------------------------------------------------------
+
+/** 将 KeyCombo 序列化为后端 set_hotkey 期望的 JSON 结构。 */
+function serializeComboForBackend(combo: KeyCombo): { mods: string[]; key: string | null } {
+  const key = (() => {
+    switch (combo.key.kind) {
+      case "char":
+        return combo.key.ch;
+      case "enter":
+        return "enter";
+      case "escape":
+        return "escape";
+      case "arrow_up":
+        return "arrow_up";
+      case "arrow_down":
+        return "arrow_down";
+      case "comma":
+        return "comma";
+    }
+  })();
+  return { mods: combo.mods as string[], key };
+}
+
+/**
+ * 调用 set_hotkey IPC。
+ * 返回 { ok: true } | { ok: false, err: string }。
+ */
+export async function setHotkey(
+  action: HotkeyAction,
+  combo: KeyCombo,
+): Promise<{ ok: true } | { ok: false; err: string }> {
+  try {
+    await invoke("set_hotkey", {
+      action,
+      combo: serializeComboForBackend(combo),
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, err: String(err) };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// localizedCombo — 用于 <kbd> 显示（U4）
+// ---------------------------------------------------------------------------
+
+/**
+ * 将 KeyCombo 渲染为平台化的按键说明字符串（如 `⌘+Shift+E` / `Ctrl+Shift+E`）。
+ * 先用 Mac 字形构建，再过 `keys()` 做 Windows 替换。
+ */
+export function localizedCombo(combo: KeyCombo): string {
+  const modStr =
+    combo.mods.length === 0
+      ? ""
+      : combo.mods
+          .map((m) => {
+            switch (m) {
+              case "meta":
+                return "⌘";
+              case "shift":
+                return "⇧";
+              case "alt":
+                return "⌥";
+              case "ctrl":
+                return "⌃";
+            }
+          })
+          .join("+") + "+";
+
+  const keyStr = (() => {
+    switch (combo.key.kind) {
+      case "char":
+        return combo.key.ch.toUpperCase();
+      case "enter":
+        return "↩";
+      case "escape":
+        return "esc";
+      case "arrow_up":
+        return "↑";
+      case "arrow_down":
+        return "↓";
+      case "comma":
+        return ",";
+    }
+  })();
+
+  return keys(modStr + keyStr);
 }
 
 // ---------------------------------------------------------------------------
