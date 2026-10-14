@@ -35,8 +35,9 @@ ClipVault 是 **macOS / Windows 双平台**的剪贴板管理器：Tauri 2.x 单
 - `app/` — Tauri 主 binary（storage / watcher / search / notes / pin / pasteback / crypto / privacy / commands）。
 - `frontend/` — WebView 静态资源（vanilla TS + Vite）。
 - `packaging/` — macOS：`codesign.sh`（ad-hoc 签名）、`dmg.sh`（DMG）、`build.sh`（按架构编排
-  `arm64` / `x64`）；Windows：`build-windows.ps1`（NSIS 安装包）；`make_icons.py`（生成应用图标、
-  ICO 与 Windows 托盘图标，纯 stdlib，无 PIL 依赖）。
+  `arm64` / `x64`）；Windows：`build-windows.ps1`（NSIS 安装包）；`make_icons.py`（从
+  `icon-source.png` 生成 `app/icons/` 下全部图标，纯 stdlib，无 PIL 依赖、不依赖 macOS，
+  改图标只改源图后重跑：`python3 packaging/make_icons.py`）。
 - `docs/plans/` — 权威 plan。
 
 ## 常用命令
