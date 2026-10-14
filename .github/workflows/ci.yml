@@ -1,0 +1,134 @@
+name: CI
+
+# 触发：
+#   - 每个 PR（含后续同步提交）：跑编译 / lint / 测试这条快线，把「能不能合」在合并前
+#     就验完。
+#   - 手动（Actions → CI → Run workflow）。
+#
+# 与 package.yml 的分工：那边只在推 `v*` tag（或手动）时做**打包**（DMG / NSIS / Release），
+# 这边只在 PR 上做**校验**，不做打包、不装 tauri-cli、不碰任何产物。两者触发条件互不重叠，
+# 所以一次 tag 推送不会同时跑两遍同样的 clippy + test。
+#
+# 为什么 PR 上也要跑 Windows：本地开发机是 macOS，`cfg(target_os = "windows")` 的分支
+# 在那里**根本不会被编译**，Windows 目标的整树编译与 lint 只有 CI 能验。这条在改到
+# 平台分支时是硬需求（见 AGENTS.md）。
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# 同一个 PR 连推多次时，取消上一次还没跑完的运行 —— 旧 head 的结果已经没有意义，
+# 让出 runner 额度给最新那次。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  macos:
+    name: macOS（fmt / clippy / test / 前端）
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 只缓存 crates.io 索引与源码。**刻意不缓存 target/**：debug 产物在本地是 GB 量级，
+      # 塞进仓库 10GB 的缓存额度会把其它条目挤掉，而它省下的只是这一条快线上的几分钟编译
+      # —— 净收益不划算（package.yml 的 windows job 对同一取舍有更长的说明）。
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      # runner 上预装了 rustup/rustc，但仍显式安装一次：CI 的可复现性不该依赖 runner
+      # 镜像的默认值。fmt 与 clippy 都由 profile minimal 之外单独指定。
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt
+          rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # cargo 的 build.rs（tauri-build）要求 tauri.conf.json 的 frontendDist 目录存在，
+      # 所以下面任何 cargo 命令之前都必须先有 frontend/dist。
+      - name: 构建前端（cargo 的 build.rs 需要 frontendDist 存在）
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
+      - name: 格式（rustfmt）
+        run: cargo fmt --all -- --check
+
+      - name: lint（clippy，警告即失败）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（cargo test --workspace）
+        run: cargo test --workspace
+
+      - name: 前端单测（vitest）
+        run: npm --prefix frontend test
+
+      # R13：默认离线、不联网。两条审计命令是 AGENTS.md「关键约束」里写死的那两条，
+      # 这里原样跑一遍，让「引入 reqwest/hyper 或裸 socket」在 PR 阶段就红。
+      - name: 网络出口审计（R13）
+        run: |
+          set -euo pipefail
+          if cargo tree | grep -Eq 'reqwest|hyper'; then
+            echo "错误：依赖树里出现了 reqwest / hyper（R13 禁止对外网络出口）" >&2
+            exit 1
+          fi
+          if grep -rE 'reqwest::|hyper::|TcpStream|std::net::' app/src clipvault-core/src; then
+            echo "错误：源码里出现了网络调用（R13 禁止对外网络出口）" >&2
+            exit 1
+          fi
+
+  windows:
+    name: Windows（clippy / test）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 与 macos job 同理：只缓存 registry，不缓存 target/debug（见那边的注释）。
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 构建前端（cargo 的 build.rs 需要 frontendDist 存在）
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
+      # 这两步是这个 job 存在的主要理由：Windows 目标的整树编译与 lint 在 macOS 开发机上
+      # 无法验证（cfg 分支不参与编译）。
+      - name: clippy（Windows 目标）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（Windows 目标）
+        run: cargo test --workspace

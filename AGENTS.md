@@ -106,9 +106,10 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 168 passed + core 27 passed（合计 195），1 个 trigram 测试 ignored
+- **测试基线**：app 177 passed + core 27 passed（合计 204），1 个 trigram 测试 ignored
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 目标的整树编译与 lint 只能在 CI 上验证**：本地开发机是 macOS，
-  `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/package.yml` 的
-  `windows` job 跑 `clippy -D warnings` + `cargo test` + NSIS 打包；改动涉及 Windows 分支时
-  务必推上去跑一次，别只看本机绿。
+  `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/ci.yml` 在**每个 PR**
+  上跑（macOS：fmt / clippy / `cargo test` / 前端构建 + vitest / R13 网络出口审计；Windows：
+  clippy + `cargo test`），所以涉及 Windows 分支的改动提 PR 即自动验证。`.github/workflows/
+  package.yml` 只在推 `v*` tag 或手动触发时做打包（DMG / NSIS / Release），不做校验。
