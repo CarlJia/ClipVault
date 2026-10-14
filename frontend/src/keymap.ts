@@ -9,11 +9,18 @@
 // - handleVaultKey(ev)  加密区模态内 keydown（保留原有逻辑）
 
 import { invoke } from "@tauri-apps/api/core";
-import { keys } from "./platform";
+import { isWindows, keys } from "./platform";
 
 // ---------------------------------------------------------------------------
 // TS 类型 —— 与 clipvault_core::keymap 一一对应
 // ---------------------------------------------------------------------------
+//
+// **两套表示，别混用**：
+// - 线格式（`Wire*`）：`get_hotkeys` / `set_hotkey` 走的 JSON，`key` 是**字符串**
+//   （`"e"` / `"enter"` / `"arrow_up"` …），由 `clipvault_core::keymap::serialize` 产出。
+// - 内部表示（`Key` / `KeyCombo`）：`key` 是带标签的联合类型，`matches` /
+//   `localizedCombo` / 录制态都用它。
+// 两者只在 `loadKeymap` / `serializeComboForBackend` 两个边界上转换。
 
 export type Mod = "meta" | "shift" | "alt" | "ctrl";
 
@@ -28,6 +35,24 @@ export type Key =
 export interface KeyCombo {
   mods: Mod[];
   key: Key;
+}
+
+/** 线格式 combo：`key` 为字符串（见上）。 */
+interface WireCombo {
+  mods: Mod[];
+  key: string;
+}
+
+/**
+ * 线格式 HotkeyMap：`actions` 按 action 字符串索引。
+ *
+ * 未知 action 会被原样保留（`dispatchHotkeyAction` 的 switch 没有对应 case，
+ * 派发时静默跳过）—— 「未知 action 丢 silently」是后端 `clipvault_core::keymap::parse`
+ * 的行为，前端这一层只做表示转换，不做过滤。
+ */
+interface WireHotkeyMap {
+  version: number;
+  actions: Record<string, WireCombo>;
 }
 
 export type HotkeyAction =
@@ -62,6 +87,30 @@ export let currentKeyMap: HotkeyMap | null = null;
 // ---------------------------------------------------------------------------
 
 /**
+ * 把 KeyboardEvent 的修饰键解析成四个平台无关的布尔。
+ *
+ * **平台主修饰键**：macOS 是 Cmd(meta)、Windows 是 Ctrl，所以「Ctrl ≡ meta」的
+ * 等价规则只在 Windows 上成立；macOS 的 Control 是独立修饰键（plan AE1 的 ⌃⌥L，
+ * 无条件合并会把 ⌃⌥L 记成 ⌘⌥⌃L）。
+ *
+ * `parseKeyCombo`（录制）与 `comboMatches`（匹配）必须走同一个函数 —— 两处各写一份
+ * 就会「录出来的」和「能触发的」对不上，这正是本次修复要关掉的那类失效。
+ */
+function eventMods(ev: KeyboardEvent): {
+  meta: boolean;
+  shift: boolean;
+  alt: boolean;
+  ctrl: boolean;
+} {
+  return {
+    meta: ev.metaKey || (isWindows() && ev.ctrlKey),
+    shift: ev.shiftKey,
+    alt: ev.altKey,
+    ctrl: ev.ctrlKey && !ev.metaKey,
+  };
+}
+
+/**
  * 把 KeyboardEvent 解析为 KeyCombo。
  * - modifier-only（Meta/Control/Shift/Alt）→ 返回 null（拒绝）。
  * - 其余情况返回 { mods, key }。
@@ -75,22 +124,58 @@ export function parseKeyCombo(ev: KeyboardEvent): KeyCombo | null {
     return null;
   }
 
+  const m = eventMods(ev);
   const mods: Mod[] = [];
-  // cross-platform 规则：meta = Mac Cmd 或 Win Ctrl
-  if (ev.metaKey || ev.ctrlKey) mods.push("meta");
-  if (ev.shiftKey) mods.push("shift");
-  if (ev.altKey) mods.push("alt");
-  // 仅 Win Ctrl（不含 Mac meta）的场景：add "ctrl" separately so the list has both
-  // when ev.ctrlKey && !ev.metaKey — needed when user binds "Ctrl+X" explicitly
-  if (ev.ctrlKey && !ev.metaKey) mods.push("ctrl");
+  if (m.meta) mods.push("meta");
+  if (m.shift) mods.push("shift");
+  if (m.alt) mods.push("alt");
+  if (m.ctrl) mods.push("ctrl");
 
-  const key = parseKeyKind(ev.key);
+  const key = keyFromEvent(ev);
   if (!key) return null; // 不认识的键
 
   return { mods, key };
 }
 
-function parseKeyKind(key: string): Key | null {
+/**
+ * KeyboardEvent → 内部 `Key`（匹配与录制共用同一条判定）。
+ *
+ * **优先 `ev.code`（物理键）而不是 `ev.key`**：macOS 上按住 Option 会把 `ev.key`
+ * 换成组合字符（⌥V→`√`、⌥X→`≈`、⌥,→`≤`），只有 `code` 还是那把物理键。读 `ev.key`
+ * 会让含 Alt 的绑定两头都坏 —— 匹配不上（`keyMatches` 拿 `√` 去比 `v`），录制也录不出
+ * （组合字符是多字节，后端 `CharKind::from_json_str` 按**字节**长度校验，直接判非法键，
+ * 实测 `set_hotkey` 返回 `unrecognised key '≈'`）。
+ *
+ * `code` 缺失或不认识（合成事件 / 非常规键位）时回落 `ev.key`，行为与修复前一致。
+ */
+function keyFromEvent(ev: KeyboardEvent): Key | null {
+  switch (ev.code) {
+    case "Enter":
+    case "NumpadEnter":
+      return { kind: "enter" };
+    case "Escape":
+      return { kind: "escape" };
+    case "ArrowUp":
+      return { kind: "arrow_up" };
+    case "ArrowDown":
+      return { kind: "arrow_down" };
+    case "Comma":
+      return { kind: "comma" };
+    default:
+      break;
+  }
+  // KeyV → v，Digit5 → 5（`code` 与键盘布局无关，也与修饰键无关）。
+  if (ev.code.startsWith("Key") && ev.code.length === 4) {
+    return { kind: "char", ch: ev.code.slice(3).toLowerCase() };
+  }
+  if (ev.code.startsWith("Digit") && ev.code.length === 6) {
+    return { kind: "char", ch: ev.code.slice(5) };
+  }
+  return keyFromKeyString(ev.key);
+}
+
+/** `code` 认不出时的回落：按 `ev.key` 字面量判定。 */
+function keyFromKeyString(key: string): Key | null {
   switch (key) {
     case "Enter":
       return { kind: "enter" };
@@ -103,9 +188,13 @@ function parseKeyKind(key: string): Key | null {
     case ",":
       return { kind: "comma" };
     default:
-      if (key.length === 1) return { kind: "char", ch: key.toLowerCase() };
-      return null;
+      return key.length === 1 ? { kind: "char", ch: key.toLowerCase() } : null;
   }
+}
+
+/** `Key` 的可比较 token：字符键看字符，命名键看 kind。 */
+function keyToken(key: Key): string {
+  return key.kind === "char" ? `char:${key.ch}` : key.kind;
 }
 
 // ---------------------------------------------------------------------------
@@ -114,15 +203,13 @@ function parseKeyKind(key: string): Key | null {
 
 /**
  * 检查一个 KeyboardEvent 是否匹配给定的 KeyCombo。
- * - mods：event 必须有 ALL listed mods，且不能有额外的 mods（但 meta||ctrl cross-platform 规则除外）。
- * - key：按 CharKind 分类匹配。
+ * - mods：event 必须有 ALL listed mods，且不能有额外的 mods（Windows 下 `metaKey ||
+ *   ctrlKey` 的等价规则除外）。
+ * - key：经 [`keyFromEvent`]（物理键 `code` 优先）判定。
  */
 function comboMatches(combo: KeyCombo, ev: KeyboardEvent): boolean {
-  // Modifiers
-  const evMeta = ev.metaKey || ev.ctrlKey; // cross-platform: Win Ctrl 当 Mac Cmd
-  const evCtrl = ev.ctrlKey && !ev.metaKey; // 仅 Win Ctrl（不含 Win Meta）
-  const evShift = ev.shiftKey;
-  const evAlt = ev.altKey;
+  // Modifiers。与 parseKeyCombo 共用 eventMods，保证「录出来的」与「能匹配的」一致。
+  const { meta: evMeta, ctrl: evCtrl, shift: evShift, alt: evAlt } = eventMods(ev);
 
   const wantMeta = combo.mods.includes("meta");
   const wantShift = combo.mods.includes("shift");
@@ -151,24 +238,13 @@ function comboMatches(combo: KeyCombo, ev: KeyboardEvent): boolean {
   }
 
   // Key
-  return keyMatches(combo.key, ev.key);
+  return keyMatches(combo.key, ev);
 }
 
-function keyMatches(key: Key, evKey: string): boolean {
-  switch (key.kind) {
-    case "char":
-      return evKey === key.ch || evKey === key.ch.toUpperCase();
-    case "enter":
-      return evKey === "Enter";
-    case "escape":
-      return evKey === "Escape";
-    case "arrow_up":
-      return evKey === "ArrowUp";
-    case "arrow_down":
-      return evKey === "ArrowDown";
-    case "comma":
-      return evKey === ",";
-  }
+/** 与 [`keyFromEvent`] 同一条判定 —— 录制得到的键与能被触发的键必须是同一套解释。 */
+function keyMatches(key: Key, ev: KeyboardEvent): boolean {
+  const got = keyFromEvent(ev);
+  return got !== null && keyToken(got) === keyToken(key);
 }
 
 /**
@@ -187,6 +263,57 @@ export function matches(ev: KeyboardEvent): HotkeyAction | null {
 }
 
 // ---------------------------------------------------------------------------
+// 线格式 → 内部表示（IPC 边界）
+// ---------------------------------------------------------------------------
+
+/**
+ * 命名键的线格式 token 集合。
+ *
+ * `clipvault_core::keymap::CharKind` 序列化出来的 token **与内部 `kind` 同名**，
+ * 所以这一张表同时是「线格式 → 内部」的识别集合与「内部 → 线格式」的写法来源：
+ * 新增命名键时改这里一处，两个方向同时生效（否则两个方向会各维护一份 switch，
+ * 迟早只改一边 —— 那正是本次修复要关掉的那类失效）。
+ */
+const NAMED_KEY_KINDS = ["enter", "escape", "arrow_up", "arrow_down", "comma"] as const;
+
+function isNamedKeyKind(raw: string): raw is (typeof NAMED_KEY_KINDS)[number] {
+  return (NAMED_KEY_KINDS as readonly string[]).includes(raw);
+}
+
+/**
+ * 线格式的 `key` 字符串 → 内部 `Key`。
+ *
+ * 命名键按 [`NAMED_KEY_KINDS`] 识别；其余一律当单字符处理（不校验长度，与后端
+ * `serialize` 的实际产出 —— 命名键或单字符 —— 一致）。
+ */
+function keyFromWire(raw: string): Key {
+  return isNamedKeyKind(raw) ? { kind: raw } : { kind: "char", ch: raw.toLowerCase() };
+}
+
+/** 内部 `Key` → 线格式的 `key` 字符串（[`keyFromWire`] 的逆，共用同一张表）。 */
+function keyToWire(key: Key): string {
+  return key.kind === "char" ? key.ch : key.kind;
+}
+
+/**
+ * 线格式 HotkeyMap → 内部 HotkeyMap。
+ *
+ * **不要**退回 `JSON.parse(json) as HotkeyMap` 的裸断言：线格式的 `key` 是字符串、
+ * 内部是带标签的 `Key`，断言只是把差异藏进类型系统，运行时 `key.kind` 恒为
+ * undefined —— 所有快捷键静默失效、设置行显示 `⌘+undefined`。
+ */
+function keyMapFromWire(wire: WireHotkeyMap): HotkeyMap {
+  const actions = {} as Record<HotkeyAction, KeyCombo>;
+  for (const [action, combo] of Object.entries(wire.actions)) {
+    actions[action as HotkeyAction] = {
+      mods: combo.mods,
+      key: keyFromWire(combo.key),
+    };
+  }
+  return { actions };
+}
+
+// ---------------------------------------------------------------------------
 // loadKeymap / reloadKeymap — IPC 拉取
 // ---------------------------------------------------------------------------
 
@@ -196,9 +323,9 @@ export function matches(ev: KeyboardEvent): HotkeyAction | null {
  */
 export async function loadKeymap(): Promise<void> {
   try {
-    // get_hotkeys 返回 JSON 字符串
+    // get_hotkeys 返回线格式 JSON 字符串，必须过 keyMapFromWire 转成内部表示。
     const json = await invoke<string>("get_hotkeys");
-    currentKeyMap = JSON.parse(json) as HotkeyMap;
+    currentKeyMap = keyMapFromWire(JSON.parse(json) as WireHotkeyMap);
   } catch (err) {
     console.warn("[keymap] loadKeymap 失败，保留既有映射：", err);
   }
@@ -215,25 +342,9 @@ export async function reloadKeymap(): Promise<void> {
 // setHotkey — IPC 写 + 返回 discriminated union（U4）
 // ---------------------------------------------------------------------------
 
-/** 将 KeyCombo 序列化为后端 set_hotkey 期望的 JSON 结构。 */
-function serializeComboForBackend(combo: KeyCombo): { mods: string[]; key: string | null } {
-  const key = (() => {
-    switch (combo.key.kind) {
-      case "char":
-        return combo.key.ch;
-      case "enter":
-        return "enter";
-      case "escape":
-        return "escape";
-      case "arrow_up":
-        return "arrow_up";
-      case "arrow_down":
-        return "arrow_down";
-      case "comma":
-        return "comma";
-    }
-  })();
-  return { mods: combo.mods as string[], key };
+/** 将 KeyCombo 序列化为后端 set_hotkey 期望的 JSON 结构（[`keyFromWire`] 的逆）。 */
+function serializeComboForBackend(combo: KeyCombo): { mods: string[]; key: string } {
+  return { mods: combo.mods as string[], key: keyToWire(combo.key) };
 }
 
 /**
