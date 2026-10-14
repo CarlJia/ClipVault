@@ -449,26 +449,12 @@ body {
   line-height: 1;
 }
 
-/* 底部提示行 */
-.hint {
-  padding: 8px 16px;
-  border-top: 1px solid var(--border);
-  color: var(--muted);
-  font-size: 11px;
-  letter-spacing: 0.02em;
-  /* 提示条会折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
-     否则相邻两行的键帽会贴在一起。 */
-  line-height: 1.8;
-}
-
 /* 「按什么」与「做什么」分色：快捷键是键帽（强调色文字 + 淡蓝底 + 描边），
    说明文字留在 --muted。用颜色而非字重区分，是因为提示条里塞了十来个按键，
    靠颜色扫读最快。`font-family: inherit` 是刻意的 —— 等宽字体（SF Mono 等）
    对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。
    Windows 上键帽文案已被 platform.ts 换成 `Ctrl+` / `Shift+` / `Enter` 纯文本（RW9），
    inherit 在那里同样合适：与说明文字同族，也避开等宽字体对中文的回退差异。 */
-.hint kbd,
-.hint .keycap,
 .editor-hint kbd,
 .editor-hint .keycap {
   display: inline-block;
@@ -480,11 +466,6 @@ body {
   font-family: inherit;
   font-size: 10px;
   white-space: nowrap;
-}
-
-/* 括号里的补充说明再弱一层，不与主提示抢注意力。 */
-.hint-note {
-  color: rgba(154, 154, 162, 0.72);
 }
 
 /* Toast */
@@ -679,7 +660,8 @@ body {
 .editor-hint {
   font-size: 11px;
   color: var(--muted);
-  /* 与 .hint 同款键帽，行距同样要给键帽留出上下余量。 */
+  /* 编辑器提示行可能折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
+     否则相邻两行的键帽会贴在一起。 */
   line-height: 1.8;
 }
 .editor-retry {
