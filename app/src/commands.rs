@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use clipvault_core::Entry;
@@ -30,6 +31,7 @@ pub struct AppState {
     pub guest_mode: Arc<AtomicBool>,
     pub skip_next: Arc<AtomicBool>,
     pub panel_opacity: Arc<AtomicU32>,
+    pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
 }
 
 /// 单条剪贴板记录的前端 DTO。
@@ -563,6 +565,85 @@ pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Resu
     crate::privacy::set_panel_opacity(&state.storage, &state.panel_opacity, opacity)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ----------------------------------------------------------------
+// HotkeyMap（U1）
+// ----------------------------------------------------------------
+
+/// 读取当前快捷键映射（JSON 字符串）。以运行时共享 slot 为准。
+#[tauri::command]
+pub fn get_hotkeys(state: State<'_, AppState>) -> String {
+    let map = state.keymap.read().unwrap();
+    clipvault_core::keymap::serialize(&map)
+}
+
+/// 设置某个 action 的快捷键。
+///
+/// 写路径：
+/// 1. 把 `serde_json::Value` 解析为 `KeyCombo`
+/// 2. 验证：非空 combo（modifier-only 拒绝）、key 存在
+/// 3. 更新 `HotkeyMap` 中对应 action
+/// 4. `persist_hotkeys` 持久化到 `settings` 表
+/// 5. `apply_hotkeys` 更新 in-memory slot
+///
+/// U2 会在这里加入 `apply_global_hotkey` 调用以完成 live re-register。
+#[tauri::command]
+pub async fn set_hotkey(
+    action: String,
+    combo: serde_json::Value,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    use clipvault_core::keymap::{CharKind, HotkeyAction, KeyCombo, Mods};
+
+    // 1. 把 action string → enum
+    let action =
+        HotkeyAction::from_json_str(&action).ok_or_else(|| format!("unknown action '{action}'"))?;
+
+    // 2. 从 JSON Value 提取 mods + key
+    let combo_obj = combo.as_object().ok_or("combo must be a JSON object")?;
+
+    // mods
+    let mods_array = combo_obj
+        .get("mods")
+        .and_then(|v| v.as_array())
+        .ok_or("combo.mods must be an array")?;
+    let mut mods = Mods::empty();
+    for m in mods_array {
+        let s = m.as_str().ok_or("mods elements must be strings")?;
+        match s {
+            "meta" => mods |= Mods::META,
+            "shift" => mods |= Mods::SHIFT,
+            "alt" => mods |= Mods::ALT,
+            "ctrl" => mods |= Mods::CTRL,
+            _ => return Err(format!("unknown modifier '{s}'")),
+        }
+    }
+
+    // key — 拒绝 null（modifier-only）
+    let key_value = combo_obj.get("key").ok_or("combo.key is required")?;
+    if key_value.is_null() {
+        return Err("modifier-only combos are not allowed".to_string());
+    }
+    let key_str = key_value.as_str().ok_or("combo.key must be a string")?;
+    let key =
+        CharKind::from_json_str(key_str).ok_or_else(|| format!("unrecognised key '{key_str}'"))?;
+
+    let new_combo = KeyCombo { mods, key };
+
+    // 3. 更新 map
+    let map = {
+        let mut map = state.keymap.read().unwrap().clone();
+        map.actions.insert(action, new_combo);
+        map
+    };
+
+    // 4. 持久化 + 更新 slot
+    crate::keymap::set_hotkey(&state.storage, &state.keymap, &map)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    Ok(())
 }
 
 // ----------------------------------------------------------------

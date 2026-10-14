@@ -17,6 +17,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32};
 
 use clipvault::commands::{self, AppState};
@@ -57,6 +58,7 @@ fn main() {
             let guest_mode = Arc::new(AtomicBool::new(false));
             let skip_next = Arc::new(AtomicBool::new(false));
             let panel_opacity = Arc::new(AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY));
+            let keymap = Arc::new(RwLock::new(clipvault_core::keymap::HotkeyMap::default()));
 
             // 2.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
             //     使重启后 watcher / 托盘 / 前端与上次状态一致。
@@ -72,12 +74,23 @@ fn main() {
             )
             .unwrap_or(privacy::DEFAULT_PANEL_OPACITY);
 
+            // 2.7 U1：从 settings 表加载持久化的快捷键映射到 slot，
+            //     使重启后 panel 内快捷键与全局热键与上次一致。
+            let _initial_keymap = tauri::async_runtime::block_on(
+                clipvault::keymap::boot_load_hotkeys(&storage, &keymap),
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("[clipvault] boot_load_hotkeys 失败：{e}，使用默认映射");
+                clipvault_core::keymap::HotkeyMap::default()
+            });
+
             // 3. 注册 IPC 共享状态。
             app.manage(AppState {
                 storage: storage.clone(),
                 guest_mode: guest_mode.clone(),
                 skip_next: skip_next.clone(),
                 panel_opacity: panel_opacity.clone(),
+                keymap: keymap.clone(),
             });
 
             // 3.5 U9：启动时校验加密区条目的可解密性（macOS / Windows 且系统凭据库可用）。
@@ -127,6 +140,8 @@ fn main() {
             commands::set_skip_next,
             commands::get_panel_opacity,
             commands::set_panel_opacity,
+            commands::get_hotkeys,
+            commands::set_hotkey,
             commands::keychain_available,
             commands::move_to_vault,
             commands::list_vault,

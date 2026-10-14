@@ -11,6 +11,7 @@ pub mod classify;
 pub mod commands;
 pub mod crypto;
 pub mod hotkey;
+pub mod keymap;
 pub mod panel;
 pub mod pasteback;
 pub mod pin;

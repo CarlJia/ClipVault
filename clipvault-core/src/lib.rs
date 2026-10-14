@@ -7,6 +7,7 @@ pub mod category;
 pub mod content_kind;
 pub mod crypto;
 pub mod entry;
+pub mod keymap;
 pub mod schema;
 
 pub use category::{AutoCategory, classify};
