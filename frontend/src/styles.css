@@ -1,0 +1,799 @@
+/* ClipVault — Raycast 风格暗色浮层（U4）。 */
+
+:root {
+  --bg: rgba(28, 28, 32, 0.78);
+  --surface: rgba(255, 255, 255, 0.06);
+  --surface-hover: rgba(255, 255, 255, 0.1);
+  --selected: rgba(10, 132, 255, 0.22);
+  --border: rgba(255, 255, 255, 0.08);
+  --text: #f5f5f7;
+  --muted: #9a9aa2;
+  --accent: #0a84ff;
+  --chip-cat: rgba(94, 92, 230, 0.28);
+  --chip-tag: rgba(255, 255, 255, 0.1);
+  --danger: #ff453a;
+  --warn: rgba(255, 214, 10, 0.16);
+  --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, "Cascadia Mono", "JetBrains Mono", Menlo, monospace;
+  --radius: 12px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background: transparent;
+  font-family: var(--font-ui);
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+  user-select: none;
+  cursor: default;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+  background: transparent;
+}
+
+.panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  background: var(--bg);
+  /* 不要在 .panel 上用 backdrop-filter（含 -webkit- 前缀）。面板窗口是
+     `transparent: true`（tauri.conf.json）+ 页面根透明，WebKit 在这种组合下
+     建立的背景捕获层不可靠：`#search` 一拿到焦点（光标闪烁触发合成层重排）
+     捕获就塌陷成不透明底，面板表现为「变实心」，失焦后要等 Core Animation
+     节流重捕获（秒级）才恢复半透明。面板的半透明本就由 --bg 的 alpha 提供，
+     不依赖模糊；`.editor` 系列模态的 blur(6px) 不受影响（它模糊的是面板内容）。
+     上游同类：tauri-apps/tauri#12804、#15512。 */
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+/* 顶部进度条（加载态；保留上一帧不闪白） */
+.progress {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 3px;
+  width: 0;
+  background: var(--accent);
+  opacity: 0;
+  transition:
+    width 0.4s ease,
+    opacity 0.2s ease;
+  z-index: 5;
+}
+.progress.active {
+  width: 100%;
+  opacity: 1;
+  transition:
+    width 1.2s ease,
+    opacity 0.1s ease;
+}
+
+/* Accessibility 横幅（AE7 / U8 首启引导） */
+.banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--warn);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+.banner.hidden {
+  display: none;
+}
+.banner-icon {
+  color: #ffd60a;
+  line-height: 1.4;
+}
+/* 横幅图标已换成内联 SVG（U7）：尺寸由 svg 的 width/height 决定，颜色经
+   `currentColor` 承接这里的 color（授权横幅黄、访客横幅蓝）。 */
+.banner-icon svg {
+  display: block;
+}
+.banner-text {
+  flex: 1;
+}
+.banner-body {
+  flex: 1;
+  min-width: 0;
+}
+.banner-title {
+  font-weight: 600;
+}
+.banner-sub {
+  margin-top: 2px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.banner-actions {
+  display: flex;
+  flex-shrink: 0;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.banner-btn {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.banner-btn:hover {
+  background: var(--surface-hover);
+}
+.banner-btn-primary {
+  border-color: var(--accent);
+  background: rgba(10, 132, 255, 0.18);
+}
+.banner-btn-primary:hover {
+  background: rgba(10, 132, 255, 0.28);
+}
+
+/* 搜索框 */
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.search-icon {
+  color: var(--muted);
+  font-size: 18px;
+}
+/* 放大镜由 SF Symbols 码字换成内联 SVG（U7）。`pointer-events: none` 是必须的：
+   它落在拖拽区（`data-tauri-drag-region="deep"`）内，SVG 若吞掉指针事件，
+   从图标上按下就拖不动面板了 —— 原来的纯文本字形没有这个问题。 */
+.search-icon svg {
+  display: block;
+  pointer-events: none;
+}
+#search {
+  flex: 1;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 20px;
+  font-family: var(--font-ui);
+  user-select: text;
+}
+#search::placeholder {
+  color: var(--muted);
+}
+
+/* Tab 栏 */
+.tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.tab {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 13px;
+  padding: 4px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.tab:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+.tab.active {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+
+/* 列表 */
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+}
+.empty {
+  padding: 40px 16px;
+  text-align: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.row:hover {
+  background: var(--surface);
+}
+.row.selected {
+  background: var(--selected);
+}
+.row-main {
+  flex: 1;
+  min-width: 0;
+}
+/* ⌘N 序号徽标：列表前 9 条显示，提示直选快捷键。 */
+.row-index {
+  flex-shrink: 0;
+  align-self: flex-start;
+  margin-top: 1px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--surface);
+  border-radius: 4px;
+  padding: 1px 5px;
+  min-width: 22px;
+  text-align: center;
+}
+.row.selected .row-index {
+  color: var(--accent);
+}
+.row-content {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 有备注时：备注作主标题，用常规字体 + 主文本色以示区分于代码内容。 */
+.row-note-title {
+  font-family: var(--font-ui);
+  color: var(--text);
+}
+/* 实际内容降为副标题：缩略、次要色、稍小字号。 */
+.row-subtitle {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.row-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+.row-time {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+/* ── 多类型条目预览（多类型 plan U5）─────────────────────────────
+   列表项按 `content_kind` 换预览块：image 缩略图 / file 文件名 /
+   rtf 徽标 / color 色块；text 沿用上面的纯文本布局。 */
+
+/* 图片行：缩略图在左，尺寸与文件大小在右，整行垂直居中。 */
+.row-image-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+/* 64×64 缩略图（U3 生成、R19 锁定尺寸）。按 1:1 显示不做二次缩放，
+   圆角 + 描边让浅色图在暗底上仍看得出边界。 */
+.row-thumb {
+  flex-shrink: 0;
+  display: block;
+  width: 64px;
+  height: 64px;
+  object-fit: cover;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+/* 无缩略图时的占位（R24：降级 48×48 仍超 10KB → 丢弃 thumb 字段）：
+   用文件大小文字顶上。尺寸沿用 .row-thumb，故**必须排在它之后**——
+   两条规则同为单类选择器、优先级相同，靠源序覆盖 `display: block`。 */
+.row-thumb-placeholder {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 4px;
+  font-family: var(--font-ui);
+  font-size: 10px;
+  line-height: 1.15;
+  color: var(--muted);
+  text-align: center;
+}
+/* 缩略图右侧的「宽×高 大小」文本。 */
+.row-image-meta {
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--muted);
+}
+/* 文件行：文件名为主标题（完整路径降为副标题，见 .row-subtitle）。 */
+.row-file-name {
+  font-family: var(--font-ui);
+}
+/* RTF 行：没有可预览的正文，只有类型徽标。 */
+.row-rtf-badge {
+  font-family: var(--font-ui);
+}
+/* 颜色行：色块 + rgba 文本。 */
+.row-color-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.row-color-swatch {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+}
+
+/* Pin 徽标（U7）：pin.fill 风格内联 SVG，13×13。
+   颜色经 CSS 自定义属性 --pin-color 承接：非选中行 muted、选中行 accent。 */
+.pin {
+  --pin-color: var(--muted);
+  color: var(--pin-color);
+  display: inline-block;
+  width: 13px;
+  height: 13px;
+  margin-right: 6px;
+  vertical-align: -2px;
+  flex-shrink: 0;
+}
+.row.selected .pin {
+  --pin-color: var(--accent);
+}
+
+.chip {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 6px;
+  color: var(--text);
+  white-space: nowrap;
+}
+.chip-cat {
+  background: var(--chip-cat);
+}
+.chip-tag {
+  background: var(--chip-tag);
+  color: var(--muted);
+}
+/* 加密区徽标（U9） */
+.chip-vault {
+  background: rgba(48, 209, 88, 0.2);
+  color: #30d158;
+}
+/* 无法解密警示徽标（U9） */
+.chip-undec {
+  background: rgba(255, 69, 58, 0.2);
+  color: var(--danger);
+}
+/* 内容类型徽标（多类型 plan U5）：IMAGE / FILE / RTF / COLOR。
+   与类别、标签徽标并列，用更小的字号 + 字距做一个中性的「类型」标。 */
+.chip-kind {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+
+/* Keychain 不可用横幅（U9）：复用 .banner 的告警样式。 */
+.banner-vault {
+  background: rgba(255, 69, 58, 0.14);
+}
+
+/* 访客模式提示条（U10）：复用 .banner 结构，用中性偏蓝的信息色区分于告警。 */
+.banner-guest {
+  background: rgba(10, 132, 255, 0.14);
+}
+.banner-guest .banner-icon {
+  color: #0a84ff;
+}
+
+/* 聚合列表（标签 / 类别 tab） */
+.agg-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.agg-row:hover {
+  background: var(--surface);
+}
+.agg-row.selected {
+  background: var(--accent);
+}
+.agg-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-family: var(--font-mono);
+}
+/* 标签/类别筛选态下的「‹ 返回」条 */
+.agg-row.filter-back {
+  justify-content: flex-start;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+  border-radius: 0;
+  margin-bottom: 4px;
+}
+.agg-row.filter-back .back-arrow {
+  font-size: 16px;
+  line-height: 1;
+}
+
+/* 底部提示行 */
+.hint {
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  /* 提示条会折成两三行，行距要容得下键帽（上下留出 1px padding + 描边），
+     否则相邻两行的键帽会贴在一起。 */
+  line-height: 1.8;
+}
+
+/* 「按什么」与「做什么」分色：快捷键是键帽（强调色文字 + 淡蓝底 + 描边），
+   说明文字留在 --muted。用颜色而非字重区分，是因为提示条里塞了十来个按键，
+   靠颜色扫读最快。`font-family: inherit` 是刻意的 —— 等宽字体（SF Mono 等）
+   对 ⌘ ⇧ ↩ 这类符号的字形覆盖不如 UI 字体稳，键帽不值得拿豆腐块换。
+   Windows 上键帽文案已被 platform.ts 换成 `Ctrl+` / `Shift+` / `Enter` 纯文本（RW9），
+   inherit 在那里同样合适：与说明文字同族，也避开等宽字体对中文的回退差异。 */
+.hint kbd,
+.hint .keycap,
+.editor-hint kbd,
+.editor-hint .keycap {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid rgba(10, 132, 255, 0.32);
+  border-radius: 4px;
+  background: rgba(10, 132, 255, 0.14);
+  color: #7ab8ff;
+  font-family: inherit;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+/* 括号里的补充说明再弱一层，不与主提示抢注意力。 */
+.hint-note {
+  color: rgba(154, 154, 162, 0.72);
+}
+
+/* Toast */
+.toast {
+  position: absolute;
+  bottom: 44px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(0, 0, 0, 0.82);
+  color: var(--text);
+  font-size: 12px;
+  padding: 6px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  z-index: 10;
+}
+.toast.hidden {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- */
+/* 备注 / 标签编辑器（U6）                                            */
+/* ---------------------------------------------------------------- */
+
+.editor {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(0, 0, 0, 0.4);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.editor.hidden {
+  display: none;
+}
+/* 备注编辑器可嵌套唤起于加密区模态之上（⌘⇧V → ⌘E）：三者 z-index 相同，
+   层级由 DOM 顺序决定，而 #editor 在 #vault 之前，故单独抬高一层。 */
+#editor {
+  z-index: 30;
+}
+
+.editor-card {
+  width: 100%;
+  max-width: 480px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 16px;
+  background: rgba(40, 40, 46, 0.96);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+
+.editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.editor-title {
+  font-size: 14px;
+  font-weight: 600;
+}
+.editor-state {
+  font-size: 12px;
+  color: var(--muted);
+  min-height: 16px;
+}
+.editor-state.state-dirty {
+  color: #ffd60a;
+}
+.editor-state.state-saving {
+  color: var(--accent);
+}
+.editor-state.state-saved {
+  color: #30d158;
+}
+.editor-state.state-error {
+  color: var(--danger);
+}
+
+.editor-preview {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  max-height: 44px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 6px 10px;
+  background: var(--surface);
+  border-radius: 6px;
+}
+
+.editor-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.editor-label {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.editor-note {
+  width: 100%;
+  resize: none;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 10px;
+  outline: none;
+  user-select: text;
+}
+.editor-note:focus {
+  border-color: var(--accent);
+}
+.editor-counter {
+  align-self: flex-end;
+  font-size: 11px;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.editor-counter.at-cap {
+  color: var(--danger);
+}
+
+.editor-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 6px 8px;
+  min-height: 38px;
+}
+.editor-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 4px 2px 8px;
+  border-radius: 6px;
+  background: var(--chip-tag);
+  color: var(--text);
+  white-space: nowrap;
+}
+.chip-x {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+}
+.chip-x:hover {
+  color: var(--danger);
+}
+.editor-tag-input {
+  flex: 1;
+  min-width: 80px;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  user-select: text;
+}
+.editor-tag-input::placeholder {
+  color: var(--muted);
+}
+
+.editor-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.editor-hint {
+  font-size: 11px;
+  color: var(--muted);
+  /* 与 .hint 同款键帽，行距同样要给键帽留出上下余量。 */
+  line-height: 1.8;
+}
+.editor-retry {
+  border: 1px solid var(--danger);
+  background: transparent;
+  color: var(--danger);
+  border-radius: 6px;
+  padding: 3px 12px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.editor-retry:hover {
+  background: rgba(255, 69, 58, 0.14);
+}
+.editor-retry.hidden {
+  display: none;
+}
+
+/* ---------------------------------------------------------------- */
+/* 加密区管理模态（U9）                                              */
+/* ---------------------------------------------------------------- */
+
+.vault-card {
+  max-width: 520px;
+  max-height: 80%;
+}
+.vault-sub {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.vault-list {
+  flex: 1;
+  overflow-y: auto;
+  max-height: 320px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.vault-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: var(--surface);
+  cursor: pointer;
+}
+.vault-row:hover {
+  background: var(--selected);
+}
+/* 选中态（↑↓ / 单击）：与主列表 `.row.selected` 同一套视觉语义，
+   因为加密区条目同样可 ↩ 回贴、⌘E 编辑备注。 */
+.vault-row.selected {
+  background: var(--selected);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+.vault-row.undecryptable {
+  background: rgba(255, 69, 58, 0.1);
+  border: 1px solid rgba(255, 69, 58, 0.28);
+}
+/* 选中优先于「无法解密」底色：红框仍在，底色调成选中色，选中位置才看得清。 */
+.vault-row.undecryptable.selected {
+  background: var(--selected);
+}
+.vault-note {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---------------------------------------------------------------- */
+/* 设置模态（U12）                                                    */
+/* ---------------------------------------------------------------- */
+
+.settings-card {
+  max-width: 420px;
+}
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.settings-value {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--muted);
+  min-width: 42px;
+  text-align: right;
+}
+.slider {
+  -webkit-appearance: none;
+  appearance: none;
+  flex: 1;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--surface-hover);
+  outline: none;
+  cursor: pointer;
+}
+.slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--accent);
+  cursor: pointer;
+  border: none;
+}
+.slider:focus::-webkit-slider-thumb {
+  box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.25);
+}

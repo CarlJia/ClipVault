@@ -1,0 +1,282 @@
+name: Package
+
+# 触发：
+#   - 推 `v*` tag：构建两个平台并把产物挂到对应的 GitHub Release。
+#   - 手动（Actions → Package → Run workflow）：只构建并上传 Artifacts，不发 Release。
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# 顶层只给只读；只有 release job 需要写权限（创建 Release 与上传资产）。
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # 与本地开发用的 tauri-cli 同一条线（本地 2.11.5）。必须是 `~` 而不是 `^`：
+  # `^2.11` 实际会装到 2.12.x，装出来的 CLI 就不在 tauri crate（`~2.11`）的线上了。
+  # 这里只存版本号本身，`~` 在安装命令处拼、缓存 key 用这个干净值 ——
+  # 两边是同一个来源，不会出现「改了版本没改缓存 key」的漂移。
+  TAURI_CLI_MINOR: '2.11'
+
+jobs:
+  macos:
+    name: macOS（${{ matrix.arch }} DMG）
+    runs-on: macos-latest
+    strategy:
+      # 两个架构是可独立交付的产物，一个挂了不该拖住另一个。
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            rust-target: aarch64-apple-darwin
+          - arch: x64
+            rust-target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      # ---- 三块缓存。都用 actions/cache（官方 action），符合 U8「不引入第三方 action」。----
+      #
+      # 1) cargo-install 出来的二进制。tauri-cli 拖着 oxc 那一整套解析器依赖，从源码
+      #    编一次要 7~9 分钟 —— 三个 job 各编一遍，是全流程最大的一笔开销。缓存命中后
+      #    这步退化成「什么都不做」。key 带 TAURI_CLI_MINOR，换版本时自动失效重编。
+      - name: 缓存 cargo 安装的二进制（cargo-tauri）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
+
+      # 2) crates.io 索引 + 已下载/解包的 crate 源码。
+      #    注意：这个 key 里没有 runner.os，但**并不会**让三个 job 共用一份 ——
+      #    hashFiles() 的摘要不止算文件内容（实测同一份 Cargo.lock 在 macOS 与 Windows
+      #    runner 上给出两个不同哈希），所以事实上就是各平台一份，加起来 ~323MB，
+      #    占额度很小。不把 runner.os 显式写进 key 只是懒得改，行为上没有差别。
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      # 3) release 编译产物（主要是依赖的 rlib）。不存在「缓存用错」的可能：cargo 按
+      #    指纹（含 rustc 版本、feature、编译参数）逐条校验，本仓库自己的 crate 改了
+      #    只重编它自己和上层，依赖照旧复用。key 带 Cargo.lock 哈希，依赖变动时靠
+      #    restore-keys 回退到上一次的缓存，还能捞回没变的那部分。
+      - name: 缓存 release 编译产物
+        uses: actions/cache@v4
+        with:
+          path: target/${{ matrix.rust-target }}/release
+          key: cargo-target-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-${{ matrix.arch }}-
+
+      # runner 上预装了 rustup/rustc，但仍然显式安装一次：CI 的可复现性不该依赖
+      # runner 镜像的默认值。clippy/rustfmt 由 profile minimal 之外单独指定。
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # arm64 runner 上编 x86_64 是交叉编译，但 Apple SDK 自带两份 slice、链接器也认
+      # 两个架构，不需要额外垫片，只要求 rustup 里装了对应 target。
+      - name: 安装 ${{ matrix.rust-target }} 目标
+        run: rustup target add ${{ matrix.rust-target }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: 安装 tauri-cli
+        run: |
+          # 缓存命中时 cargo-tauri 已在 PATH 上，直接跳过；否则从源码编（7~9 分钟）。
+          # 判据用「PATH 里有没有 cargo-tauri」而不是 cargo 自己的 "already installed"
+          # 记录：后者读 ~/.cargo/.crates*.json，万一二进制在、记录不在，cargo install
+          # 会以 "binary `cargo-tauri` already exists" 直接失败；也不要去执行
+          # `cargo tauri --version` 探测，那样会留下非零退出码给后续判断添乱。
+          if command -v cargo-tauri >/dev/null 2>&1; then
+            echo "tauri-cli 命中缓存，跳过源码编译"
+          else
+            cargo install tauri-cli --version "~$TAURI_CLI_MINOR" --locked
+          fi
+
+      # 直接复用仓库里的打包脚本，而不是把步骤摊在 workflow 里：本地怎么打，CI 就怎么打，
+      # 差别只有传进去的架构参数。
+      - name: 打包（前端 → tauri build → ad-hoc 签名 → DMG）
+        run: packaging/build.sh ${{ matrix.arch }}
+
+      # 把要上传的产物收进一个固定布局的暂存目录，而不是直接传 bundle 下的两个路径：
+      # upload-artifact 按「上传路径的公共祖先」剥前缀，直接传会让 artifact 里出现
+      # dmg/ 与 macos/ 两层。更麻烦的是两个架构的 .app 同名，合并进 dist/ 时 x64 会
+      # 覆盖 arm64，留下一个架构都对不上的目录。这里按架构改名，布局也变成显式约定。
+      - name: 暂存产物
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.rust-target }}/release/bundle/dmg/ClipVault_*.dmg staging/
+          cp -R target/${{ matrix.rust-target }}/release/bundle/macos/ClipVault.app \
+            "staging/ClipVault_${{ matrix.arch }}.app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipVault-macos-${{ matrix.arch }}
+          if-no-files-found: error
+          path: staging/
+
+  windows:
+    name: Windows（NSIS 安装包）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 三块缓存，与 macos job 同理（见那边的注释）。差别只有一处：
+      # **只缓存 release，不缓存 debug** —— clippy/test 在 debug 下产出的 target/debug
+      # 比 release 大得多（本机量级 3~10GB），塞进 10GB 的仓库缓存额度会把其它条目挤掉，
+      # 而它能省的只有那 4 分钟 lint+测试。净收益不划算，故留作每次重编。
+      - name: 缓存 cargo 安装的二进制（cargo-tauri）
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/.crates.toml
+            ~/.cargo/.crates2.json
+          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
+
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: 缓存 release 编译产物
+        uses: actions/cache@v4
+        with:
+          path: target/release
+          key: cargo-target-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-release-
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # cargo 的 build.rs（tauri-build）要求 tauri.conf.json 的 frontendDist 目录存在，
+      # 所以下面的 clippy / test 之前必须先有 frontend/dist。
+      - name: 构建前端（cargo 的 build.rs 需要 frontendDist 存在）
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run build
+
+      # 下面两步是这个 workflow 存在的主要理由：本地开发机是 macOS，
+      # cfg(target_os = "windows") 的分支在那里**根本不会被编译**，所以 Windows 目标的
+      # 整树编译与 lint 只能在 CI 上验证。
+      - name: clippy（Windows 目标）
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: 测试（Windows 目标）
+        run: cargo test --workspace
+
+      - name: 安装 tauri-cli
+        run: |
+          # 与 macos job 同理（见那边的注释）：判据是 PATH 里有没有 cargo-tauri，
+          # 不去执行探测命令 —— 免得留下非零的 $LASTEXITCODE 被 GHA 的 pwsh 包装
+          # 当成整步失败。
+          if (Get-Command cargo-tauri -ErrorAction SilentlyContinue) {
+            Write-Host "tauri-cli 命中缓存，跳过源码编译"
+          } else {
+            cargo install tauri-cli --version "~$env:TAURI_CLI_MINOR" --locked
+            if ($LASTEXITCODE -ne 0) { throw "cargo install tauri-cli 失败" }
+          }
+
+      - name: 打包（前端 → tauri build --bundles nsis）
+        run: packaging/build-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ClipVault-windows-nsis
+          if-no-files-found: error
+          path: target/release/bundle/nsis/*.exe
+
+  release:
+    name: 发布到 GitHub Release
+    needs: [macos, windows]
+    # 只有 tag 推送才发版；手动触发时到此为止，产物留在 Artifacts 里。
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # 这个 job 只消费 Artifacts，所以**刻意不 checkout** —— 但 gh 默认要靠 .git 里的
+      # remote 推断仓库，缺了它会直接报 "failed to run git: fatal: not a git repository"。
+      # 所以下面每条 gh 命令都显式带 `--repo "$GITHUB_REPOSITORY"`（该变量由 Actions 注入）：
+      # 既不依赖 git 上下文，也省掉一次 checkout。
+      # 独立成一个 job（而不是让各平台/各架构自己往 Release 里塞）：它们并发跑时
+      # 各自"没有就创建"会撞车。
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 挂载产物到 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          repo="${GITHUB_REPOSITORY}"
+
+          # .app 是目录，不能作为 release asset —— Release 只放 DMG 与 NSIS 安装包。
+          # 资产用 find 按后缀递归收集，**不去猜** artifact 合并后的目录层级：
+          # upload-artifact 是按上传路径的公共祖先剥前缀的，早先写的 dist/*.dmg
+          # 就因为这个静默匹配不到两个 DMG（只有根上的 .exe 会被传上去）。
+          # 用 while-read 攒数组而不是 mapfile：后者是 bash 4 才有的，留着 3.2 也能跑
+          # （本仓库的开发机是 macOS，自带 bash 3.2）。
+          assets=()
+          while IFS= read -r f; do assets+=("$f"); done \
+            < <(find dist -type f \( -name '*.dmg' -o -name '*.exe' \) | sort)
+          if (( ${#assets[@]} == 0 )); then
+            echo "错误：dist/ 下没有 .dmg/.exe —— 上游 artifact 的布局变了？" >&2
+            exit 1
+          fi
+          echo "待上传 ${#assets[@]} 个资产："
+          printf '  %s\n' "${assets[@]}"
+
+          # 每个资产名里都必须含 tag 的版本号。这条断言是有来历的：换版本号会让
+          # Cargo.lock 变 → target 缓存 key 变 → restore-keys 前缀回退命中**上一版**的
+          # 缓存，而那份缓存里带着上一版 `bundle/dmg/ClipVault_<旧版本>_*.dmg`；收集是按
+          # 通配来的，于是旧版本的文件跟着一起发到了新 Release 上（v0.2.0 上真发生过）。
+          # 上游已修（build.sh 打新 DMG 前先清旧产物），这里再兜一道：
+          # 宁可发布失败，也不要发出混着旧版本文件的 Release。
+          version="${tag#v}"
+          for a in "${assets[@]}"; do
+            case "$(basename "$a")" in
+              *"$version"*) ;;
+              *)
+                echo "错误：资产 $(basename "$a") 的名字里没有 tag $tag 的版本号 $version" >&2
+                exit 1
+                ;;
+            esac
+          done
+
+          gh release view "$tag" --repo "$repo" >/dev/null 2>&1 || \
+            gh release create "$tag" --repo "$repo" --title "ClipVault $tag" --generate-notes
+          gh release upload "$tag" "${assets[@]}" --repo "$repo" --clobber
+          # 回读一遍确认真上去了。注意 jq 表达式的开头那个点：裸标识符在 jq 里是
+          # **函数引用**，写成 `assets[].name` 会让 gh 报 "function not defined: assets/0"
+          # 并以非零退出把整个 job 拖挂（这一行也是头一回真正跑到才暴露的）。
+          gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name'

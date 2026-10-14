@@ -1,0 +1,89 @@
+[package]
+name = "clipvault"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# tauri 与 @tauri-apps/api 必须停在同一个 major.minor 上：`cargo tauri build` 启动时会
+# 交叉比对两者的版本（tauri-cli 的 check_mismatched_packages），不一致直接报
+# "Found version mismatched Tauri packages" 并中止打包。Cargo 的 caret 语义意味着
+# `version = "2"` 会一路浮动到最新的 2.x（CI 上实际解析到 2.12.3），而前端
+# package-lock.json 锁的 @tauri-apps/api 是 2.11.1 —— 于是 Windows job 必挂。
+# 因此这里写 `~2.11`（= >=2.11.0, <2.12.0），前端 package.json 同样用 `~`。
+# 升级 tauri 时两边必须同一次改动一起抬。
+tauri = { version = "~2.11", features = ["tray-icon", "image-png", "macos-private-api"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clipvault-core = { path = "../clipvault-core" }
+tokio = { version = "1", features = ["sync", "macros", "rt-multi-thread", "time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
+# U9：加密区条目的密文以 base64 存进 TEXT 列（content），nonce 存 BLOB 列。
+base64 = "0.22"
+# U9：move_to_vault 的每条随机 salt（salted content_hash，避免明文指纹）。
+rand = "0.8"
+# 多类型 plan U3：图片缩略图生成（decode → resize → encode PNG → base64）。
+# `tiff` 与捕获侧对齐：`capture` 在 PNG 缺失时回退读 `NSPasteboardTypeTIFF`
+# （mime = `image/tiff`），缺这个 decoder 时 `load_from_memory` 直接失败，
+# 该条 entry 就没有 thumb，UI 只能退化成文件大小文字（R19 要求图片必带缩略图）。
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "tiff",
+] }
+
+# macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
+# - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。
+# - NSWorkspace / NSRunningApplication：U8 前台应用捕获与失焦比对。
+# - objc2-core-graphics：U8 CGEvent 模拟 ⌘V（CGEventCreateKeyboardEvent /
+#   CGEventPost / CGEventSetFlags 对应 new_keyboard_event / post / set_flags）。
+#   选用 objc2-core-graphics 而非 core-graphics crate，以与既有 objc2 0.6 家族
+#   （objc2-foundation / objc2-app-kit 0.3）保持同一绑定栈、避免混用两套 FFI。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSPasteboard",
+    "NSWorkspace",
+    "NSRunningApplication",
+] }
+objc2-core-graphics = { version = "0.3", features = [
+    "CGEvent",
+    "CGEventTypes",
+    "CGEventSource",
+    "CGRemoteOperation",
+] }
+# U9：Keychain 托管数据密钥（service = com.clipvault.data_key）。
+security-framework = "3"
+
+# Windows 原生绑定（多平台 plan U1 起）。仅在 Windows 目标上编译，与上面的 objc2 家族对称。
+# - 剪贴板：U1 采集（OpenClipboard / GetClipboardData / CF_HDROP / CF_DIB*）与
+#   U3 回贴（SetClipboardData 写回 CF_UNICODETEXT / CF_HDROP / 注册格式 PNG）。
+# - 热键与注入：U2 RegisterHotKey、U3 SendInput（都在 Win32_UI_Input_KeyboardAndMouse）。
+# - 凭据库：U4 数据密钥（CredReadW / CredWriteW）。
+# - 选 `windows` crate 而非 `windows-sys`：前者把返回 BOOL 的 API 映射成 Result
+#   （省掉逐处 GetLastError 判定），并自带 INPUT / CREDENTIALW / DROPFILES / MSG
+#   等结构体定义 —— 手写 #[repr(C)] 布局正是 FFI 最容易出错的地方。0.61.3 已在
+#   依赖树内（tauri / wry / webview2-com 传递引入），不新解析第二个版本。
+#
+# 注：`Win32_Security_Credentials` 会连带打开父模块 `Win32_Security`；feature 之间
+# 有依赖关系，少写一个就会在编译期以 "could not find `Security` in `Win32`" 的形式暴露。
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Credentials",
+    "Win32_System_DataExchange",
+    "Win32_System_Memory",
+    "Win32_System_Ole",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
