@@ -179,6 +179,37 @@ ClipVault 默认全部离线，不做云同步、不上传任何数据（见下�
 
 ---
 
+## 快捷键自定义（设置 → 快捷键）
+
+主面板底部那条快捷键提示条已移除（U5），所有快捷键改在「设置」面板里集中管理与重绑。
+
+入口：**主面板左下角的「设置」按钮**（或面板内按 `⌘,` / `Ctrl+,`）。
+
+### 可重绑的快捷键
+
+- **全局**（仅 macOS / Windows；Linux 上整组隐藏）：`OpenPanel` 唤出主面板（默认 `⌥⌘V` / `Ctrl+Alt+V`）。
+- **面板内**（13 项）：`Paste`、`EditNote`、`TogglePin`、`MoveToVault`、`OpenUrl`、`OpenVault`、`ToggleGuestMode`、`SkipOnce`、`OpenSettings`、`Close`、`MoveUp`、`MoveDown`。
+- **不在范围**：`⌘1-9` 序号直选（用户范围协商结果未选）；`⌥` 双击「本次不记录」修饰键（watcher 侧机制不同）。
+
+### 重绑流程
+
+1. 在设置 → 快捷键列表里点对应行的「重绑」按钮。
+2. 该行进入录制态（`<kbd>` 闪烁），全局监听 `keydown`。
+3. 按下任一非修饰键单键（`Escape` 取消；只按 `Cmd` / `Shift` / `Alt` / `Ctrl` 视为无效，等下一键）。
+4. 后端 `set_hotkey` IPC 持久化到 `settings` 表 `hotkeys` JSON 行 + 重新注册全局热键（若改的是 `OpenPanel`）。
+5. 成功时行立即更新；冲突时 toast「已被占用」并保持原绑定。
+6. 重启 ClipVault 仍然生效（从 `settings` 表恢复）。
+
+### 字形对照
+
+- macOS 显示 `⌘⇧V` 风格（U+2318 ⌘、U+21E7 ⇧、U+21A5 ↩ 等）。
+- Windows 通过 `platform.ts` 的 `keys()` 翻译为 `Ctrl+Shift+V` 纯文本。
+- Linux 仍按 macOS 字形渲染（不进行平台翻译），但全局热键组隐藏。
+
+存储后端是 `settings` 表新增 `key=hotkeys` 单行 JSON（与 `guest_mode` / `panel_opacity` 同表同 schema），见 plan `docs/plans/2026-10-14-0927-feat-shortcut-customization-plan.md`。
+
+---
+
 ## 开发
 
 前置：Rust（edition 2024 工具链）、Node.js（前端）、`cargo install tauri-cli --version "~2.11" --locked`。
