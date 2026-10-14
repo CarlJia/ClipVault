@@ -108,6 +108,9 @@ const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
 const settingsCloseEl = document.querySelector<HTMLButtonElement>("#settings-close")!;
 const opacityEl = document.querySelector<HTMLInputElement>("#settings-opacity")!;
 const opacityValueEl = document.querySelector<HTMLSpanElement>("#settings-opacity-value")!;
+// 设置卡片内容区（透明度字段 + 快捷键区块）。超长时在此滚动，标题栏与底部提示
+// 常驻不滚动（U4）。
+const settingsBodyEl = document.querySelector<HTMLDivElement>("#settings-body")!;
 
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
@@ -551,16 +554,13 @@ vaultClearEl.addEventListener("click", () => {
 // ----------------------------------------------------------------
 
 /**
- * 把 0-100 百分比透明度即时应用到 `--bg` CSS 变量。
- * `.panel` (`styles.css:49`) 用 `background: var(--bg)`，只动变量就一处生效，
- * `backdrop-filter: blur(20px)` 不被破坏、不触发重排。
+ * 把 0-100 百分比透明度即时应用到 `--panel-alpha` CSS 变量（U5：全页唯一写入者）。
+ * `.panel` 的 `--bg`（`styles.css` `:root`）与 `#settings` 遮罩都从该变量派生，
+ * 只动这一个变量就全页生效，不触发重排。
  */
 function applyPanelOpacity(percent: number): void {
   const alpha = Math.max(0, Math.min(100, percent)) / 100;
-  document.documentElement.style.setProperty(
-    "--bg",
-    `rgba(28, 28, 32, ${alpha})`,
-  );
+  document.documentElement.style.setProperty("--panel-alpha", String(alpha));
 }
 
 /** 打开设置模态，并把 slider 位置 / 文本对齐到当前后端值。 */
@@ -569,6 +569,9 @@ async function openSettings(): Promise<void> {
   opacityEl.value = String(v);
   opacityValueEl.textContent = `${v}%`;
   settingsEl.classList.remove("hidden");
+  // 每次打开都把内容区复位到顶部（R10）：上次滚到快捷键列表底部的滚动位置
+  // 不应残留，否则打开就停在半截。
+  settingsBodyEl.scrollTop = 0;
   // 渲染快捷键区块（U4）
   void renderHotkeysSection();
   // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。
@@ -752,7 +755,7 @@ setEditorCloseHandler(() => {
 void listen("open-settings", () => {
   void openSettings();
 });
-// U12：启动时一次性把 `--bg` CSS 变量对齐到后端持久化的透明度，
+// U12：启动时一次性把 `--panel-alpha` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
 void getPanelOpacity().then(applyPanelOpacity);
 // U7：平台标识（`platform_info`）先到位再首屏渲染 —— 底部键帽、行序号徽标（⌘1–9）、

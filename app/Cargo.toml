@@ -44,11 +44,17 @@ image = { version = "0.25", default-features = false, features = [
 #   （objc2-foundation / objc2-app-kit 0.3）保持同一绑定栈、避免混用两套 FFI。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString"] }
+# `NSKeyedArchiver`:反归档 `NSPasteboardTypeColor` 的颜色归档（安全反归档 API
+# 定义在这个模块里,见 `capture::rgba_from_archived`）。
+objc2-foundation = { version = "0.3", features = ["NSString", "NSKeyedArchiver"] }
 objc2-app-kit = { version = "0.3", features = [
     "NSPasteboard",
     "NSWorkspace",
     "NSRunningApplication",
+    # `NSColor` + `NSColorSpace`:颜色捕获要把归档还原成真实 sRGB 分量
+    # （`colorUsingColorSpace:` 需要 NSColorSpace）。
+    "NSColor",
+    "NSColorSpace",
 ] }
 objc2-core-graphics = { version = "0.3", features = [
     "CGEvent",

@@ -100,7 +100,13 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
 - **Windows 支持**：U1–U9 完成 —— 采集 / 热键 / 回贴 / 凭据、命令收口、托盘、前端跨平台化、
   打包与 CI、文档均已落地。剩余的是 **Windows 真机验收**（Windows plan 的 AEW1–AEW8：
   托盘在浅/深色任务栏下的可见性、`Ctrl+X` 文案与 SVG 字形、无授权横幅、加密区端到端等）。
-- **测试基线**：app 131 passed + core 22 passed，1 个 trigram 测试 ignored
+- **多屏摆放与设置面板适配**：U1–U6 完成（见
+  `docs/plans/2026-10-14-1818-feat-panel-display-placement-and-settings-fit-plan.md`）——
+  面板按「焦点屏」（前台窗口所在屏；前台是自己时取鼠标屏）定位、Windows 侧同源实现，
+  唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
+  透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
+  AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
+- **测试基线**：app 168 passed + core 27 passed（合计 195），1 个 trigram 测试 ignored
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 目标的整树编译与 lint 只能在 CI 上验证**：本地开发机是 macOS，
   `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/package.yml` 的

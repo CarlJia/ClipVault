@@ -238,7 +238,13 @@ impl Watcher {
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,静默忽略。
+                // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,不入库。
+                // 留一行日志是必要的:指纹算法一旦退化(如 binary 分支曾漏掉 payload,
+                // 让同 kind 的所有内容共用一个指纹),真正的「重复」与「被误判为重复
+                // 而丢弃的新内容」在这里完全无法区分,只有日志能事后发现。
+                // 打 `e` 而不是写死「duplicate content_hash」:这个分支按错误码匹配,
+                // 将来加了别的约束(NOT NULL / CHECK)进来时,日志会自己说明是哪个约束。
+                eprintln!("[capture] skipped: {e} (hash {hash})");
             }
             Err(e) => {
                 eprintln!("clipvault watcher: insert failed: {e}");

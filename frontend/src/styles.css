@@ -1,7 +1,14 @@
 /* ClipVault — Raycast 风格暗色浮层（U4）。 */
 
 :root {
-  --bg: rgba(28, 28, 32, 0.78);
+  /* 面板透明度 alpha（无单位数值），U5 起为全页唯一来源。
+     跨边界不变量（KTD6）：此默认值必须等于 Rust `app/src/privacy.rs` 的
+     `DEFAULT_PANEL_OPACITY / 100`（78 → 0.78），且不得越出
+     `[MIN_PANEL_OPACITY, MAX_PANEL_OPACITY] / 100 = [0.30, 1.0]`。
+     运行期由 `main.ts` 的 `applyPanelOpacity` 覆写，`--bg` 从这里派生，
+     不再有第二份默认值需要手工同步。 */
+  --panel-alpha: 0.78;
+  --bg: rgba(28, 28, 32, var(--panel-alpha));
   --surface: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.1);
   --selected: rgba(10, 132, 255, 0.22);
@@ -740,8 +747,55 @@ body {
 /* 设置模态（U12）                                                    */
 /* ---------------------------------------------------------------- */
 
+/* 设置模态遮罩（U5）：由面板透明度派生，随滑块同向变化，让「拖动即有反馈」
+   在设置打开时也看得见。映射两端：面板 alpha 0.30 → 遮罩 0.12，
+   面板 alpha 1.0 → 遮罩 0.40，中间线性 —— 即 `0.12 + 0.4*(a-0.30) = a*0.4`，
+   正好是一句 `* 0.4`。默认 78% 时遮罩约 0.31，卡片四周仍压得住。
+   只覆盖 `#settings`：`#editor` / `#vault` 继续用 .editor 的 rgba(0,0,0,0.4)。 */
+#settings {
+  background: rgba(0, 0, 0, calc(var(--panel-alpha) * 0.4));
+}
+
 .settings-card {
   max-width: 420px;
+  /* 高度上限：相对 .editor 的内容盒解析（.editor 是 inset:0 + padding:16px 的
+     flex 居中容器），已自动扣除四周各 16px 内边距 —— 即 420 - 32 = 388px。
+     不要把这里写成「面板高度减去 16px」：竖直内边距是上下各 16px（合计 32px），
+     按单边算会正好复现本次要修的裁切。同 .vault-card 的 `max-height: 80%` 思路。 */
+  max-height: 100%;
+}
+
+/* 设置卡片的内容区：透明度字段 + 快捷键区块。
+   flex:1 + min-height:0 是让这块超长 flex 子项真的被压缩、从而触发滚动的关键
+   （缺 min-height:0，flex 子项的默认 min-height:auto 会让它撑到内容高度、永不滚动）。
+   overscroll-behavior:contain 让滚轮事件在此终止：内容区是滚轮的唯一归属，
+   不把滚动链传给面板底层的 .list（R17）。 */
+.settings-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  /* 原 .editor-card 的 gap:12px 提供的内容间距，孩子搬进来后由本层承接。 */
+  gap: 12px;
+  /* 细滚动条而不是隐藏（R12：保留可见的滚动 affordance）。Firefox/标准属性… */
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) transparent;
+}
+/* …与 WebKit（Tauri 用的 WKWebView / WebView2 均走这里）的细滚动条。 */
+.settings-body::-webkit-scrollbar {
+  width: 8px;
+}
+.settings-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.settings-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.settings-body::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }
 .settings-row {
   display: flex;
@@ -817,6 +871,9 @@ body {
   align-items: center;
   gap: 8px;
   padding: 4px 0;
+  /* 进入录制态时该行会 scrollIntoView({ block: "nearest" })（见 settings.ts
+     startRecording）。留 8px 滚动边距，贴边时不至于紧贴内容区上下沿。 */
+  scroll-margin-block: 8px;
 }
 
 .hotkey-row-label {

@@ -215,8 +215,8 @@ export async function refreshKeychainBanner(banner: HTMLElement): Promise<void> 
 
 /**
  * 默认透明度（0-100 整数百分比），与后端 `privacy::DEFAULT_PANEL_OPACITY`、
- * `styles.css` `--bg` 默认 0.78 三处对齐。前端任何 fallback 都走这个值，
- * 避免后端拉取失败时显示空背景。
+ * `styles.css` 的 `--panel-alpha` 默认值 0.78（`--bg` 由它派生）对齐。前端任何
+ * fallback 都走这个值，避免后端拉取失败时显示空背景。
  */
 export const DEFAULT_PANEL_OPACITY = 78;
 
@@ -311,7 +311,13 @@ function startRecording(action: HotkeyAction): void {
 
   recordingAction = action;
   const row = document.querySelector<HTMLElement>(`[data-action="${action}"]`);
-  if (row) row.classList.add("recording");
+  if (row) {
+    row.classList.add("recording");
+    // 进入录制态的行自动滚入可见区（R11）：若该行接近内容区（.settings-body）
+    // 底部，用户看不到「请按新键…」。block:"nearest" 只在该行不可见时才滚动，
+    // 已可见则不跳动；.hotkey-row 的 scroll-margin-block 留出贴边余量。
+    row.scrollIntoView({ block: "nearest" });
+  }
   const kbd = row?.querySelector<HTMLElement>(".hotkey-row-combo kbd");
   if (kbd) kbd.textContent = "请按新键…";
 

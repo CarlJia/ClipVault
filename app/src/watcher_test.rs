@@ -144,6 +144,32 @@ async fn process_handles_binary_capture() {
 }
 
 #[tokio::test]
+async fn process_keeps_two_distinct_images_in_history() {
+    // 回归（用户症状）：连续复制两张不同的图片，历史里必须两条都在。
+    // 曾经 binary 指纹只哈希 kind 名，第二张与第一张指纹相同，撞
+    // entries.content_hash UNIQUE 后被静默丢弃 —— 表现为「复制图片不进历史」。
+    let (watcher, storage, _skip) = make_watcher(false, false);
+    let png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89";
+    watcher
+        .process(Captured::image("image/png", png.to_vec(), 1, 1))
+        .await;
+
+    let mut second = png.to_vec();
+    second.push(0);
+    watcher
+        .process(Captured::image("image/png", second, 1, 1))
+        .await;
+
+    let entries = storage.list_recent(10).await.unwrap();
+    assert_eq!(entries.len(), 2, "两张不同图片应各占一条历史");
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.content_kind == ContentKind::Image.as_str())
+    );
+}
+
+#[tokio::test]
 async fn process_skips_payload_over_25mb() {
     // R23: payload > 25MB 时不入库,日志一行。
     let (watcher, storage, _skip) = make_watcher(false, false);
