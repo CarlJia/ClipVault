@@ -234,8 +234,19 @@ mod imp {
         ) -> OsStatus;
     }
 
-    // GetEventParameter name 第四参数 type
-    const TYPE_EVENTHOTKEYID: u32 = 0x484B_4944; // 'HKID'
+    // GetEventParameter 第二参数 (参数名) / 第三参数 (type) 用的常量。
+    //
+    // kEventClassKeyboard / kEventHotKeyPressed 携带 EventHotKeyID 的方式是
+    // `kEventParamDirectObject` (name) + `typeEventHotKeyID` (type) —— 见
+    // `CarbonEvents.h:4685`：--> kEventParamDirectObject (in, typeEventHotKeyID)。
+    // Carbon 头里这两个是 enum 成员,无法 `#[link]` 导出,Rust 端只能 pin 数字。
+    // mod tests 把它们和头文件值硬绑,挡住往 name/type 位置写错四字母 token
+    // 的回归(b7171dd 写过 'HKID' —— 名字错,类型也错,GetEventParameter
+    // 直接返回 eventParameterNotFoundErr,回调早退,show_panel 永远不执行)。
+    /// kEventParamDirectObject = '----' (CarbonEvents.h: kEventParamDirectObject).
+    const K_EVT_PARAM_DIRECT_OBJECT: u32 = 0x2D2D_2D2D;
+    /// typeEventHotKeyID = 'hkid' (CarbonEvents.h: typeEventHotKeyID).
+    const TYPE_EVENT_HOT_KEY_ID: u32 = 0x686B_6964;
 
     // ---- Carbon 常量 ----
     /// `'keyb'` —— kEventClassKeyboard。
@@ -269,8 +280,9 @@ mod imp {
 
     /// 全局热键回调：路由到具体 action。
     ///
-    /// Carbon 通过 `GetEventParameter(event, kEventParamEventHotKeyID, ...)` 提供 EventHotKeyID，
-    /// 我们用它查找对应的 HotkeyAction。
+    /// Carbon 通过 `GetEventParameter(event, kEventParamDirectObject, typeEventHotKeyID, ...)`
+    /// 把 `EventHotKeyID` 投递给回调，我们用它查找对应的 `HotkeyAction`。
+    /// 见 [`K_EVT_PARAM_DIRECT_OBJECT`] / [`TYPE_EVENT_HOT_KEY_ID`]。
     extern "C" fn hotkey_handler(
         _call: EventHandlerCallRef,
         _event: EventRef,
@@ -289,8 +301,8 @@ mod imp {
         let status = unsafe {
             GetEventParameter(
                 _event,
-                TYPE_EVENTHOTKEYID,
-                TYPE_EVENTHOTKEYID,
+                K_EVT_PARAM_DIRECT_OBJECT,
+                TYPE_EVENT_HOT_KEY_ID,
                 &mut actual,
                 std::mem::size_of::<EventHotKeyID>() as u32,
                 std::ptr::null_mut(),
@@ -443,6 +455,38 @@ mod imp {
     /// 返回进程是否已获得 Accessibility 授权（AE7 检测接缝）。
     pub fn check_accessibility() -> bool {
         unsafe { AXIsProcessTrusted() != 0 }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        //! 钉死两个跨进程边界的 Carbon 枚举常量。
+        //!
+        //! 这两个值在 Carbon 头里是 `enum` 成员，无法 `#[link]` 导出 —— Rust 端
+        //! 只能 pin 数字。把它们和 `CarbonEvents.h` 的值硬绑，是为了挡住一类
+        //! 特定回归：往 `GetEventParameter` 的 `name` / `type` 位置塞一个
+        //! 「看起来合理」的四字母 token（b7171dd 的 `'HKID'` 就是这么来的）。
+        //!
+        //! 真正的 API 契约出处：
+        //! - `SDK/.../Carbon.framework/.../CarbonEvents.h:4685`
+        //!   `kEventClassKeyboard / kEventHotKeyPressed -->
+        //!    kEventParamDirectObject (in, typeEventHotKeyID)`
+        //! - `CarbonEvents.h:376` `typeEventHotKeyID = 'hkid'`
+
+        use super::{K_EVT_PARAM_DIRECT_OBJECT, TYPE_EVENT_HOT_KEY_ID};
+
+        /// `kEventParamDirectObject` = `'----'`。
+        /// 是 `kEventHotKeyPressed` 事件携带 `EventHotKeyID` 时用的参数名。
+        #[test]
+        fn k_evt_param_direct_object_matches_carbon_header() {
+            assert_eq!(K_EVT_PARAM_DIRECT_OBJECT, 0x2D2D_2D2D);
+        }
+
+        /// `typeEventHotKeyID` = `'hkid'`。
+        /// 是 `kEventParamDirectObject` 里塞的 `EventHotKeyID` 的 type 码。
+        #[test]
+        fn type_event_hot_key_id_matches_carbon_header() {
+            assert_eq!(TYPE_EVENT_HOT_KEY_ID, 0x686B_6964);
+        }
     }
 }
 
