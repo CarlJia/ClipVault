@@ -6,6 +6,11 @@
 // 后续单元接管的动作在此仅调用类型化 IPC 桩并给出 toast 提示：
 // Enter→paste_entry(U8)、⌘E→open_note_editor(U6)、⌘P→toggle_pin(U7)。
 
+// 纯副作用 import：styles.css 不被任何模块引用，只能靠它进入 Vite 的依赖图，
+// 否则构建产物里不会出现 CSS 资产（面板/模态全部无样式）。删掉这一行不会报错，
+// 只会静默失去全部样式 —— 别顺手清理「看起来没人用」的这一行。
+import "./styles.css";
+
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
