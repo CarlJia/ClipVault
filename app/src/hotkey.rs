@@ -121,11 +121,11 @@ fn charkind_to_vkey(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
         ('4', 0x17),
         ('6', 0x15),
         ('5', 0x16),
-        ('9', 0x1C),
-        ('7', 0x1D),
-        ('8', 0x1F),
-        ('0', 0x20),
-        ('O', 0x22),
+        ('9', 0x19),
+        ('7', 0x1A),
+        ('8', 0x1C),
+        ('0', 0x1D),
+        ('O', 0x1F),
         ('U', 0x21),
         ('I', 0x22),
         ('P', 0x23),
@@ -780,7 +780,7 @@ mod tests {
         assert_eq!(charkind_to_vkey(CharKind::Char('V')), Some(0x09)); // upper normalised
         assert_eq!(charkind_to_vkey(CharKind::Char('a')), Some(0x00));
         assert_eq!(charkind_to_vkey(CharKind::Char('z')), Some(0x06));
-        assert_eq!(charkind_to_vkey(CharKind::Char('0')), Some(0x20));
+        assert_eq!(charkind_to_vkey(CharKind::Char('0')), Some(0x1D)); // kVK_ANSI_0
         // Enter, Escape, ArrowUp, ArrowDown
         assert_eq!(charkind_to_vkey(CharKind::Enter), Some(0x24)); // kVK_Return
         assert_eq!(charkind_to_vkey(CharKind::Escape), Some(0x35)); // kVK_Escape

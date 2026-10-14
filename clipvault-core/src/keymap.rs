@@ -112,6 +112,13 @@ impl std::ops::BitOrAssign for Mods {
     }
 }
 
+impl std::ops::BitAndAssign for Mods {
+    #[inline]
+    fn bitand_assign(&mut self, rhs: Mods) {
+        self.0 &= rhs.0;
+    }
+}
+
 /// 键值类别。
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum CharKind {
