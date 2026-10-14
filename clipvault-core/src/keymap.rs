@@ -213,7 +213,12 @@ impl HotkeyAction {
 }
 
 /// Action → KeyCombo 全量映射表。
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+///
+/// **不** 派生 `Default` —— `HashMap` 的派生 Default 产生空表，而本类型的"默认"
+/// 含义是 [`default_map`] 提供的 13 条硬编码条目。`parse` 路径从 default_map 出发、
+/// 缺失字段保留默认值；如果本类型有 `Default::default()`，调用方很容易拿到空表。
+/// 调用方请使用 [`HotkeyMap::default_map`].
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HotkeyMap {
     pub actions: std::collections::HashMap<HotkeyAction, KeyCombo>,
 }

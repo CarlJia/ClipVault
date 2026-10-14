@@ -66,7 +66,6 @@ impl std::error::Error for ConflictReason {}
 fn mods_to_carbon(mods: clipvault_core::keymap::Mods) -> u32 {
     use clipvault_core::keymap::Mods;
     let mut mask = 0u32;
-    // SAFETY: explicit match — Carbon bit layout differs from Mods bit layout
     if mods.contains(Mods::META) {
         mask |= 0x0100; // cmdKey
     }
@@ -295,6 +294,9 @@ mod imp {
             if id.signature == hotkey_id.signature && id.id == hotkey_id.id {
                 if *action == HotkeyAction::OpenPanel {
                     crate::tray::show_panel(app);
+                } else {
+                    // 未来新增全局 action 时在这里处理（现在只支持 OpenPanel）。
+                    eprintln!("[hotkey] 未实现的全局 action: {:?}", action);
                 }
                 break;
             }

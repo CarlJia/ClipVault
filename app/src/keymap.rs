@@ -24,13 +24,9 @@ pub const HOTKEYS_KEY: &str = "hotkeys";
 /// 并在 `Err` 时返回 `Ok(default())`（R3：静默回落，不修改库）。
 pub fn parse_hotkeys(raw: Option<&str>) -> Result<HotkeyMap, String> {
     match raw {
-        Some(json) => parse_hotkeys_str(json),
+        Some(json) => parse_keymap_json(json),
         None => Ok(HotkeyMap::default_map()),
     }
-}
-
-fn parse_hotkeys_str(json: &str) -> Result<HotkeyMap, String> {
-    parse_keymap_json(json)
 }
 
 /// 从 `settings` 表加载 HotkeyMap。

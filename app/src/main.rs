@@ -57,7 +57,7 @@ fn main() {
             let guest_mode = Arc::new(AtomicBool::new(false));
             let skip_next = Arc::new(AtomicBool::new(false));
             let panel_opacity = Arc::new(AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY));
-            let keymap = Arc::new(RwLock::new(clipvault_core::keymap::HotkeyMap::default()));
+            let keymap = Arc::new(RwLock::new(clipvault_core::keymap::HotkeyMap::default_map()));
 
             // 2.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
             //     使重启后 watcher / 托盘 / 前端与上次状态一致。
@@ -80,7 +80,7 @@ fn main() {
             )
             .unwrap_or_else(|e| {
                 eprintln!("[clipvault] boot_load_hotkeys 失败：{e}，使用默认映射");
-                clipvault_core::keymap::HotkeyMap::default()
+                clipvault_core::keymap::HotkeyMap::default_map()
             });
 
             // 注册 IPC 共享状态（在 apply_global_hotkey 之前，因为 apply 需要 AppState.app）。

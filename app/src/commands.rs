@@ -645,9 +645,12 @@ pub async fn set_hotkey(
         .await
         .map_err(|e| e.to_string())?;
 
-    // 5. U2：live re-register 全局热键（若改的是 OpenPanel）
+    // 5. U2：live re-register 全局热键（若改的是 OpenPanel）。
+    //    Clippy 报 collapsible_if 但实际并不触发（外层是 `if`，内层是 `if let`，
+    //    rust-clippy 的 collapsible_if 不合并 `if let`）；保留 `#[allow]` 避免后续
+    //    toolchain 升级误报。`clippy::collapsible_else_if` 也不适用（else 是动作注释）。
+    #[allow(clippy::collapsible_if)]
     if action == HotkeyAction::OpenPanel {
-        #[allow(clippy::collapsible_if)]
         if let Err(e) = crate::keymap::apply_global_hotkey(&state.app, &map) {
             // 注册失败不阻止命令返回（已在内存中更新）；冲突由前端 toast 提示。
             // settings 表已在 step 4 持久化，故本次绑定在库中可见。
