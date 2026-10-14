@@ -223,6 +223,24 @@ pub fn decrypt_payload(
     }
 }
 
+/// color 条目的回贴文本:从 `metadata_json` 的 `rgba` 字段取色值(rgb 之外的键忽略)。
+///
+/// color 是唯一「内容不在 payload 里」的二进制类型 —— 它没有字节可写,能贴出去的就是
+/// 这段色值文本。抽成吃 `Option<&str>` 的纯函数,是为了让「metadata 缺字段 / 不是 JSON /
+/// 不是对象」这些边界能在任意平台上单测,而不必真机跑一次回贴。
+///
+/// 取不到时返回空串(与 `content` 为空的其它二进制类型一致,后端照样会写一个空文本)。
+pub fn color_paste_text(metadata_json: Option<&str>) -> String {
+    metadata_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|meta| {
+            meta.get("rgba")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 /// 回贴编排(纯决策逻辑,平台副作用全走 trait)。
 ///
 /// 顺序对应计划 U8 Approach，并修正了「未授权时内容也进不了剪贴板」的缺陷：
@@ -247,15 +265,20 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
 ) -> Result<PasteOutcome, PasteError> {
     // 1. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
     //    - text kind: 走 `decrypt_content`(base64 解码 entry.content 配 nonce)。
-    //    - 非 text kind: entry.content 留空;vault 条目需要 `decrypt_payload` 解密
+    //    - color kind: 色值在 `metadata_json.rgba`,由 `color_paste_text` 取出(无 payload)。
+    //    - 其余非 text kind: entry.content 留空;vault 条目需要 `decrypt_payload` 解密
     //      payload BLOB;非 vault 条目 payload 是明文,直接用。
     let kind = ContentKind::parse(&entry.content_kind);
-    let text = if matches!(kind, ContentKind::Text) {
-        decrypt_content(entry, nonce, decryptor)?
-    } else {
-        String::new()
+    let text = match kind {
+        ContentKind::Text => decrypt_content(entry, nonce, decryptor)?,
+        ContentKind::Color => color_paste_text(entry.metadata_json.as_deref()),
+        _ => String::new(),
     };
-    let payload_bytes: Option<Vec<u8>> = if matches!(kind, ContentKind::Text) {
+    let payload_bytes: Option<Vec<u8>> = if matches!(kind, ContentKind::Text | ContentKind::Color) {
+        // text 的内容在 `content`;color 的色值在 `metadata_json.rgba` —— 两者都没有
+        // payload。**color 必须和 text 一样跳过这一段**:它走 vault 时 `payload_nonce`
+        // 恒为 None(压根没有 payload 可加密),`decrypt_payload` 会直接
+        // `VaultDecryptFailed`,于是加密区里的颜色条目在写剪贴板前就整体失败了。
         None
     } else {
         let raw = entry.payload.as_deref().unwrap_or(&[]);
@@ -851,9 +874,9 @@ mod imp_win {
         ///   —— 那是 objc2 暴露面不足的权宜之计，Windows 没有这个限制。同时附带一份换行
         ///   文本，使只接受文本的目标（普通输入框）也能拿到路径，这也是资源管理器自己的做法。
         ///
-        /// 注：`Color` 走 `content`，而 `perform_paste` 只对 `Text` 填充 `content`，因此
-        /// **两个平台上 color 条目当前都会粘贴出空文本**（rgba 值存在 `metadata_json` 里，
-        /// 从未传到后端）。这是既有行为，本单元保持一致、不单方面改动 Windows 的表现。
+        /// 注：`Color` 也走 `content` —— `perform_paste` 现在会从 `metadata_json.rgba`
+        /// 取出色值填进 `content`（见 `color_paste_text`），因此两个平台的 color 条目
+        /// 都会粘贴出色值文本（`rgba(r,g,b,a)`）。这里不需要任何 Windows 专属分支。
         fn write_clipboard(
             &self,
             kind: ContentKind,

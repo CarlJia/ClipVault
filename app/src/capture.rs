@@ -121,13 +121,18 @@ impl Captured {
     }
 
     /// 入库时的指纹。同 MVP `hash_prefix`,但 binary 加 `kind:` 前缀
-    /// 避免跨 kind 冲突（KTD8）。
+    /// 避免跨 kind 冲突（KTD8）——**前缀之后必须再喂 payload 字节**:
+    /// 只哈希前缀会让同 kind 的所有内容得到同一个指纹,第二次捕获直接撞
+    /// `entries.content_hash` 的 UNIQUE 约束而被丢弃（见下方回归测试）。
     pub fn fingerprint(&self) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         match (&self.text, &self.payload) {
             (Some(t), _) => hasher.update(format!("text:{}", t).as_bytes()),
-            (None, Some(_)) => hasher.update(format!("{}:", self.kind.as_str()).as_bytes()),
+            (None, Some(payload)) => {
+                hasher.update(format!("{}:", self.kind.as_str()).as_bytes());
+                hasher.update(payload);
+            }
             (None, None) => hasher.update(format!("color:{}", self.metadata).as_bytes()),
         }
         let digest = hasher.finalize();
@@ -229,11 +234,9 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
         return Some(Captured::rtf(bytes));
     }
 
-    // 4. color: NSKeyedArchiver bytes;U2 阶段保留 raw bytes,真正反归档
-    // 与 sRGB 提取留作后续增强（U2 test 中用 Captured::color 直接构造
-    // 验证 metadata 通路即可）。
+    // 4. color: 反归档取出真实 sRGB 分量（U2 的长度占位实现已由 U2 收口单元替换）。
     if let Some(bytes) = unsafe { pb.dataForType(NSPasteboardTypeColor) }.map(|d| d.to_vec()) {
-        return Some(Captured::color(format!("nskeyed:{}B", bytes.len())));
+        return Some(color_capture(&bytes));
     }
 
     // 5. string 兜底（MVP 文本路径）
@@ -522,6 +525,86 @@ pub(crate) use win::{open_clipboard_with_retry, png_format, rtf_format};
 // macOS helpers
 // ---------------------------------------------------------------
 
+/// 颜色捕获:把 `NSPasteboardTypeColor` 的归档还原成 `rgba(r,g,b,a)` 文本。
+///
+/// **颜色条目的身份必须来自颜色内容,不能来自「归档有多长」。** `metadata.rgba` 不只是
+/// 前端色块的 CSS 值与回贴时写进剪贴板的文本,它还是 [`Captured::fingerprint`] 在
+/// color 分支上唯一的内容来源。曾经这里放的是归档字节长度占位(`nskeyed:{}B`),于是
+/// **归档长度相同的两个颜色指纹相同**:实测红色与绿色的 NSColor 归档都是 3603 字节,
+/// 「先复制红、再复制绿」时绿会撞 `entries.content_hash` 的 UNIQUE 约束被静默丢弃 ——
+/// 与图片/文件侧同一个缺陷,只是发生在最后一个还没收口的类型上。
+///
+/// 解不开归档的颜色(图案色等转不出 sRGB 的)退回**字节摘要**而不是长度:占位串本身
+/// 不可读无所谓(这种颜色前端本来就画不出色块),但绝不能丢掉「不同内容 → 不同指纹」,
+/// 否则同一种静默丢弃会换个形式回来。
+#[cfg(target_os = "macos")]
+fn color_capture(bytes: &[u8]) -> Captured {
+    match rgba_from_archived(bytes) {
+        Some(rgba) => Captured::color(rgba),
+        None => Captured::color(format!("nskeyed:{}", bytes_digest(bytes))),
+    }
+}
+
+/// NSColor 归档字节 → `rgba(r,g,b,a)`;读不出来返回 `None`。
+///
+/// 用**安全**反归档 `unarchivedObjectOfClass:fromData:error:` 而不是
+/// `unarchiveObjectWithData:`:剪贴板是任意进程都能写的不可信输入,非安全反归档会
+/// 实例化归档里声明的任意类;指定 `NSColor` 作根类后,归档里出现别的类会直接失败 ——
+/// 那正是我们要的结果(失败即走摘要兜底)。
+///
+/// 实测(本机 macOS):AppKit 自己写出的颜色归档、以及旧式非安全 API 写出的归档,
+/// 这套安全解码都能读出;`colorUsingColorSpace:` 对图案色返回 nil。
+#[cfg(target_os = "macos")]
+fn rgba_from_archived(bytes: &[u8]) -> Option<String> {
+    use objc2::ClassType;
+    use objc2_app_kit::{NSColor, NSColorSpace};
+    use objc2_foundation::{NSData, NSKeyedUnarchiver};
+
+    let data = NSData::with_bytes(bytes);
+    let object = unsafe {
+        NSKeyedUnarchiver::unarchivedObjectOfClass_fromData_error(NSColor::class(), &data)
+    }
+    .ok()?;
+    let color = object.downcast::<NSColor>().ok()?;
+    // 语义色(动态系统色)与图案色在 sRGB 里没有固定分量,这里返回 nil。
+    let srgb = color.colorUsingColorSpace(&NSColorSpace::sRGBColorSpace())?;
+
+    // 夹到 0–255:Display P3 等广色域转 sRGB 会略微越界。分量是 `CGFloat`(64 位平台上
+    // 就是 f64),这里不写多余的 `as f64` —— clippy::unnecessary_cast 会拦。
+    let r = (srgb.redComponent().clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (srgb.greenComponent().clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (srgb.blueComponent().clamp(0.0, 1.0) * 255.0).round() as u8;
+    let alpha = srgb.alphaComponent().clamp(0.0, 1.0);
+    // 不透明写 `1`;否则最多两位小数并去掉尾随 0(`0.5` / `0` / `0.13`)。
+    let alpha = if alpha >= 1.0 {
+        "1".to_string()
+    } else {
+        let text = format!("{alpha:.2}");
+        text.trim_end_matches('0').trim_end_matches('.').to_string()
+    };
+
+    Some(format!("rgba({r},{g},{b},{alpha})"))
+}
+
+/// 归档字节的 SHA-256 前 8 字节(16 位十六进制)。与 [`Captured::fingerprint`] 同形,
+/// 便于一眼认出这是内容摘要而不是长度占位。
+#[cfg(target_os = "macos")]
+fn bytes_digest(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+
+    let mut hex = String::with_capacity(16);
+    for byte in digest.iter().take(8) {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// 读 NSFilenamesPboardType（property-list NSData）解析为路径数组。
 ///
 /// 解析失败或 property-list 不是 NSArray<NSString> 时返回 `None`。后续
@@ -683,6 +766,118 @@ mod tests {
         assert!(c.payload.is_none());
     }
 
+    /// 真实粘贴板颜色归档(sRGB 0.2/0.6/0.9/1.0 的 `NSKeyedArchiver` bplist)。
+    ///
+    /// 生成方式与生产同形:把该 `NSColor` 写进一个私有 `NSPasteboard`,再读
+    /// `NSPasteboardTypeColor` 的字节。夹具写死而不是测试里现造,是为了让用例只测我们的
+    /// 解码路径,不依赖 AppKit 的写侧 API。
+    #[cfg(target_os = "macos")]
+    const NSCOLOR_SRGB_ARCHIVE_B64: &str = concat!(
+        "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8Q",
+        "D05TS2V5ZWRBcmNoaXZlctEICVRyb290gAGmCwwZHyAnVSRudWxs1g0ODxAREhMUFRYXGFYkY2xh",
+        "c3NcTlNDb21wb25lbnRzVU5TUkdCXE5TQ29sb3JTcGFjZV8QEk5TQ3VzdG9tQ29sb3JTcGFjZV8Q",
+        "EE5TTGluZWFyRXhwb3N1cmWABU0wLjIgMC42IDAuOSAxTxAnMC4xNjU1NTAzMzYyIDAuNTIwMDI5",
+        "MTg3MiAwLjg3NDQyMjA3MzQAEAGAAkEw0xobDRwdHlROU0lEVU5TSUNDEAeAA4AETxEMSAAADEhM",
+        "aW5vAhAAAG1udHJSR0IgWFlaIAfOAAIACQAGADEAAGFjc3BNU0ZUAAAAAElFQyBzUkdCAAAAAAAA",
+        "AAAAAAAAAAD21gABAAAAANMtSFAgIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAEWNwcnQAAAFQAAAAM2Rlc2MAAAGEAAAAbHd0cHQAAAHwAAAAFGJrcHQAAAIE",
+        "AAAAFHJYWVoAAAIYAAAAFGdYWVoAAAIsAAAAFGJYWVoAAAJAAAAAFGRtbmQAAAJUAAAAcGRtZGQA",
+        "AALEAAAAiHZ1ZWQAAANMAAAAhnZpZXcAAAPUAAAAJGx1bWkAAAP4AAAAFG1lYXMAAAQMAAAAJHRl",
+        "Y2gAAAQwAAAADHJUUkMAAAQ8AAAIDGdUUkMAAAQ8AAAIDGJUUkMAAAQ8AAAIDHRleHQAAAAAQ29w",
+        "eXJpZ2h0IChjKSAxOTk4IEhld2xldHQtUGFja2FyZCBDb21wYW55AABkZXNjAAAAAAAAABJzUkdC",
+        "IElFQzYxOTY2LTIuMQAAAAAAAAAAAAAAEnNSR0IgSUVDNjE5NjYtMi4xAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABYWVogAAAAAAAA81EAAQAAAAEWzFhZ",
+        "WiAAAAAAAAAAAAAAAAAAAAAAWFlaIAAAAAAAAG+iAAA49QAAA5BYWVogAAAAAAAAYpkAALeFAAAY",
+        "2lhZWiAAAAAAAAAkoAAAD4QAALbPZGVzYwAAAAAAAAAWSUVDIGh0dHA6Ly93d3cuaWVjLmNoAAAA",
+        "AAAAAAAAAAAWSUVDIGh0dHA6Ly93d3cuaWVjLmNoAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAAAAAAAAAAAAAAAAAAGRlc2MAAAAAAAAALklFQyA2MTk2Ni0yLjEgRGVmYXVsdCBSR0Ig",
+        "Y29sb3VyIHNwYWNlIC0gc1JHQgAAAAAAAAAAAAAALklFQyA2MTk2Ni0yLjEgRGVmYXVsdCBSR0Ig",
+        "Y29sb3VyIHNwYWNlIC0gc1JHQgAAAAAAAAAAAAAAAAAAAAAAAAAAAABkZXNjAAAAAAAAACxSZWZl",
+        "cmVuY2UgVmlld2luZyBDb25kaXRpb24gaW4gSUVDNjE5NjYtMi4xAAAAAAAAAAAAAAAsUmVmZXJl",
+        "bmNlIFZpZXdpbmcgQ29uZGl0aW9uIGluIElFQzYxOTY2LTIuMQAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "AAAAAAAAdmlldwAAAAAAE6T+ABRfLgAQzxQAA+3MAAQTCwADXJ4AAAABWFlaIAAAAAAATAlWAFAA",
+        "AABXH+dtZWFzAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAACjwAAAAJzaWcgAAAAAENSVCBjdXJ2",
+        "AAAAAAAABAAAAAAFAAoADwAUABkAHgAjACgALQAyADcAOwBAAEUASgBPAFQAWQBeAGMAaABtAHIA",
+        "dwB8AIEAhgCLAJAAlQCaAJ8ApACpAK4AsgC3ALwAwQDGAMsA0ADVANsA4ADlAOsA8AD2APsBAQEH",
+        "AQ0BEwEZAR8BJQErATIBOAE+AUUBTAFSAVkBYAFnAW4BdQF8AYMBiwGSAZoBoQGpAbEBuQHBAckB",
+        "0QHZAeEB6QHyAfoCAwIMAhQCHQImAi8COAJBAksCVAJdAmcCcQJ6AoQCjgKYAqICrAK2AsECywLV",
+        "AuAC6wL1AwADCwMWAyEDLQM4A0MDTwNaA2YDcgN+A4oDlgOiA64DugPHA9MD4APsA/kEBgQTBCAE",
+        "LQQ7BEgEVQRjBHEEfgSMBJoEqAS2BMQE0wThBPAE/gUNBRwFKwU6BUkFWAVnBXcFhgWWBaYFtQXF",
+        "BdUF5QX2BgYGFgYnBjcGSAZZBmoGewaMBp0GrwbABtEG4wb1BwcHGQcrBz0HTwdhB3QHhgeZB6wH",
+        "vwfSB+UH+AgLCB8IMghGCFoIbgiCCJYIqgi+CNII5wj7CRAJJQk6CU8JZAl5CY8JpAm6Cc8J5Qn7",
+        "ChEKJwo9ClQKagqBCpgKrgrFCtwK8wsLCyILOQtRC2kLgAuYC7ALyAvhC/kMEgwqDEMMXAx1DI4M",
+        "pwzADNkM8w0NDSYNQA1aDXQNjg2pDcMN3g34DhMOLg5JDmQOfw6bDrYO0g7uDwkPJQ9BD14Peg+W",
+        "D7MPzw/sEAkQJhBDEGEQfhCbELkQ1xD1ERMRMRFPEW0RjBGqEckR6BIHEiYSRRJkEoQSoxLDEuMT",
+        "AxMjE0MTYxODE6QTxRPlFAYUJxRJFGoUixStFM4U8BUSFTQVVhV4FZsVvRXgFgMWJhZJFmwWjxay",
+        "FtYW+hcdF0EXZReJF64X0hf3GBsYQBhlGIoYrxjVGPoZIBlFGWsZkRm3Gd0aBBoqGlEadxqeGsUa",
+        "7BsUGzsbYxuKG7Ib2hwCHCocUhx7HKMczBz1HR4dRx1wHZkdwx3sHhYeQB5qHpQevh7pHxMfPh9p",
+        "H5Qfvx/qIBUgQSBsIJggxCDwIRwhSCF1IaEhziH7IiciVSKCIq8i3SMKIzgjZiOUI8Ij8CQfJE0k",
+        "fCSrJNolCSU4JWgllyXHJfcmJyZXJocmtyboJxgnSSd6J6sn3CgNKD8ocSiiKNQpBik4KWspnSnQ",
+        "KgIqNSpoKpsqzysCKzYraSudK9EsBSw5LG4soizXLQwtQS12Last4S4WLkwugi63Lu4vJC9aL5Ev",
+        "xy/+MDUwbDCkMNsxEjFKMYIxujHyMioyYzKbMtQzDTNGM38zuDPxNCs0ZTSeNNg1EzVNNYc1wjX9",
+        "Njc2cjauNuk3JDdgN5w31zgUOFA4jDjIOQU5Qjl/Obw5+To2OnQ6sjrvOy07azuqO+g8JzxlPKQ8",
+        "4z0iPWE9oT3gPiA+YD6gPuA/IT9hP6I/4kAjQGRApkDnQSlBakGsQe5CMEJyQrVC90M6Q31DwEQD",
+        "REdEikTORRJFVUWaRd5GIkZnRqtG8Ec1R3tHwEgFSEtIkUjXSR1JY0mpSfBKN0p9SsRLDEtTS5pL",
+        "4kwqTHJMuk0CTUpNk03cTiVObk63TwBPSU+TT91QJ1BxULtRBlFQUZtR5lIxUnxSx1MTU19TqlP2",
+        "VEJUj1TbVShVdVXCVg9WXFapVvdXRFeSV+BYL1h9WMtZGllpWbhaB1pWWqZa9VtFW5Vb5Vw1XIZc",
+        "1l0nXXhdyV4aXmxevV8PX2Ffs2AFYFdgqmD8YU9homH1YklinGLwY0Njl2PrZEBklGTpZT1lkmXn",
+        "Zj1mkmboZz1nk2fpaD9olmjsaUNpmmnxakhqn2r3a09rp2v/bFdsr20IbWBtuW4SbmtuxG8eb3hv",
+        "0XArcIZw4HE6cZVx8HJLcqZzAXNdc7h0FHRwdMx1KHWFdeF2Pnabdvh3VnezeBF4bnjMeSp5iXnn",
+        "ekZ6pXsEe2N7wnwhfIF84X1BfaF+AX5ifsJ/I3+Ef+WAR4CogQqBa4HNgjCCkoL0g1eDuoQdhICE",
+        "44VHhauGDoZyhteHO4efiASIaYjOiTOJmYn+imSKyoswi5aL/IxjjMqNMY2Yjf+OZo7OjzaPnpAG",
+        "kG6Q1pE/kaiSEZJ6kuOTTZO2lCCUipT0lV+VyZY0lp+XCpd1l+CYTJi4mSSZkJn8mmia1ZtCm6+c",
+        "HJyJnPedZJ3SnkCerp8dn4uf+qBpoNihR6G2oiailqMGo3aj5qRWpMelOKWpphqmi6b9p26n4KhS",
+        "qMSpN6mpqhyqj6sCq3Wr6axcrNCtRK24ri2uoa8Wr4uwALB1sOqxYLHWskuywrM4s660JbSctRO1",
+        "irYBtnm28Ldot+C4WbjRuUq5wro7urW7LrunvCG8m70VvY++Cr6Evv+/er/1wHDA7MFnwePCX8Lb",
+        "w1jD1MRRxM7FS8XIxkbGw8dBx7/IPci8yTrJuco4yrfLNsu2zDXMtc01zbXONs62zzfPuNA50LrR",
+        "PNG+0j/SwdNE08bUSdTL1U7V0dZV1tjXXNfg2GTY6Nls2fHadtr724DcBdyK3RDdlt4c3qLfKd+v",
+        "4DbgveFE4cziU+Lb42Pj6+Rz5PzlhOYN5pbnH+ep6DLovOlG6dDqW+rl63Dr++yG7RHtnO4o7rTv",
+        "QO/M8Fjw5fFy8f/yjPMZ86f0NPTC9VD13vZt9vv3ivgZ+Kj5OPnH+lf65/t3/Af8mP0p/br+S/7c",
+        "/23//9IhIiMkWiRjbGFzc25hbWVYJGNsYXNzZXNcTlNDb2xvclNwYWNloiUmXE5TQ29sb3JTcGFj",
+        "ZVhOU09iamVjdNIhIigpV05TQ29sb3KiKCYACAARABoAJAApADIANwBJAEwAUQBTAFoAYABtAHQA",
+        "gQCHAJQAqQC8AL4AzAD2APgA+gD8AQMBCAEOARABEgEUDWANZQ1wDXkNhg2JDZYNnw2kDawAAAAA",
+        "AAACAQAAAAAAAAAqAAAAAAAAAAAAAAAAAAANrw==",
+    );
+
+    #[cfg(target_os = "macos")]
+    fn nscolor_fixture() -> Vec<u8> {
+        use base64::Engine;
+
+        base64::engine::general_purpose::STANDARD
+            .decode(NSCOLOR_SRGB_ARCHIVE_B64)
+            .expect("夹具必须是合法 base64")
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn color_capture_decodes_to_srgb_rgba() {
+        // 回归:修前 color 的身份是归档字节长度占位(`nskeyed:{}B`),而实测红与绿的
+        // NSColor 归档都是 3603 字节 —— 等长即同指纹,第二个颜色会被 content_hash
+        // UNIQUE 静默丢弃,和图片侧是同一个缺陷。
+        let captured = color_capture(&nscolor_fixture());
+        assert_eq!(captured.kind, ContentKind::Color);
+        assert_eq!(
+            captured.metadata["rgba"], "rgba(51,153,230,1)",
+            "身份必须来自解码出的颜色内容,而不是归档有多长"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn color_capture_falls_back_to_a_content_digest() {
+        // 解不开归档的颜色也不能退回长度占位:两个**等长**但内容不同的垃圾输入必须
+        // 得到不同指纹(长度占位会让它们相同,静默丢弃就换个形式回来了)。
+        let a = color_capture(b"not a color archive!!");
+        let b = color_capture(b"not a color archive??");
+        assert_ne!(a.fingerprint(), b.fingerprint());
+        assert!(
+            a.metadata["rgba"]
+                .as_str()
+                .is_some_and(|s| s.starts_with("nskeyed:")),
+            "兜底仍是归档摘要占位串"
+        );
+    }
+
     #[test]
     fn image_captured_records_dimensions_and_size() {
         // 1x1 transparent PNG
@@ -705,6 +900,36 @@ mod tests {
         assert_ne!(file.fingerprint(), image.fingerprint());
         assert_ne!(image.fingerprint(), rtf.fingerprint());
         assert_ne!(rtf.fingerprint(), text.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_differs_within_kind_for_different_payloads() {
+        // 回归：binary 分支曾只把 kind 名喂进摘要,同 kind 的第二次捕获会得到
+        // 完全相同的指纹,撞 entries.content_hash UNIQUE 后被静默丢弃 ——
+        // 用户可见症状就是「复制图片不进历史」(只有第一张进得去)。
+        let img_a = Captured::image("image/png", b"png-bytes-a".to_vec(), 1, 1);
+        let img_b = Captured::image("image/png", b"png-bytes-b".to_vec(), 1, 1);
+        assert_ne!(
+            img_a.fingerprint(),
+            img_b.fingerprint(),
+            "同 kind 不同 payload 必须得到不同指纹"
+        );
+
+        let file_a = Captured::file(vec!["/tmp/a.txt".into()], true);
+        let file_b = Captured::file(vec!["/tmp/b.txt".into()], true);
+        assert_ne!(file_a.fingerprint(), file_b.fingerprint());
+
+        let rtf_a = Captured::rtf(b"{\\rtf1 a}".to_vec());
+        let rtf_b = Captured::rtf(b"{\\rtf1 b}".to_vec());
+        assert_ne!(rtf_a.fingerprint(), rtf_b.fingerprint());
+
+        // 指纹必须仍然是 payload 的确定函数:5 秒去重窗口靠它判「同一条内容」,
+        // 换个不稳定来源(时间戳、地址)会让去重整体失效。
+        assert_eq!(
+            img_a.fingerprint(),
+            Captured::image("image/png", b"png-bytes-a".to_vec(), 1, 1).fingerprint(),
+            "同 kind 同 payload 的指纹必须稳定"
+        );
     }
 
     #[test]

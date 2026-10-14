@@ -14,7 +14,7 @@ use clipvault_core::crypto::CryptoError;
 use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, InjectError, PasteBackend, PasteError, PasteOutcome, cgevent_fail_msg,
-    modifier_label, no_accessibility_msg, perform_paste, should_replace_target,
+    color_paste_text, modifier_label, no_accessibility_msg, perform_paste, should_replace_target,
     vault_decrypt_fail_msg, wait_for_frontmost, window_switched_msg,
 };
 
@@ -186,6 +186,50 @@ fn image_entry() -> Entry {
         Some(b"\x89PNG raw bytes".to_vec()),
         None,
         Some(r#"{"width":1,"height":1}"#.to_string()),
+    )
+}
+
+/// 构造一条非加密颜色条目：色值只存在 `metadata_json.rgba`，`payload` 为空
+/// （macOS 的颜色捕获本来就只产出一段 rgba 文本）。
+fn color_entry(rgba: &str) -> Entry {
+    Entry::from_row(
+        5,
+        "colorhash".to_string(),
+        String::new(),
+        String::new(),
+        "color".to_string(),
+        0,
+        None,
+        0,
+        1,
+        0,
+        "color".to_string(),
+        None,
+        None,
+        None,
+        Some(format!(r#"{{"rgba":"{rgba}"}}"#)),
+    )
+}
+
+/// 构造一条加密区颜色条目（`is_vault = 1`，`payload` / `payload_nonce` 均为空 ——
+/// 颜色本来就没有 payload 可加密）。
+fn vault_color_entry() -> Entry {
+    Entry::from_row(
+        6,
+        "vcolorhash".to_string(),
+        String::new(),
+        String::new(),
+        "color".to_string(),
+        0,
+        None,
+        1, // is_vault
+        1,
+        0,
+        "color".to_string(),
+        None,
+        None,
+        None,
+        Some(r#"{"rgba":"rgba(51,153,230,1)"}"#.to_string()),
     )
 }
 
@@ -614,4 +658,77 @@ fn target_replaced_when_other_app_is_frontmost() {
 #[test]
 fn target_kept_when_frontmost_unknown() {
     assert!(!should_replace_target(None, 42));
+}
+
+// ----------------------------------------------------------------
+// color 回贴：色值从 metadata_json 取出（U2 收口）
+// ----------------------------------------------------------------
+//
+// 颜色条目没有 payload 可写，能贴出去的就是 `metadata_json.rgba` 这段文本。此前
+// `perform_paste` 只对 `Text` 填 `content`，于是两个平台上回贴颜色都会写出空文本。
+
+/// 颜色条目回贴时写的是 rgba 色值，而不是空串。
+#[test]
+fn color_entry_pastes_rgba_text() {
+    let checker = MockChecker { trusted: false };
+    let backend = MockBackend::default();
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &color_entry("rgba(51,153,230,1)"),
+        None,
+        None,
+        None,
+        &NeverDecryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::NoAccessibilityClipboardOnly));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Color));
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some("rgba(51,153,230,1)"),
+        "颜色条目的回贴文本必须来自 metadata_json.rgba"
+    );
+}
+
+/// 加密区里的颜色条目同样要贴出色值：颜色没有 payload，`perform_paste` 若照旧让非 text
+/// 类型走 `decrypt_payload`，会因 `payload_nonce` 为 None 直接 `VaultDecryptFailed` ——
+/// 表现是「加密区里的颜色条目按回车后什么都没发生」。
+#[test]
+fn vaulted_color_entry_pastes_rgba_without_payload_decrypt() {
+    let checker = MockChecker { trusted: false };
+    let backend = MockBackend::default();
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_color_entry(),
+        None,
+        None,
+        None,
+        &NeverDecryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::NoAccessibilityClipboardOnly));
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some("rgba(51,153,230,1)"),
+        "加密区颜色条目也必须贴出色值,而不是卡在解密 payload 那一步"
+    );
+}
+
+/// `color_paste_text` 的边界：取不到就空串，绝不 panic，也不把非字符串当成色值。
+#[test]
+fn color_paste_text_handles_missing_or_odd_metadata() {
+    assert_eq!(color_paste_text(None), "");
+    assert_eq!(color_paste_text(Some("")), "");
+    assert_eq!(color_paste_text(Some("not json")), "");
+    assert_eq!(color_paste_text(Some("{}")), "");
+    assert_eq!(color_paste_text(Some(r#"{"rgba":123}"#)), "");
+    assert_eq!(color_paste_text(Some(r#"{"width":1}"#)), "");
+    assert_eq!(
+        color_paste_text(Some(r#"{"rgba":"rgba(0,0,0,1)"}"#)),
+        "rgba(0,0,0,1)"
+    );
 }
