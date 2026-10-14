@@ -413,14 +413,12 @@ mod imp_macos {
 /// （物理像素 vs AppKit 点、y 向下 vs y 向上）。取数走
 /// `GetForegroundWindow` / `GetWindowThreadProcessId` / `GetWindowRect` / `GetCursorPos`，
 /// 四个 API 都在已启用的 `Win32_UI_WindowsAndMessaging` feature 下，**不新增 feature**
-/// （`MonitorFromWindow` / `GetMonitorInfoW` 在未启用的 `Win32_Graphics_Gdi` 下，故选屏
-/// 交给 Tauri 的 `monitor_from_point`，见 `app/Cargo.toml`）。
+/// （`MonitorFromWindow` / `GetMonitorInfoW` 处于未启用的 `Win32_Graphics_Gdi` 下，与本适配层无关：选屏在 `available_monitors()` 的同一份列表上直接按下标取用，不调用 `monitor_from_point`，详见 `place()` 内联注释）。
 ///
 /// # 线程模型
 ///
 /// 本适配层由 `app/src/hotkey.rs` 自建的消息泵线程调用，**不是主线程**。因此只用线程
-/// 安全的 Tauri API（`available_monitors` / `monitor_from_point` / `primary_monitor` /
-/// `set_position`，内部向事件循环投递消息并等应答），**不引入任何主线程假设**，也不碰
+/// 安全的 Tauri API（`available_monitors` / `primary_monitor` / `set_position`，内部向事件循环投递消息并等应答），**不引入任何主线程假设**，也不碰
 /// AppKit 那套（`MainThreadMarker` / `NSScreen`）。
 #[cfg(target_os = "windows")]
 mod imp_win {
@@ -664,6 +662,51 @@ mod tests {
             y: 500.0,
         };
         assert_eq!(select_display(None, Some(cursor), &displays), Some(1));
+    }
+
+    #[test]
+    fn falls_back_to_nearest_when_cursor_sits_in_the_gap() {
+        // 与 selects_nearest_display_when_focus_in_gap 同型两块屏（主屏 (0,0,1000,1000)、
+        // 副屏 (2000,0,1000,1000)，中间 (1000,2000) 整段空隙），但把焦点空出来、只给一个
+        // 落在空隙中的鼠标点，断言 select_display 走「最近屏」档、命中副屏。
+        let displays = vec![
+            Display {
+                bounds: rect(0.0, 0.0, 1000.0, 1000.0),
+                work: rect(0.0, 0.0, 1000.0, 1000.0),
+            },
+            Display {
+                bounds: rect(2000.0, 0.0, 1000.0, 1000.0),
+                work: rect(2000.0, 0.0, 1000.0, 1000.0),
+            },
+        ];
+        // 鼠标在空隙偏副屏一侧 (1700, 500) —— 第 1/2 档都不命中，落到 min_by 取最近（副屏比主屏近 200）。
+        let cursor = Point {
+            x: 1700.0,
+            y: 500.0,
+        };
+        assert_eq!(select_display(None, Some(cursor), &displays), Some(1));
+    }
+
+    #[test]
+    fn nearest_probe_prefers_focused_center_over_cursor() {
+        // 第 3 档的 `probe` 必须以 focused 中心优先、cursor 兜底；颠倒顺序会让 Cursor 档
+        // （前台是自己 / 取不到 pid）的最近屏判定走错屏。
+        let displays = vec![
+            Display {
+                bounds: rect(0.0, 0.0, 1000.0, 1000.0),
+                work: rect(0.0, 0.0, 1000.0, 1000.0),
+            },
+            Display {
+                bounds: rect(2000.0, 0.0, 1000.0, 1000.0),
+                work: rect(2000.0, 0.0, 1000.0, 1000.0),
+            },
+        ];
+        let focused = rect(1900.0, 400.0, 200.0, 200.0); // 中心 (2000,500) 落在副屏
+        let cursor = Point { x: 500.0, y: 500.0 }; // 中心在主屏
+        assert_eq!(
+            select_display(Some(focused), Some(cursor), &displays),
+            Some(1)
+        );
     }
 
     #[test]
