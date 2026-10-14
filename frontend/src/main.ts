@@ -554,16 +554,13 @@ vaultClearEl.addEventListener("click", () => {
 // ----------------------------------------------------------------
 
 /**
- * 把 0-100 百分比透明度即时应用到 `--bg` CSS 变量。
- * `.panel` (`styles.css:49`) 用 `background: var(--bg)`，只动变量就一处生效，
- * `backdrop-filter: blur(20px)` 不被破坏、不触发重排。
+ * 把 0-100 百分比透明度即时应用到 `--panel-alpha` CSS 变量（U5：全页唯一写入者）。
+ * `.panel` 的 `--bg`（`styles.css` `:root`）与 `#settings` 遮罩都从该变量派生，
+ * 只动这一个变量就全页生效，不触发重排。
  */
 function applyPanelOpacity(percent: number): void {
   const alpha = Math.max(0, Math.min(100, percent)) / 100;
-  document.documentElement.style.setProperty(
-    "--bg",
-    `rgba(28, 28, 32, ${alpha})`,
-  );
+  document.documentElement.style.setProperty("--panel-alpha", String(alpha));
 }
 
 /** 打开设置模态，并把 slider 位置 / 文本对齐到当前后端值。 */
@@ -758,7 +755,7 @@ setEditorCloseHandler(() => {
 void listen("open-settings", () => {
   void openSettings();
 });
-// U12：启动时一次性把 `--bg` CSS 变量对齐到后端持久化的透明度，
+// U12：启动时一次性把 `--panel-alpha` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
 void getPanelOpacity().then(applyPanelOpacity);
 // U7：平台标识（`platform_info`）先到位再首屏渲染 —— 底部键帽、行序号徽标（⌘1–9）、

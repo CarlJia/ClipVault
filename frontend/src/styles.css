@@ -1,7 +1,14 @@
 /* ClipVault — Raycast 风格暗色浮层（U4）。 */
 
 :root {
-  --bg: rgba(28, 28, 32, 0.78);
+  /* 面板透明度 alpha（无单位数值），U5 起为全页唯一来源。
+     跨边界不变量（KTD6）：此默认值必须等于 Rust `app/src/privacy.rs` 的
+     `DEFAULT_PANEL_OPACITY / 100`（78 → 0.78），且不得越出
+     `[MIN_PANEL_OPACITY, MAX_PANEL_OPACITY] / 100 = [0.30, 1.0]`。
+     运行期由 `main.ts` 的 `applyPanelOpacity` 覆写，`--bg` 从这里派生，
+     不再有第二份默认值需要手工同步。 */
+  --panel-alpha: 0.78;
+  --bg: rgba(28, 28, 32, var(--panel-alpha));
   --surface: rgba(255, 255, 255, 0.06);
   --surface-hover: rgba(255, 255, 255, 0.1);
   --selected: rgba(10, 132, 255, 0.22);
@@ -739,6 +746,15 @@ body {
 /* ---------------------------------------------------------------- */
 /* 设置模态（U12）                                                    */
 /* ---------------------------------------------------------------- */
+
+/* 设置模态遮罩（U5）：由面板透明度派生，随滑块同向变化，让「拖动即有反馈」
+   在设置打开时也看得见。映射两端：面板 alpha 0.30 → 遮罩 0.12，
+   面板 alpha 1.0 → 遮罩 0.40，中间线性 —— 即 `0.12 + 0.4*(a-0.30) = a*0.4`，
+   正好是一句 `* 0.4`。默认 78% 时遮罩约 0.31，卡片四周仍压得住。
+   只覆盖 `#settings`：`#editor` / `#vault` 继续用 .editor 的 rgba(0,0,0,0.4)。 */
+#settings {
+  background: rgba(0, 0, 0, calc(var(--panel-alpha) * 0.4));
+}
 
 .settings-card {
   max-width: 420px;

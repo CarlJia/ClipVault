@@ -215,8 +215,8 @@ export async function refreshKeychainBanner(banner: HTMLElement): Promise<void> 
 
 /**
  * 默认透明度（0-100 整数百分比），与后端 `privacy::DEFAULT_PANEL_OPACITY`、
- * `styles.css` `--bg` 默认 0.78 三处对齐。前端任何 fallback 都走这个值，
- * 避免后端拉取失败时显示空背景。
+ * `styles.css` 的 `--panel-alpha` 默认值 0.78（`--bg` 由它派生）对齐。前端任何
+ * fallback 都走这个值，避免后端拉取失败时显示空背景。
  */
 export const DEFAULT_PANEL_OPACITY = 78;
 
