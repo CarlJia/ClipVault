@@ -311,7 +311,13 @@ function startRecording(action: HotkeyAction): void {
 
   recordingAction = action;
   const row = document.querySelector<HTMLElement>(`[data-action="${action}"]`);
-  if (row) row.classList.add("recording");
+  if (row) {
+    row.classList.add("recording");
+    // 进入录制态的行自动滚入可见区（R11）：若该行接近内容区（.settings-body）
+    // 底部，用户看不到「请按新键…」。block:"nearest" 只在该行不可见时才滚动，
+    // 已可见则不跳动；.hotkey-row 的 scroll-margin-block 留出贴边余量。
+    row.scrollIntoView({ block: "nearest" });
+  }
   const kbd = row?.querySelector<HTMLElement>(".hotkey-row-combo kbd");
   if (kbd) kbd.textContent = "请按新键…";
 

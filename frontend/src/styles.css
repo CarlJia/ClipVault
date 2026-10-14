@@ -742,6 +742,44 @@ body {
 
 .settings-card {
   max-width: 420px;
+  /* 高度上限：相对 .editor 的内容盒解析（.editor 是 inset:0 + padding:16px 的
+     flex 居中容器），已自动扣除四周各 16px 内边距 —— 即 420 - 32 = 388px。
+     不要把这里写成「面板高度减去 16px」：竖直内边距是上下各 16px（合计 32px），
+     按单边算会正好复现本次要修的裁切。同 .vault-card 的 `max-height: 80%` 思路。 */
+  max-height: 100%;
+}
+
+/* 设置卡片的内容区：透明度字段 + 快捷键区块。
+   flex:1 + min-height:0 是让这块超长 flex 子项真的被压缩、从而触发滚动的关键
+   （缺 min-height:0，flex 子项的默认 min-height:auto 会让它撑到内容高度、永不滚动）。
+   overscroll-behavior:contain 让滚轮事件在此终止：内容区是滚轮的唯一归属，
+   不把滚动链传给面板底层的 .list（R17）。 */
+.settings-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+  /* 原 .editor-card 的 gap:12px 提供的内容间距，孩子搬进来后由本层承接。 */
+  gap: 12px;
+  /* 细滚动条而不是隐藏（R12：保留可见的滚动 affordance）。Firefox/标准属性… */
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) transparent;
+}
+/* …与 WebKit（Tauri 用的 WKWebView / WebView2 均走这里）的细滚动条。 */
+.settings-body::-webkit-scrollbar {
+  width: 8px;
+}
+.settings-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.settings-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.settings-body::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
 }
 .settings-row {
   display: flex;
@@ -817,6 +855,9 @@ body {
   align-items: center;
   gap: 8px;
   padding: 4px 0;
+  /* 进入录制态时该行会 scrollIntoView({ block: "nearest" })（见 settings.ts
+     startRecording）。留 8px 滚动边距，贴边时不至于紧贴内容区上下沿。 */
+  scroll-margin-block: 8px;
 }
 
 .hotkey-row-label {

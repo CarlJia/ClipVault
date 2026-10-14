@@ -108,6 +108,9 @@ const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
 const settingsCloseEl = document.querySelector<HTMLButtonElement>("#settings-close")!;
 const opacityEl = document.querySelector<HTMLInputElement>("#settings-opacity")!;
 const opacityValueEl = document.querySelector<HTMLSpanElement>("#settings-opacity-value")!;
+// 设置卡片内容区（透明度字段 + 快捷键区块）。超长时在此滚动，标题栏与底部提示
+// 常驻不滚动（U4）。
+const settingsBodyEl = document.querySelector<HTMLDivElement>("#settings-body")!;
 
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
@@ -569,6 +572,9 @@ async function openSettings(): Promise<void> {
   opacityEl.value = String(v);
   opacityValueEl.textContent = `${v}%`;
   settingsEl.classList.remove("hidden");
+  // 每次打开都把内容区复位到顶部（R10）：上次滚到快捷键列表底部的滚动位置
+  // 不应残留，否则打开就停在半截。
+  settingsBodyEl.scrollTop = 0;
   // 渲染快捷键区块（U4）
   void renderHotkeysSection();
   // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。

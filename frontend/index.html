@@ -99,22 +99,28 @@
               <span class="editor-title">设置</span>
               <button id="settings-close" class="banner-btn">关闭</button>
             </div>
-            <div class="editor-field">
-              <label class="editor-label" for="settings-opacity">面板透明度</label>
-              <div class="settings-row">
-                <input id="settings-opacity" class="slider" type="range" min="30" max="100" step="2" />
-                <span id="settings-opacity-value" class="settings-value">78%</span>
+            <!-- 内容区（U4）：透明度字段 + 快捷键区块。快捷键列表 1+12 行会把卡片
+                 撑高到超过 560×420 面板，故这段内容放入可滚动的内容区；标题栏
+                 （.editor-head）与底部提示（.editor-foot）留在卡片直接子级常驻不滚动。
+                 滚轮事件由这里独占，不带动面板底层的 .list（R17）。 -->
+            <div class="settings-body" id="settings-body">
+              <div class="editor-field">
+                <label class="editor-label" for="settings-opacity">面板透明度</label>
+                <div class="settings-row">
+                  <input id="settings-opacity" class="slider" type="range" min="30" max="100" step="2" />
+                  <span id="settings-opacity-value" class="settings-value">78%</span>
+                </div>
               </div>
-            </div>
-            <div class="settings-section settings-hotkeys-section">
-              <div class="settings-section-title">快捷键</div>
-              <div class="hotkey-group" id="hotkey-group-global">
-                <div class="hotkey-group-title">全局热键</div>
-                <ul class="hotkey-list" id="hotkey-list-global"></ul>
-              </div>
-              <div class="hotkey-group" id="hotkey-group-panel">
-                <div class="hotkey-group-title">面板内快捷键</div>
-                <ul class="hotkey-list" id="hotkey-list-panel"></ul>
+              <div class="settings-section settings-hotkeys-section">
+                <div class="settings-section-title">快捷键</div>
+                <div class="hotkey-group" id="hotkey-group-global">
+                  <div class="hotkey-group-title">全局热键</div>
+                  <ul class="hotkey-list" id="hotkey-list-global"></ul>
+                </div>
+                <div class="hotkey-group" id="hotkey-group-panel">
+                  <div class="hotkey-group-title">面板内快捷键</div>
+                  <ul class="hotkey-list" id="hotkey-list-panel"></ul>
+                </div>
               </div>
             </div>
             <div class="editor-foot">
