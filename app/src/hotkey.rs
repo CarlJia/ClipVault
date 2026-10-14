@@ -536,6 +536,7 @@ fn charkind_to_vk(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
         CharKind::Escape => Some(0x1B),    // VK_ESCAPE
         CharKind::ArrowUp => Some(0x26),   // VK_UP
         CharKind::ArrowDown => Some(0x28), // VK_DOWN
+        CharKind::Comma => Some(0xBC),     // VK_OEM_COMMA
     }
 }
 
@@ -544,16 +545,17 @@ mod imp_win {
     use super::ConflictReason;
     use super::{charkind_to_vk, mods_to_win32};
     use std::collections::HashMap;
+    use std::sync::Mutex;
     use std::sync::mpsc;
-    use std::sync::{Mutex, OnceLock};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
     use clipvault_core::keymap::{HotkeyAction, KeyCombo};
     use tauri::AppHandle;
-    use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage, WM_HOTKEY,
     };
@@ -631,7 +633,7 @@ mod imp_win {
                 let mut guard = PUMP.lock().expect("hotkey pump mutex poisoned");
                 if let Some(ref mut p) = *guard {
                     p.thread_id = thread_id;
-                    p.handle = handle;
+                    p.handle = Some(handle);
                     return Ok(());
                 }
                 STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -796,7 +798,7 @@ mod imp_win {
                     };
                     let mask = mods_to_win32(combo.mods);
                     unsafe {
-                        if RegisterHotKey(None, id, mask, vk).is_err() {
+                        if RegisterHotKey(None, id, HOT_KEY_MODIFIERS(mask), vk).is_err() {
                             let _ = reply.send(Err(ConflictReason::Taken(format!(
                                 "RegisterHotKey failed for id {id}"
                             ))));
