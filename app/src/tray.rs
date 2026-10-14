@@ -230,7 +230,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             let _ = app.emit("open-settings", ());
         }
         "quit" => {
-            crate::hotkey::unregister();
+            crate::hotkey::unregister_all();
             app.exit(0);
         }
         _ => {}

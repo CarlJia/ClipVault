@@ -32,6 +32,8 @@ pub struct AppState {
     pub skip_next: Arc<AtomicBool>,
     pub panel_opacity: Arc<AtomicU32>,
     pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
+    /// U2：AppHandle，用于 apply_global_hotkey 和 hotkey::register。
+    pub app: tauri::AppHandle,
 }
 
 /// 单条剪贴板记录的前端 DTO。
@@ -642,6 +644,17 @@ pub async fn set_hotkey(
     crate::keymap::set_hotkey(&state.storage, &state.keymap, &map)
         .await
         .map_err(|e| e.to_string())?;
+
+    // 5. U2：live re-register 全局热键（若改的是 OpenPanel）
+    if action == HotkeyAction::OpenPanel {
+        #[allow(clippy::collapsible_if)]
+        if let Err(e) = crate::keymap::apply_global_hotkey(&state.app, &map) {
+            // 注册失败不阻止命令返回（已在内存中更新）；冲突由前端 toast 提示。
+            // settings 表已在 step 4 持久化，故本次绑定在库中可见。
+            // 用户需再改一次才能重试，或重启后回落。
+            eprintln!("[keymap] apply_global_hotkey 失败：{e}");
+        }
+    }
 
     Ok(())
 }

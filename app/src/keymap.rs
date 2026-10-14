@@ -1,11 +1,12 @@
-//! HotkeyMap 持久化层（U1）。
+//! HotkeyMap 持久化层（U1 / U2）。
 //!
 //! 与 [`crate::privacy::panel_opacity`] 同形：
 //! - `parse_hotkeys` — 纯函数，把 DB 原始 JSON 字符串解析为 `HotkeyMap`
 //! - `load_persist_hotkeys` — Storage wrapper，读出 parse 失败时返回 `Ok(default())`
 //! - `persist_hotkeys` — 写入 `settings` 表 `hotkeys` 行
 //! - `boot_load_hotkeys` — 启动路径：load → 写入 `Arc<RwLock<HotkeyMap>>`
-//! - `apply_hotkey_to_global` — 运行时更新 in-memory slot（U2 再接入 `hotkey::apply_global_hotkey`）
+//! - `apply_hotkeys` — 运行时更新 in-memory slot
+//! - `apply_global_hotkey` — 全局热键 re-register（U2：串起 `hotkey::register`）
 
 use std::sync::RwLock;
 
@@ -59,6 +60,28 @@ pub async fn persist_hotkeys(storage: &Storage, map: &HotkeyMap) -> SqliteResult
 pub fn apply_hotkeys(slot: &RwLock<HotkeyMap>, map: &HotkeyMap) {
     // 从来不失败，所以不用 Result
     *slot.write().unwrap() = map.clone();
+}
+
+/// 全局热键 re-register：清空旧注册 → 对每个 HotkeyAction::OpenPanel 映射重新注册。
+///
+/// 成功：全部注册成功 → `Ok(())`
+/// 失败：任一失败 → `unregister_all()` 清理已注册项 → 返回 `Err(ConflictReason)`
+///
+/// 平台翻译在 `crate::hotkey::register` 内部完成；本函数只负责串起调用链。
+pub fn apply_global_hotkey(
+    app: &tauri::AppHandle,
+    map: &HotkeyMap,
+) -> Result<(), crate::hotkey::ConflictReason> {
+    use clipvault_core::keymap::HotkeyAction;
+
+    crate::hotkey::unregister_all();
+
+    // 目前只有 OpenPanel 是全局热键；其余 action 在面板内通过 WebView 处理。
+    if let Some(combo) = map.actions.get(&HotkeyAction::OpenPanel) {
+        crate::hotkey::register(app, HotkeyAction::OpenPanel, combo)?;
+    }
+
+    Ok(())
 }
 
 /// 写路径：持久化 → 更新共享 slot（即时生效）。

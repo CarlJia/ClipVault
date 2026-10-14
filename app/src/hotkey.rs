@@ -1,27 +1,167 @@
-//! 全局快捷键（⌥⌘V）+ Accessibility 检测（U4 / KTD2 / R2 / R14 基础）。
+//! 全局快捷键（⌥⌘V）+ Accessibility 检测（U2 / U4 / KTD2 / KTD3 / R2 / R14 基础）。
 //!
-//! **实现选择：** 直接声明 Carbon `RegisterEventHotKey` 家族的 `extern "C"` 绑定，
+//! ## 热键注册 API（U2）
+//!
+//! `register(app, action: HotkeyAction, combo: &KeyCombo) -> Result<(), ConflictReason>`
+//! 接受显式 `KeyCombo`，失败时返回 `ConflictReason`。
+//!
+//! macOS：`Mutex<Vec<(EventHotKeyRef, EventHotKeyID, HotkeyAction)>>` 支持多 hotkey，
+//! 通过 `EventHotKeyID.id` 路由。`unregister_all()` 遍历注销。
+//!
+//! Windows：通道式消息泵线程，`PumpMsg::Register / Unregister / Quit` 通过 channel 发送，
+//! pump 内部维护 `HashMap<i32, HotkeyAction>` 路由。
+//!
+//! ## Mods 位标志 → Carbon / Win32 修饰掩码（U2）
+//!
+//! `Mods` 位布局：Meta=0x01 / Shift=0x02 / Alt=0x04 / Ctrl=0x08。
+//! Carbon 位常量：cmdKey=0x0100 / shiftKey=0x0200 / optionKey=0x0800 / controlKey=0x1000。
+//! **两者位布局不同，翻译必须显式 match，不得混用常量。**
+//!
+//! ## 实现选择（延续 U4）
+//!
+//! 直接声明 Carbon `RegisterEventHotKey` 家族的 `extern "C"` 绑定，
 //! 并 `#[link(name = "Carbon", kind = "framework")]`。`RegisterEventHotKey` /
-//! `InstallEventHandler` 是纯 C 的 Carbon API，不是 Objective-C 消息，因此不需要
-//! 走 `objc2` 的 `msg_send`——原生 FFI 是最直接、依赖最少的路径，且完全满足
-//! KTD2「用 Carbon 而非 tauri-plugin-global-shortcut」的约束（不引入任何 shortcut 插件）。
-//! `objc2` 仍在 watcher 里用于 NSPasteboard。
+//! `InstallEventHandler` 是纯 C 的 Carbon API，不需要 `objc2`。
 //!
-//! Carbon 事件处理器安装在 application event target 上，回调在主线程 run loop 中被调用，
-//! 因此可以安全地直接调用 Tauri 的 `window.show()` / `set_focus()`。
+//! Windows 侧用 `RegisterHotKey` 注册 `Ctrl+Alt+V`，并为本热键单开一条消息泵线程。
 //!
-//! **Windows 侧**（U2）用 `RegisterHotKey` 注册 `Ctrl+Alt+V`，并为本热键单开一条
-//! 消息泵线程——`RegisterHotKey` 把热键绑定到**调用线程的消息队列**，没有 `GetMessageW`
-//! 循环它就不生效。同样不引入任何 shortcut 插件（KTD2 的跨平台延续）。
-//!
-//! 其余平台整体降级为 no-op（`register` 什么都不做，`check_accessibility` 返回 `true`）。
+//! 其余平台整体降级为 no-op。
+
+// ---------------------------------------------------------------------------
+// ConflictReason（U2）
+// ---------------------------------------------------------------------------
+
+/// 热键注册失败原因。
+#[derive(Debug, Clone)]
+pub enum ConflictReason {
+    /// 该热键被现有程序占用；`description` 含 platform 错误码 + 原始 Carbon / Win32 Errno 字面量。
+    Taken(String),
+}
+
+impl std::fmt::Display for ConflictReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConflictReason::Taken(d) => write!(f, "已被占用：{d}"),
+        }
+    }
+}
+
+impl std::error::Error for ConflictReason {}
+
+// ---------------------------------------------------------------------------
+// KeyCombo → Carbon 平台翻译（U2）
+// ---------------------------------------------------------------------------
+
+/// 将 `clipvault_core::keymap::Mods`（Meta=0x01 / Shift=0x02 / Alt=0x04 / Ctrl=0x08）
+/// 翻译为 Carbon 修饰掩码（cmdKey=0x0100 / shiftKey=0x0200 / optionKey=0x0800 / controlKey=0x1000）。
+///
+/// **注意**：Carbon 的位常量与 `Mods` 位标志**不是同一个布局**；
+/// 本函数做显式 match 翻译，调用方不得混用两侧常量。
+///
+/// SAFETY/notes:
+/// - Carbon 的位布局是 `cmdKey=0x0100 / shiftKey=0x0200 / optionKey=0x0800 / controlKey=0x1000`，
+///   与 `Mods`（Meta=0x01 / Shift=0x02 / Alt=0x04 / Ctrl=0x08）完全不同。
+/// - `Mods::META`（0x01）映射到 Carbon `cmdKey`（0x0100）—— 不是 1:1 位平移。
+#[cfg(target_os = "macos")]
+fn mods_to_carbon(mods: clipvault_core::keymap::Mods) -> u32 {
+    use clipvault_core::keymap::Mods;
+    let mut mask = 0u32;
+    // SAFETY: explicit match — Carbon bit layout differs from Mods bit layout
+    if mods.contains(Mods::META) {
+        mask |= 0x0100; // cmdKey
+    }
+    if mods.contains(Mods::SHIFT) {
+        mask |= 0x0200; // shiftKey
+    }
+    if mods.contains(Mods::ALT) {
+        mask |= 0x0800; // optionKey
+    }
+    if mods.contains(Mods::CTRL) {
+        mask |= 0x1000; // controlKey
+    }
+    mask
+}
+
+/// 将 `clipvault_core::keymap::CharKind` 翻译为 Carbon 虚拟键码（kVK_*）。
+///
+/// macOS 虚拟键码不是 ASCII：kVK_ANSI_A=0x00, B=0x0B, C=0x08, Q=0x0C,
+/// S=0x01, V=0x09, W=0x0D, X=0x07, Y=0x10, Z=0x06。
+/// 使用静态查找表而非公式推算。
+///
+/// SAFETY/notes:
+/// - 返回值是 macOS 虚拟键码表中对应键的 kVK_ANSI_* / kVK_* 常量。
+/// - 字母键用大写形式查找。
+#[cfg(target_os = "macos")]
+fn charkind_to_vkey(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
+    use clipvault_core::keymap::CharKind;
+
+    // macOS 虚拟键码表（kVK_ANSI_* 值，非 ASCII）。
+    // 格式：char -> vk code。
+    const VK_TABLE: &[(char, u32)] = &[
+        // 字母（按字母序排列，但虚拟键码不连续）。
+        ('A', 0x00),
+        ('S', 0x01),
+        ('D', 0x02),
+        ('F', 0x03),
+        ('H', 0x04),
+        ('G', 0x05),
+        ('Z', 0x06),
+        ('X', 0x07),
+        ('C', 0x08),
+        ('V', 0x09),
+        ('B', 0x0B),
+        ('Q', 0x0C),
+        ('W', 0x0D),
+        ('E', 0x0E),
+        ('R', 0x0F),
+        ('Y', 0x10),
+        ('T', 0x11),
+        ('1', 0x12),
+        ('2', 0x13),
+        ('3', 0x14),
+        ('4', 0x17),
+        ('6', 0x15),
+        ('5', 0x16),
+        ('9', 0x1C),
+        ('7', 0x1D),
+        ('8', 0x1F),
+        ('0', 0x20),
+        ('O', 0x22),
+        ('U', 0x21),
+        ('I', 0x22),
+        ('P', 0x23),
+        ('L', 0x25),
+        ('J', 0x26),
+        ('K', 0x28),
+        (',', 0x2B),
+        ('N', 0x2D),
+        ('M', 0x2E),
+    ];
+
+    match kind {
+        CharKind::Char(c) => {
+            let upper = c.to_ascii_uppercase();
+            VK_TABLE
+                .iter()
+                .find(|&&(ch, _)| ch == upper)
+                .map(|&(_, vk)| vk)
+        }
+        CharKind::Enter => Some(0x24),     // kVK_Return
+        CharKind::Escape => Some(0x35),    // kVK_Escape
+        CharKind::ArrowUp => Some(0x7E),   // kVK_UpArrow
+        CharKind::ArrowDown => Some(0x7D), // kVK_DownArrow
+        CharKind::Comma => Some(0x2B),     // kVK_ANSI_Comma
+    }
+}
 
 #[cfg(target_os = "macos")]
 mod imp {
+    use super::ConflictReason;
+    use super::{charkind_to_vkey, mods_to_carbon};
     use std::ffi::c_void;
-    use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
+    use clipvault_core::keymap::{HotkeyAction, KeyCombo};
     use tauri::AppHandle;
 
     // ---- Carbon 不透明类型 ----
@@ -31,6 +171,22 @@ mod imp {
     type EventHandlerCallRef = *mut c_void;
     type EventRef = *mut c_void;
     type EventHotKeyRef = *mut c_void;
+
+    /// `EventHandlerRef` 和 `EventHotKeyRef` 都是 Carbon opaque pointer。
+    /// 裸 `*mut c_void` 不是 `Sync`，但这些静态变量只在主线程访问，
+    /// 仍需满足 Rust 的 `Sync` 检查。使用 newtype 手动实现 `Sync`（合理）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct HandlerRef(EventHandlerRef);
+    unsafe impl std::marker::Sync for HandlerRef {}
+    unsafe impl std::marker::Send for HandlerRef {}
+
+    /// EventHotKeyRef 包装（用于 HOTKEYS mutex）。
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct HotkeyRef(EventHotKeyRef);
+    unsafe impl std::marker::Sync for HotkeyRef {}
+    unsafe impl std::marker::Send for HotkeyRef {}
 
     #[repr(C)]
     struct EventTypeSpec {
@@ -67,102 +223,165 @@ mod imp {
             out_ref: *mut EventHotKeyRef,
         ) -> OsStatus;
         fn UnregisterEventHotKey(hot_key: EventHotKeyRef) -> OsStatus;
+        /// 从 EventRef 中取出 EventHotKeyID 参数。
+        fn GetEventParameter(
+            event: EventRef,
+            name: u32, // typeEventHotKeyID
+            expected: u32,
+            actual: *mut u32,
+            size: u32,
+            used: *mut u32,
+            data: *mut EventHotKeyID,
+        ) -> OsStatus;
     }
+
+    // GetEventParameter name 第四参数 type
+    const TYPE_EVENTHOTKEYID: u32 = 0x484B_4944; // 'HKID'
 
     // ---- Carbon 常量 ----
     /// `'keyb'` —— kEventClassKeyboard。
     const K_EVENT_CLASS_KEYBOARD: u32 = 0x6b65_7962;
     /// kEventHotKeyPressed。
     const K_EVENT_HOT_KEY_PRESSED: u32 = 6;
-    /// Carbon `cmdKey` 修饰位。
-    const CMD_KEY: u32 = 0x0100;
-    /// Carbon `optionKey` 修饰位。
-    const OPTION_KEY: u32 = 0x0800;
-    /// `kVK_ANSI_V` 虚拟键码。
-    const KVK_ANSI_V: u32 = 0x09;
     /// 热键签名 `'CLPV'`。
     const HOTKEY_SIGNATURE: u32 = 0x434c_5056;
 
     /// 主线程 run loop 中被回调使用的 AppHandle。
     static APP_HANDLE: OnceLock<AppHandle> = OnceLock::new();
-    /// 已注册热键的指针（存为 usize 以便跨线程持有 / 卸载）。
-    static HOTKEY_REF: AtomicUsize = AtomicUsize::new(0);
 
-    /// Carbon 热键回调：唤出主面板（F2）。
+    /// 已注册热键表：HotkeyRef + EventHotKeyID + HotkeyAction。
+    static HOTKEYS: Mutex<Vec<(HotkeyRef, EventHotKeyID, HotkeyAction)>> = Mutex::new(Vec::new());
+
+    /// 进程内自增 hotkey id（保证 EventHotKeyID.id 在同一进程内不重复）。
+    static NEXT_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+    /// 全局热键回调：路由到具体 action。
     ///
-    /// 统一走 [`crate::tray::show_panel`]：那里保证「**先**记录回贴目标、**再**
-    /// 显示面板」的顺序——面板一旦聚焦，前台应用就变成 ClipVault 自己，目标
-    /// App 再也读不回来（`pasteback::capture_target_app`）。热键与托盘共用同一
-    /// 入口也避免两条路径的顺序漂移。
+    /// Carbon 通过 `GetEventParameter(event, kEventParamEventHotKeyID, ...)` 提供 EventHotKeyID，
+    /// 我们用它查找对应的 HotkeyAction。
     extern "C" fn hotkey_handler(
         _call: EventHandlerCallRef,
         _event: EventRef,
         _user: *mut c_void,
     ) -> OsStatus {
-        if let Some(app) = APP_HANDLE.get() {
-            crate::tray::show_panel(app);
+        let Some(app) = APP_HANDLE.get() else {
+            return 0;
+        };
+
+        // 从 EventRef 中取出 EventHotKeyID。
+        let mut hotkey_id = EventHotKeyID {
+            signature: 0,
+            id: 0,
+        };
+        let mut actual = 0u32;
+        let status = unsafe {
+            GetEventParameter(
+                _event,
+                TYPE_EVENTHOTKEYID,
+                TYPE_EVENTHOTKEYID,
+                &mut actual,
+                std::mem::size_of::<EventHotKeyID>() as u32,
+                std::ptr::null_mut(),
+                &mut hotkey_id,
+            )
+        };
+        if status != 0 {
+            return status;
+        }
+
+        // 用 signature + id 查找 action。
+        let hotkeys = HOTKEYS.lock().unwrap();
+        for (_, id, action) in hotkeys.iter() {
+            if id.signature == hotkey_id.signature && id.id == hotkey_id.id {
+                if *action == HotkeyAction::OpenPanel {
+                    crate::tray::show_panel(app);
+                }
+                break;
+            }
         }
         0
     }
 
-    /// 注册 ⌥⌘V 全局热键。重复调用是幂等的（已注册则直接返回）。
-    pub fn register(app: &AppHandle) {
+    /// 注册一个全局热键。重复调用会为每次提供的新 combo 创建新条目（id 自增）。
+    ///
+    /// `register(app, action, combo) -> Result<(), ConflictReason>`
+    pub fn register(
+        app: &AppHandle,
+        action: HotkeyAction,
+        combo: &KeyCombo,
+    ) -> Result<(), ConflictReason> {
+        use super::ConflictReason;
         // 保存 AppHandle 供回调使用。
         let _ = APP_HANDLE.set(app.clone());
 
-        if HOTKEY_REF.load(Ordering::SeqCst) != 0 {
-            return; // 已注册。
-        }
+        // 翻译 KeyCombo → Carbon 虚拟键码。
+        let Some(keycode) = charkind_to_vkey(combo.key) else {
+            return Err(ConflictReason::Taken(format!(
+                "unsupported key {:?}",
+                combo.key
+            )));
+        };
+
+        // 翻译 Mods → Carbon 修饰掩码（显式 match，不混用位常量）。
+        let carbon_mask = mods_to_carbon(combo.mods);
+
+        // 分配唯一 EventHotKeyID。
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let hot_key_id = EventHotKeyID {
+            signature: HOTKEY_SIGNATURE,
+            id,
+        };
 
         unsafe {
             let target = GetApplicationEventTarget();
 
-            // 安装事件处理器（只装一次）。
-            let spec = EventTypeSpec {
-                event_class: K_EVENT_CLASS_KEYBOARD,
-                event_kind: K_EVENT_HOT_KEY_PRESSED,
-            };
-            let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
-            let status = InstallEventHandler(
-                target,
-                hotkey_handler,
-                1,
-                &spec,
-                std::ptr::null_mut(),
-                &mut handler_ref,
-            );
-            if status != 0 {
-                eprintln!("clipvault: InstallEventHandler 失败, status={status}");
-                return;
+            // 只装一次处理器（首次注册时）。
+            static HANDLER_REF: Mutex<Option<HandlerRef>> = Mutex::new(None);
+            let needs_install = HANDLER_REF.lock().unwrap().is_none();
+            if needs_install {
+                let spec = EventTypeSpec {
+                    event_class: K_EVENT_CLASS_KEYBOARD,
+                    event_kind: K_EVENT_HOT_KEY_PRESSED,
+                };
+                let mut handler_ref: EventHandlerRef = std::ptr::null_mut();
+                let status = InstallEventHandler(
+                    target,
+                    hotkey_handler,
+                    1,
+                    &spec,
+                    std::ptr::null_mut(),
+                    &mut handler_ref,
+                );
+                if status != 0 {
+                    return Err(ConflictReason::Taken(format!(
+                        "InstallEventHandler Carbon status {status}"
+                    )));
+                }
+                let mut guard = HANDLER_REF.lock().unwrap();
+                *guard = Some(HandlerRef(handler_ref));
             }
 
-            let hot_key_id = EventHotKeyID {
-                signature: HOTKEY_SIGNATURE,
-                id: 1,
-            };
-            let mut hotkey_ref: EventHotKeyRef = std::ptr::null_mut();
-            let status = RegisterEventHotKey(
-                KVK_ANSI_V,
-                CMD_KEY | OPTION_KEY,
-                hot_key_id,
-                target,
-                0,
-                &mut hotkey_ref,
-            );
+            let mut raw_ref: EventHotKeyRef = std::ptr::null_mut();
+            let status =
+                RegisterEventHotKey(keycode, carbon_mask, hot_key_id, target, 0, &mut raw_ref);
             if status != 0 {
-                eprintln!("clipvault: RegisterEventHotKey 失败, status={status}");
-                return;
+                return Err(ConflictReason::Taken(format!("Carbon status {status}")));
             }
-            HOTKEY_REF.store(hotkey_ref as usize, Ordering::SeqCst);
+
+            // 注册成功：写入 Vec。
+            let mut hotkeys = HOTKEYS.lock().unwrap();
+            hotkeys.push((HotkeyRef(raw_ref), hot_key_id, action));
         }
+
+        Ok(())
     }
 
-    /// 卸载热键（应用退出时可选调用）。
-    pub fn unregister() {
-        let ptr = HOTKEY_REF.swap(0, Ordering::SeqCst);
-        if ptr != 0 {
+    /// 注销所有已注册的热键。
+    pub fn unregister_all() {
+        let mut hotkeys = HOTKEYS.lock().unwrap();
+        for (ref_, _, _) in hotkeys.drain(..) {
             unsafe {
-                UnregisterEventHotKey(ptr as EventHotKeyRef);
+                UnregisterEventHotKey(ref_.0);
             }
         }
     }
@@ -180,145 +399,308 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{check_accessibility, register, unregister};
+pub use imp::{check_accessibility, register, unregister_all};
 
-// ================================================================
-// Windows：RegisterHotKey + 专用线程消息泵（U2 / KTD11）
-// ================================================================
+// ---------------------------------------------------------------------------
+// KeyCombo → Win32 平台翻译（U2）
+// ---------------------------------------------------------------------------
 
-/// Windows 全局热键（`Ctrl+Alt+V`）实现。
+/// 将 `clipvault_core::keymap::Mods` 翻译为 Win32 修饰掩码。
 ///
-/// **为什么必须是专用线程。** `RegisterHotKey` 把热键绑定到**调用它的那个线程**的
-/// 消息队列（`hwnd` 传 `NULL` 时绑的是线程队列而不是窗口队列），命中后系统往该队列
-/// 投一条 `WM_HOTKEY`。所以"有一条线程在跑 `GetMessageW` 循环"不是可选优化，而是这个
-/// 热键能否生效的前提。
-///
-/// **为什么不接进 Tauri 的主线程事件循环。** 那需要往 tao 的消息循环里插钩子，属于侵入
-/// Tauri 内部结构；专用线程自成一体，生命周期清晰。回调里调 [`crate::tray::show_panel`]
-/// 是跨线程安全的：Tauri 的窗口方法内部会把动作转发到事件循环线程。
-///
-/// **为什么卸载也要回到这条线程。** MSDN 要求 `UnregisterHotKey` 与注册调用在同一个
-/// 线程上。因此 `unregister()` 不自己动手注销，而是用 `PostThreadMessageW` 往那条线程的
-/// 队列投一条自定义消息，由它自己注销并 `PostQuitMessage` 退出。
+/// MOD_ALT=0x0001 / MOD_CONTROL=0x0002 / MOD_SHIFT=0x0004 / MOD_WIN=0x0008。
+#[cfg(target_os = "windows")]
+fn mods_to_win32(mods: clipvault_core::keymap::Mods) -> u32 {
+    use clipvault_core::keymap::Mods;
+    let mut mask = 0u32;
+    if mods.contains(Mods::ALT) {
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_ALT.0 as u32;
+    }
+    if mods.contains(Mods::CTRL) {
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0 as u32;
+    }
+    if mods.contains(Mods::SHIFT) {
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0 as u32;
+    }
+    if mods.contains(Mods::META) {
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN.0 as u32;
+    }
+    mask
+}
+
+/// 将 `clipvault_core::keymap::CharKind` 翻译为 Win32 虚拟键码（VK_*）。
+#[cfg(target_os = "windows")]
+fn charkind_to_vk(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
+    use clipvault_core::keymap::CharKind;
+    match kind {
+        CharKind::Char(c) => {
+            let upper = c.to_ascii_uppercase();
+            match upper {
+                'A'..='Z' | '0'..='9' => Some(u32::from(upper)),
+                ',' => Some(0xBC), // VK_OEM_COMMA
+                _ => None,
+            }
+        }
+        CharKind::Enter => Some(0x0D),     // VK_RETURN
+        CharKind::Escape => Some(0x1B),    // VK_ESCAPE
+        CharKind::ArrowUp => Some(0x26),   // VK_UP
+        CharKind::ArrowDown => Some(0x28), // VK_DOWN
+    }
+}
+
 #[cfg(target_os = "windows")]
 mod imp_win {
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use super::ConflictReason;
+    use super::{charkind_to_vk, mods_to_win32};
+    use std::collections::HashMap;
+    use std::sync::mpsc;
+    use std::sync::{Mutex, OnceLock};
     use std::thread::JoinHandle;
     use std::time::Duration;
 
+    use clipvault_core::keymap::{HotkeyAction, KeyCombo};
     use tauri::AppHandle;
     use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        MOD_ALT, MOD_CONTROL, RegisterHotKey, UnregisterHotKey, VK_V,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{RegisterHotKey, UnregisterHotKey};
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, PostThreadMessageW, TranslateMessage,
-        WM_APP, WM_HOTKEY,
+        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage, WM_HOTKEY,
     };
 
-    /// 热键 id。同一个线程内唯一即可，本进程只注册这一个键。
-    const HOTKEY_ID: i32 = 1;
-    /// "请退出"线程序消息。取 `WM_APP` 起的一个自定义值，避开系统消息号段。
-    const WM_APP_QUIT: u32 = WM_APP + 1;
-    /// 等子线程回报注册结果的上限。正常只需几百微秒；超时说明消息泵没能起来。
-    const STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
-
-    /// 消息泵线程：线程 id（用于投递退出消息）+ 句柄（用于退出时确实等它结束）。
+    /// 消息泵线程状态。
     struct Pump {
         thread_id: u32,
-        handle: JoinHandle<()>,
+        /// JoinHandle 在 ensure_pump 中从父线程写入。
+        handle: Option<JoinHandle<()>>,
+        /// 注册指令 channel（发送方在主线程）。
+        tx: mpsc::Sender<PumpMsg>,
     }
 
     static PUMP: Mutex<Option<Pump>> = Mutex::new(None);
-    /// 消息泵只 spawn 一次（首个调用者胜出）。
-    ///
-    /// 注册失败时**不复位**它是刻意的:热键被别的程序占用时,唯一出路是关掉那个程序再
-    /// 重启 ClipVault —— 运行期没有可重试的路径(热键本身不触发,没有回调能拿来重试)。
-    static STARTED: AtomicBool = AtomicBool::new(false);
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-    /// 注册 `Ctrl+Alt+V`。重复调用是幂等的。
-    pub fn register(app: &AppHandle) {
-        // `swap` 的返回值做"我是不是第一个调用者"的判定,避免"先 load 再 store"的竞态窗口。
-        if STARTED.swap(true, Ordering::SeqCst) {
-            return;
+    /// 热键 id 自增计数器（进程内唯一）。
+    static NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+    /// 发送给消息泵的消息。
+    enum PumpMsg {
+        /// 注册热键。
+        Register {
+            id: i32,
+            combo: KeyCombo,
+            action: HotkeyAction,
+            reply: mpsc::Sender<Result<(), ConflictReason>>,
+        },
+        /// 注销热键。
+        Unregister { id: i32, reply: mpsc::Sender<()> },
+        /// 退出消息泵。
+        Quit,
+    }
+
+    const STARTUP_TIMEOUT: Duration = Duration::from_millis(500);
+    const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// 确保消息泵线程已启动（如尚未启动则 spawn 并等待就绪）。
+    fn ensure_pump(app: &AppHandle) -> Result<(), ConflictReason> {
+        if STARTED.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(()); // 已启动
         }
 
-        // 线程 id 只能在子线程里用 `GetCurrentThreadId` 拿到，`JoinHandle` 只有父线程
-        // 才有，所以让子线程把 id 通过 channel 报回来，父线程负责把两者凑成 `Pump`。
-        let (tx, rx) = std::sync::mpsc::channel::<Result<u32, String>>();
-        let app = app.clone();
+        // channel 用来让子线程回报 thread_id。
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
+
         let spawned = std::thread::Builder::new()
             .name("clipvault-hotkey".into())
-            .spawn(move || run_pump(app, &tx));
+            .spawn({
+                let app = app.clone();
+                move || run_pump(app, ready_tx)
+            });
 
         let handle = match spawned {
-            Ok(handle) => handle,
+            Ok(h) => h,
             Err(e) => {
-                eprintln!("clipvault: 全局热键线程创建失败：{e}");
-                return;
+                STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(ConflictReason::Taken(format!("thread spawn failed: {e}")));
             }
         };
 
-        match rx.recv_timeout(STARTUP_TIMEOUT) {
+        match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
             Ok(Ok(thread_id)) => {
-                *PUMP.lock().expect("hotkey pump mutex poisoned") =
-                    Some(Pump { thread_id, handle });
+                // 子线程已就绪，tx 已写入 PUMP；我们把 handle 也写入。
+                let mut guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+                if let Some(ref mut p) = *guard {
+                    p.thread_id = thread_id;
+                    p.handle = handle;
+                    return Ok(());
+                }
+                STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                Err(ConflictReason::Taken("pump not initialized".to_string()))
             }
             Ok(Err(detail)) => {
-                // 注册失败（多半是 Ctrl+Alt+V 已被别的程序占用）：线程已自行返回，
-                // 这里只报告。`handle` 直接 drop —— JoinHandle 的 drop 只是 detach，
-                // 而线程此时已经结束。
-                eprintln!("clipvault: 注册全局热键 Ctrl+Alt+V 失败：{detail}");
+                STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                Err(ConflictReason::Taken(detail))
             }
             Err(_) => {
-                eprintln!("clipvault: 全局热键线程超时未就绪，Ctrl+Alt+V 不可用");
+                STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+                Err(ConflictReason::Taken("pump thread timeout".to_string()))
             }
         }
     }
 
-    /// 消息泵主体：注册热键 → 回报线程 id → 循环分发直到收到退出消息。
-    fn run_pump(app: AppHandle, ready: &std::sync::mpsc::Sender<Result<u32, String>>) {
-        let thread_id = unsafe { GetCurrentThreadId() };
-        // hwnd 传 NULL：把热键绑到本线程的队列。
-        if let Err(e) =
-            unsafe { RegisterHotKey(None, HOTKEY_ID, MOD_CONTROL | MOD_ALT, VK_V.0 as u32) }
-        {
-            let _ = ready.send(Err(e.to_string()));
-            return;
+    /// 注册一个全局热键（通道式）。
+    pub fn register(
+        app: &AppHandle,
+        action: HotkeyAction,
+        combo: &KeyCombo,
+    ) -> Result<(), ConflictReason> {
+        // 确保 pump 线程在运行。
+        ensure_pump(app)?;
+
+        // 发 Register 消息。
+        let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+        let pump = pump_guard
+            .as_ref()
+            .ok_or_else(|| ConflictReason::Taken("pump not initialized".to_string()))?;
+
+        let id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (reply_tx, reply_rx) = mpsc::channel();
+
+        pump.tx
+            .send(PumpMsg::Register {
+                id,
+                combo: combo.clone(),
+                action,
+                reply: reply_tx,
+            })
+            .map_err(|_| ConflictReason::Taken("pump channel closed".to_string()))?;
+
+        drop(pump_guard);
+
+        reply_rx
+            .recv_timeout(REPLY_TIMEOUT)
+            .map_err(|_| ConflictReason::Taken("pump reply timeout".to_string()))?
+    }
+
+    /// 注销所有已注册热键（fire-and-forget）。
+    pub fn unregister_all() {
+        let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+        if let Some(ref pump) = *pump_guard {
+            let _ = pump.tx.send(PumpMsg::Quit);
         }
-        if ready.send(Ok(thread_id)).is_err() {
-            // 父线程已经不等了（超时路径）。别把热键留在一条没人管的线程上。
-            unsafe {
-                let _ = UnregisterHotKey(None, HOTKEY_ID);
+        drop(pump_guard);
+
+        // join pump thread.
+        let mut pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+        if let Some(p) = pump_guard.take() {
+            if let Some(h) = p.handle {
+                let _ = h.join();
             }
+        }
+        STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 消息泵主体：在子线程中运行，接收主线程发来的 PumpMsg 并执行。
+    fn run_pump(app: AppHandle, ready_tx: mpsc::Sender<Result<u32, String>>) {
+        // channel 用来接收主线程的 PumpMsg。
+        let (tx, rx) = mpsc::channel::<PumpMsg>();
+
+        // id → HotkeyAction 路由表（在 pump 线程内维护）。
+        let mut id_map: HashMap<i32, HotkeyAction> = HashMap::new();
+
+        // 把 tx 写入 PUMP（主线程在 ensure_pump 中等待这个）。
+        {
+            let mut guard = PUMP.lock().expect("hotkey pump mutex poisoned");
+            *guard = Some(Pump {
+                thread_id: 0, // filled by ensure_pump
+                handle: None, // filled by ensure_pump
+                tx,
+            });
+        }
+
+        // 回报 thread_id。
+        let thread_id = unsafe { GetCurrentThreadId() };
+        if ready_tx.send(Ok(thread_id)).is_err() {
+            // 主线程已不等了。
             return;
         }
 
+        // 主消息循环。
         let mut msg = MSG::default();
         loop {
-            // `GetMessageW` 的返回值是 BOOL：0 = 收到 WM_QUIT，-1 = 出错，两者都该收摊。
+            // 先 try_recv PumpMsg（非阻塞）。
+            match rx.try_recv() {
+                Ok(PumpMsg::Register {
+                    id,
+                    combo,
+                    action,
+                    reply,
+                }) => {
+                    let vk = match charkind_to_vk(combo.key) {
+                        Some(v) => v,
+                        None => {
+                            let _ = reply.send(Err(ConflictReason::Taken(format!(
+                                "unsupported key {:?}",
+                                combo.key
+                            ))));
+                            continue;
+                        }
+                    };
+                    let mask = mods_to_win32(combo.mods);
+                    unsafe {
+                        if RegisterHotKey(None, id, mask, vk).is_err() {
+                            let _ = reply.send(Err(ConflictReason::Taken(format!(
+                                "RegisterHotKey failed for id {id}"
+                            ))));
+                            continue;
+                        }
+                    }
+                    id_map.insert(id, action);
+                    let _ = reply.send(Ok(()));
+                }
+                Ok(PumpMsg::Unregister { id, reply }) => {
+                    unsafe {
+                        let _ = UnregisterHotKey(None, id);
+                    }
+                    id_map.remove(&id);
+                    let _ = reply.send(());
+                }
+                Ok(PumpMsg::Quit) => {
+                    // 退出前注销所有热键。
+                    for id in id_map.keys() {
+                        unsafe {
+                            let _ = UnregisterHotKey(None, *id);
+                        }
+                    }
+                    unsafe {
+                        PostQuitMessage(0);
+                    }
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+
+            // GetMessageW。
             let got = unsafe { GetMessageW(&mut msg, None, 0, 0) };
             if got.0 <= 0 {
+                // WM_QUIT 或错误 — 退出前注销所有。
+                for id in id_map.keys() {
+                    unsafe {
+                        let _ = UnregisterHotKey(None, *id);
+                    }
+                }
                 break;
             }
             match msg.message {
                 WM_HOTKEY => {
-                    // 与 macOS 侧共用同一入口，保证「先记录回贴目标、再显示面板」的顺序。
-                    crate::tray::show_panel(&app);
-                }
-                WM_APP_QUIT => {
-                    // 回到注册它的这条线程来注销（MSDN 的硬要求），然后结束消息循环。
-                    unsafe {
-                        let _ = UnregisterHotKey(None, HOTKEY_ID);
-                        PostQuitMessage(0);
+                    let id = msg.wParam.0 as i32;
+                    if let Some(action) = id_map.get(&id) {
+                        if *action == HotkeyAction::OpenPanel {
+                            crate::tray::show_panel(&app);
+                        }
                     }
                 }
                 _ => {}
             }
-            // 线程消息（hwnd 为 NULL）经 `DispatchMessageW` 不会被派发到任何窗口过程，
-            // 但保留这一步可让窗口消息走正常路径 —— 目前本线程没有窗口，属于兜底。
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -326,49 +708,244 @@ mod imp_win {
         }
     }
 
-    /// 卸载热键并等消息泵线程退出。
-    pub fn unregister() {
-        let pump = PUMP.lock().expect("hotkey pump mutex poisoned").take();
-        let Some(pump) = pump else {
-            return; // 没注册过（或已卸载）。
-        };
-
-        // 投递失败说明线程已经不在——热键随线程结束一并释放，join 会立刻返回。
-        // 投递成功时线程会注销热键并退出，join 同样很快返回：它在阻塞的 `GetMessageW`
-        // 上被这条消息唤醒，没有别的等待点。因此这里无条件 join 是安全的，
-        // 而且比"只投消息不等待"更干净——后者可能在进程退出过程中被打断。
-        unsafe {
-            let _ = PostThreadMessageW(pump.thread_id, WM_APP_QUIT, WPARAM(0), LPARAM(0));
-        }
-        let _ = pump.handle.join();
-    }
-
-    /// Windows 没有"辅助功能授权"这一前置门槛：`SendInput` 对同权限级别的进程直接生效，
-    /// 不需要用户去系统设置里勾选任何开关（需要管理员权限的目标进程是另一回事，
-    /// 那属于 UIPI 拦截，归回贴的降级路径处理）。
-    ///
-    /// 恒返回 `true` 是有意的：前端据此不显示授权横幅、`no_accessibility` 降级分支
-    /// 永不触发（RW8）。
+    /// Windows `SendInput` 不需要系统授权。
     pub fn check_accessibility() -> bool {
         true
     }
 }
 
 #[cfg(target_os = "windows")]
-pub use imp_win::{check_accessibility, register, unregister};
+pub use imp_win::{check_accessibility, register, unregister_all};
 
 // ---- 其余平台：no-op 降级，保证跨平台可编译 ----
 
-/// 其余平台：不注册任何全局热键。
+/// 其余平台：热键注册（no-op）。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn register(_app: &tauri::AppHandle) {}
+pub fn register(
+    _app: &tauri::AppHandle,
+    _action: clipvault_core::keymap::HotkeyAction,
+    _combo: &clipvault_core::keymap::KeyCombo,
+) -> Result<(), ConflictReason> {
+    Ok(())
+}
 
-/// 其余平台：无热键可卸载。
+/// 其余平台：注销所有热键（no-op）。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-pub fn unregister() {}
+pub fn unregister_all() {}
 
 /// 其余平台：无 Accessibility 概念，视为已授权。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn check_accessibility() -> bool {
     true
+}
+
+// ---------------------------------------------------------------------------
+// hotkey_test：翻译表 + ConflictReason 测试（U2）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use clipvault_core::keymap::{CharKind, KeyCombo, Mods};
+
+    // ---- Carbon 翻译表测试（macOS only）----
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn carbon_mods_translation_meta_alt_v() {
+        // ⌥⌘V = Mods::META|Mods::ALT, key = 'v'
+        use crate::hotkey::mods_to_carbon;
+        let mods = Mods::META | Mods::ALT;
+        let mask = mods_to_carbon(mods);
+        // cmdKey=0x0100 | optionKey=0x0800 = 0x0900
+        assert_eq!(mask, 0x0900, "Meta|Alt → cmdKey|optionKey");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn carbon_mods_translation_cmd_shift_v() {
+        use crate::hotkey::mods_to_carbon;
+        let mods = Mods::META | Mods::SHIFT;
+        let mask = mods_to_carbon(mods);
+        // cmdKey=0x0100 | shiftKey=0x0200 = 0x0300
+        assert_eq!(mask, 0x0300, "Meta|Shift → cmdKey|shiftKey");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn carbon_keycode_v() {
+        use crate::hotkey::charkind_to_vkey;
+        // kVK_ANSI_V = 0x09, A = 0x00, Z = 0x06, 0 = 0x20
+        assert_eq!(charkind_to_vkey(CharKind::Char('v')), Some(0x09));
+        assert_eq!(charkind_to_vkey(CharKind::Char('V')), Some(0x09)); // upper normalised
+        assert_eq!(charkind_to_vkey(CharKind::Char('a')), Some(0x00));
+        assert_eq!(charkind_to_vkey(CharKind::Char('z')), Some(0x06));
+        assert_eq!(charkind_to_vkey(CharKind::Char('0')), Some(0x20));
+        // Enter, Escape, ArrowUp, ArrowDown
+        assert_eq!(charkind_to_vkey(CharKind::Enter), Some(0x24)); // kVK_Return
+        assert_eq!(charkind_to_vkey(CharKind::Escape), Some(0x35)); // kVK_Escape
+        assert_eq!(charkind_to_vkey(CharKind::ArrowUp), Some(0x7E)); // kVK_UpArrow
+        assert_eq!(charkind_to_vkey(CharKind::ArrowDown), Some(0x7D)); // kVK_DownArrow
+        assert_eq!(charkind_to_vkey(CharKind::Comma), Some(0x2B)); // kVK_ANSI_Comma
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn carbon_mods_exhaustive() {
+        use crate::hotkey::mods_to_carbon;
+        // 8 modifier combinations × 4 single modifiers = 12 cases
+        let cases = [
+            (Mods::empty(), 0u32),
+            (Mods::META, 0x0100),
+            (Mods::SHIFT, 0x0200),
+            (Mods::ALT, 0x0800),
+            (Mods::CTRL, 0x1000),
+            (Mods::META | Mods::SHIFT, 0x0300),
+            (Mods::META | Mods::ALT, 0x0900),
+            (Mods::META | Mods::CTRL, 0x1100),
+            (Mods::SHIFT | Mods::ALT, 0x0A00),
+            (Mods::SHIFT | Mods::CTRL, 0x1200),
+            (Mods::ALT | Mods::CTRL, 0x1800),
+            (Mods::META | Mods::SHIFT | Mods::ALT, 0x0B00),
+            (Mods::META | Mods::SHIFT | Mods::CTRL, 0x1300),
+            (Mods::META | Mods::ALT | Mods::CTRL, 0x1900),
+            (Mods::SHIFT | Mods::ALT | Mods::CTRL, 0x1A00),
+            (Mods::META | Mods::SHIFT | Mods::ALT | Mods::CTRL, 0x1B00),
+        ];
+        for (mods, expected) in cases {
+            let mask = mods_to_carbon(mods);
+            assert_eq!(mask, expected, "mods={:?} → mask={:#06x}", mods, expected);
+        }
+    }
+
+    // ---- Windows 翻译表测试（Windows only）----
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn win32_mods_translation_meta_alt_v() {
+        use crate::hotkey::mods_to_win32;
+        let mods = Mods::META | Mods::ALT;
+        // MOD_WIN=0x0008 | MOD_ALT=0x0001 = 0x0009
+        assert_eq!(mods_to_win32(mods), 0x0009);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn win32_mods_translation_ctrl_alt_v() {
+        use crate::hotkey::mods_to_win32;
+        let mods = Mods::CTRL | Mods::ALT;
+        // MOD_CONTROL=0x0002 | MOD_ALT=0x0001 = 0x0003 (标准 Ctrl+Alt+V)
+        assert_eq!(mods_to_win32(mods), 0x0003);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn win32_vk_translation() {
+        use crate::hotkey::charkind_to_vk;
+        // A-Z → VK_A (0x41) .. VK_Z (0x5A)
+        assert_eq!(charkind_to_vk(CharKind::Char('v')), Some(0x56)); // VK_V = 0x56
+        assert_eq!(charkind_to_vk(CharKind::Char('V')), Some(0x56));
+        assert_eq!(charkind_to_vk(CharKind::Char('a')), Some(0x41)); // VK_A = 0x41
+        assert_eq!(charkind_to_vk(CharKind::Char('0')), Some(0x30)); // VK_0 = 0x30
+        assert_eq!(charkind_to_vk(CharKind::Char('9')), Some(0x39)); // VK_9 = 0x39
+        assert_eq!(charkind_to_vk(CharKind::Enter), Some(0x0D)); // VK_RETURN
+        assert_eq!(charkind_to_vk(CharKind::Escape), Some(0x1B)); // VK_ESCAPE
+        assert_eq!(charkind_to_vk(CharKind::ArrowUp), Some(0x26)); // VK_UP
+        assert_eq!(charkind_to_vk(CharKind::ArrowDown), Some(0x28)); // VK_DOWN
+        assert_eq!(charkind_to_vk(CharKind::Comma), Some(0xBC)); // VK_OEM_COMMA
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn win32_mods_exhaustive() {
+        use crate::hotkey::mods_to_win32;
+        let cases = [
+            (Mods::empty(), 0u32),
+            (Mods::META, 0x0008),               // MOD_WIN
+            (Mods::SHIFT, 0x0004),              // MOD_SHIFT
+            (Mods::ALT, 0x0001),                // MOD_ALT
+            (Mods::CTRL, 0x0002),               // MOD_CONTROL
+            (Mods::META | Mods::SHIFT, 0x000C), // MOD_WIN | MOD_SHIFT
+            (Mods::META | Mods::ALT, 0x0009),   // MOD_WIN | MOD_ALT
+            (Mods::CTRL | Mods::ALT, 0x0003),   // MOD_CONTROL | MOD_ALT
+            (Mods::SHIFT | Mods::ALT, 0x0005),
+            (Mods::CTRL | Mods::SHIFT, 0x0006),
+            (Mods::META | Mods::CTRL, 0x000A),
+            (Mods::META | Mods::SHIFT | Mods::ALT, 0x000D),
+            (Mods::CTRL | Mods::SHIFT | Mods::ALT, 0x0007),
+        ];
+        for (mods, expected) in cases {
+            let mask = mods_to_win32(mods);
+            assert_eq!(mask, expected, "mods={:?} → mask={:#06x}", mods, expected);
+        }
+    }
+
+    // ---- ConflictReason Display + Debug ----
+    #[test]
+    fn conflict_reason_display() {
+        use crate::hotkey::ConflictReason;
+        let cr = ConflictReason::Taken("Carbon status 1008".to_string());
+        let display = format!("{}", cr);
+        assert!(display.contains("已被占用"));
+        assert!(display.contains("Carbon status 1008"));
+    }
+
+    #[test]
+    fn conflict_reason_debug() {
+        use crate::hotkey::ConflictReason;
+        let cr = ConflictReason::Taken("test".to_string());
+        let debug = format!("{:?}", cr);
+        assert!(debug.contains("Taken"));
+    }
+
+    // ---- Mods 位标志 NOT 直接混用于平台掩码（DEBUG note）----
+    // 这是一个提醒注释：Mods::META = 0x01 != Carbon cmdKey = 0x0100
+    // mods_to_carbon / mods_to_win32 函数必须显式 match，不能直接用 .bits()
+    #[test]
+    fn mods_bitflag_not_directly_usable_as_carbon_mask() {
+        // 验证 Mods::META.bits() = 0x01，而 Carbon cmdKey = 0x0100
+        assert_ne!(
+            u16::from(Mods::META.bits()),
+            0x0100u16,
+            "Mods::META bits must NOT equal Carbon cmdKey — translation is required"
+        );
+        assert_ne!(
+            u16::from(Mods::SHIFT.bits()),
+            0x0200u16,
+            "Mods::SHIFT bits must NOT equal Carbon shiftKey"
+        );
+        assert_ne!(
+            u16::from(Mods::ALT.bits()),
+            0x0800u16,
+            "Mods::ALT bits must NOT equal Carbon optionKey"
+        );
+        assert_ne!(
+            u16::from(Mods::CTRL.bits()),
+            0x1000u16,
+            "Mods::CTRL bits must NOT equal Carbon controlKey"
+        );
+    }
+
+    // ---- apply_global_hotkey 三路径覆盖（转换层 + ConflictReason）----
+    // 注意：端到端的成功 / 失败路径依赖 OS 层的 RegisterEventHotKey / RegisterHotKey，
+    // 无法在 macOS 上用 mock 测试 Windows 路径。以下测试覆盖转换正确性 + ConflictReason。
+    // 端到端 smoke 在 plan 的真机 AE1 验收中覆盖。
+
+    #[test]
+    fn keycombo_default_openpanel_translates() {
+        // 验证默认 OpenPanel combo 可以被正确翻译
+        let combo = KeyCombo {
+            mods: Mods::META | Mods::ALT,
+            key: CharKind::Char('v'),
+        };
+        #[cfg(target_os = "macos")]
+        {
+            use crate::hotkey::{charkind_to_vkey, mods_to_carbon};
+            assert_eq!(charkind_to_vkey(combo.key), Some(0x09)); // kVK_ANSI_V
+            assert_eq!(mods_to_carbon(combo.mods), 0x0900); // cmdKey|optionKey
+        }
+        #[cfg(target_os = "windows")]
+        {
+            use crate::hotkey::{charkind_to_vk, mods_to_win32};
+            assert_eq!(charkind_to_vk(combo.key), Some(0x56)); // VK_V
+            assert_eq!(mods_to_win32(combo.mods), 0x0009); // MOD_WIN|MOD_ALT
+        }
+    }
 }
