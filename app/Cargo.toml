@@ -34,6 +34,10 @@ image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "tiff",
 ] }
+# U2：诊断日志（plan 2026-10-15-1642）的 `log` facade。
+# log 0.4.34 已经通过 tauri / tao 间接拉入,本次仅把它升为直接依赖,
+# 不会引入新的 crate（`cargo tree` 形状不变,R13 仍为空）。
+log = { version = "0.4", features = ["std"] }
 
 # macOS 原生绑定（KTD2）。仅在 macOS 目标上编译。
 # - NSPasteboard：U3 watcher 轮询 + U8 回贴写入。

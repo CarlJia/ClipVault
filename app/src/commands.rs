@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use clipvault_core::Entry;
 use rusqlite::Result as SqliteResult;
@@ -32,6 +32,8 @@ pub struct AppState {
     pub skip_next: Arc<AtomicBool>,
     pub panel_opacity: Arc<AtomicU32>,
     pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
+    /// U2：日志级别原子,`set_log_level` / `get_log_level` 路径写入与读取。
+    pub log_level: Arc<AtomicU8>,
     /// U2：AppHandle，用于 apply_global_hotkey 和 hotkey::register。
     pub app: tauri::AppHandle,
 }

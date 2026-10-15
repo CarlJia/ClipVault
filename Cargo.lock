@@ -397,6 +397,7 @@ dependencies = [
  "base64 0.22.1",
  "clipvault-core",
  "image",
+ "log",
  "objc2",
  "objc2-app-kit",
  "objc2-core-graphics",

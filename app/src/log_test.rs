@@ -4,11 +4,18 @@
 //! 装 I/O 胶水。任何平台/闰年/字节边界的正确性,先在这里钉死,再让 U2 接线。
 
 use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU8;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::log::{
-    Level, MAX_LOG_BYTES, backup_log_path, format_line, format_timestamp, log_path_in, parse_level,
-    reveal_argv, should_rotate, tail_lines,
+    Level, MAX_LOG_BYTES, apply_log_level, backup_log_path, boot_load_log_level, clear,
+    format_line, format_timestamp, init, log_path_in, parse_level, read_info, read_tail,
+    reveal_argv, should_emit, should_rotate, tail_lines,
 };
+use crate::storage::Storage;
+use crate::storage::test_helpers::open_test_db;
 
 #[test]
 fn log_path_in_appends_filename() {
@@ -61,7 +68,8 @@ fn format_timestamp_known_epochs() {
 
 #[test]
 fn format_line_control_chars() {
-    let line = format_line(0, Level::Info, "test", "hello\x07world\nnext");
+    // 记录级别用 log::Level::Info（与"用户设置 Info"对应的常规 INFO 记录）。
+    let line = format_line(0, log::Level::Info, "test", "hello\x07world\nnext");
     assert!(line.starts_with("1970-01-01T00:00:00.000Z INFO [test] "));
     // \x07 → '?';\n 保留。
     assert!(line.contains("hello?world\nnext"));
@@ -70,10 +78,11 @@ fn format_line_control_chars() {
 
 #[test]
 fn format_line_combined() {
-    let line = format_line(1234567890123, Level::Verbose, "module::sub", "x = 42");
+    // 记录级别 log::Level::Debug(仅 Verbose 用户设置下才会写出),输出 "DEBUG"。
+    let line = format_line(1234567890123, log::Level::Debug, "module::sub", "x = 42");
     assert_eq!(
         line,
-        "2009-02-13T23:31:30.123Z VERBOSE [module::sub] x = 42\n"
+        "2009-02-13T23:31:30.123Z DEBUG [module::sub] x = 42\n"
     );
 }
 
@@ -185,4 +194,214 @@ fn reveal_argv_windows_uses_explorer_select() {
     assert_eq!(prog, "explorer.exe");
     // /select, 紧贴路径,无空格——explorer 的标准格式。
     assert_eq!(args, vec![format!("/select,{}", path)]);
+}
+
+// ----------------------------------------------------------------
+// U2：I/O 层 + 全局 sink 接线单测。
+//
+// 设计要点（与 U1 一脉）：纯函数优先、I/O 测隔离在临时目录。
+// log crate 的 `set_boxed_logger` 是进程级唯一,无法在并行测试里多次调用,
+// 所以 `init` 在 `cfg(test)` 下不安装到全局（见 `install_global_logger`）,
+// 仍能验证 `read_info` / `read_tail` / `clear` 等 I/O 行为。
+// ----------------------------------------------------------------
+
+/// 进程内唯一的临时日志目录(用于隔离并行测试)。
+fn temp_log_dir(label: &str) -> PathBuf {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let mut p = std::env::temp_dir();
+    p.push(format!(
+        "clipvault_log_test_{label}_{n}_{nanos}_{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&p).unwrap();
+    p
+}
+
+#[test]
+fn init_creates_file_when_missing() {
+    let dir = temp_log_dir("create");
+    let path = crate::log::log_path_in(&dir);
+    let level = Arc::new(AtomicU8::new(Level::Info as u8));
+    init(&path, level).expect("init 失败");
+    assert!(path.exists());
+    let size = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(size, 0);
+    // 幂等:再调一次不报错。
+    init(&path, Arc::new(AtomicU8::new(Level::Info as u8))).expect("二次 init");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_rotates_oversize_existing_via_rename() {
+    let dir = temp_log_dir("rot");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+    // 预写 2 MiB current + 1 KiB backup。init 应 remove(.1) + rename。
+    let big = vec![b'x'; 2 * 1024 * 1024];
+    std::fs::write(&current, &big).unwrap();
+    std::fs::write(&backup, vec![b'y'; 1024]).unwrap();
+    let level = Arc::new(AtomicU8::new(Level::Info as u8));
+    init(&current, level).expect("init");
+    let cur_size = std::fs::metadata(&current).unwrap().len();
+    let bk_size = std::fs::metadata(&backup).unwrap().len();
+    assert!(cur_size <= crate::log::MAX_LOG_BYTES);
+    // .1 是被 rotate 过去的 2 MiB(原 1 KiB .1 已被覆盖)。
+    assert_eq!(bk_size, 2 * 1024 * 1024);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_when_only_backup_exists_no_panic() {
+    let dir = temp_log_dir("bk");
+    let backup = crate::log::backup_log_path(&dir);
+    std::fs::write(&backup, b"previous session\n").unwrap();
+    let current = crate::log::log_path_in(&dir);
+    let level = Arc::new(AtomicU8::new(Level::Info as u8));
+    init(&current, level).expect("init");
+    assert!(current.exists());
+    assert_eq!(current.metadata().unwrap().len(), 0);
+    // .1 保持原状(不被误删)。
+    let preserved = std::fs::read(&backup).unwrap();
+    assert_eq!(preserved, b"previous session\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn init_failure_is_non_fatal() {
+    // 传入一个无法作为目录创建 / 文件写入的 path(空路径名)。init 返回 Err,
+    // 整个 app 仍能继续(由 main.rs 决定兜底行为)。
+    let bad = std::path::Path::new("");
+    let level = Arc::new(AtomicU8::new(Level::Info as u8));
+    let res = init(bad, level);
+    assert!(res.is_err());
+}
+
+#[test]
+fn boot_load_log_level_round_trip() {
+    let storage = open_test_db();
+    let atomic = AtomicU8::new(Level::Verbose as u8);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // 写 verbose → 读出 Verbose。
+        crate::log::persist_log_level(&storage, Level::Verbose)
+            .await
+            .unwrap();
+        let loaded = boot_load_log_level(&storage, &atomic).await.unwrap();
+        assert_eq!(loaded, Level::Verbose);
+        assert_eq!(
+            atomic.load(std::sync::atomic::Ordering::SeqCst),
+            Level::Verbose as u8
+        );
+        // 写 garbage → 读出 Info(回落),且原子被覆盖为 Info。
+        storage
+            .set_setting(crate::log::LOG_LEVEL_KEY, "garbage")
+            .await
+            .unwrap();
+        let loaded = boot_load_log_level(&storage, &atomic).await.unwrap();
+        assert_eq!(loaded, Level::Info);
+        assert_eq!(
+            atomic.load(std::sync::atomic::Ordering::SeqCst),
+            Level::Info as u8
+        );
+    });
+}
+
+#[test]
+fn set_max_level_changes_log_filter() {
+    // 验证 set_max_level 同时更新原子与 `log::set_max_level`。
+    let atomic = AtomicU8::new(Level::Info as u8);
+    crate::log::set_max_level(&atomic, Level::Verbose);
+    assert_eq!(
+        log::max_level(),
+        Level::Verbose.log_level_upper_bound().to_level_filter()
+    );
+    assert!(should_emit(&atomic, log::Level::Debug));
+    crate::log::set_max_level(&atomic, Level::Info);
+    assert_eq!(
+        log::max_level(),
+        Level::Info.log_level_upper_bound().to_level_filter()
+    );
+    // Info 模式下不应写出 Debug 级记录。
+    assert!(!should_emit(&atomic, log::Level::Debug));
+    // 但应写出 Info / Warn / Error。
+    assert!(should_emit(&atomic, log::Level::Info));
+    assert!(should_emit(&atomic, log::Level::Warn));
+    assert!(should_emit(&atomic, log::Level::Error));
+}
+
+#[test]
+fn clear_truncates_current_and_removes_backup() {
+    let dir = temp_log_dir("clear");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+    std::fs::write(&current, b"line1\nline2\n").unwrap();
+    std::fs::write(&backup, b"line0\n").unwrap();
+    clear(&dir).expect("clear");
+    assert_eq!(current.metadata().unwrap().len(), 0);
+    assert!(!backup.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_info_reports_size_and_level() {
+    let dir = temp_log_dir("info");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+    std::fs::write(&current, b"hi\n").unwrap();
+    std::fs::write(&backup, b"old\n").unwrap();
+    let atomic = AtomicU8::new(Level::Verbose as u8);
+    let info = read_info(&current, &atomic);
+    assert_eq!(info.size_bytes, 3);
+    assert_eq!(info.backup_size_bytes, 4);
+    assert_eq!(info.level, "verbose");
+    assert!(info.path.ends_with("clipvault.log"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_tail_combines_backup_and_current() {
+    let dir = temp_log_dir("tail");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+    std::fs::write(&backup, b"line1\nline2\n").unwrap();
+    std::fs::write(&current, b"line3\nline4\n").unwrap();
+    let tail = read_tail(&dir, 1024, 100).expect("read_tail");
+    // 拼接顺序: .1 在前,current 在后。
+    assert_eq!(tail, "line1\nline2\nline3\nline4\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_tail_handles_missing_backup() {
+    let dir = temp_log_dir("tail2");
+    let current = crate::log::log_path_in(&dir);
+    std::fs::write(&current, b"line3\nline4\n").unwrap();
+    let tail = read_tail(&dir, 1024, 100).expect("read_tail");
+    assert_eq!(tail, "line3\nline4\n");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn apply_log_level_persists_and_updates() {
+    // 验证 KTD5 形状:clamp + 原子更新 + 持久化 + 重新读出一致。
+    let storage: Storage = open_test_db();
+    let atomic = AtomicU8::new(Level::Info as u8);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        apply_log_level(&storage, &atomic, Level::Verbose)
+            .await
+            .unwrap();
+        assert_eq!(
+            atomic.load(std::sync::atomic::Ordering::SeqCst),
+            Level::Verbose as u8
+        );
+        let reloaded = boot_load_log_level(&storage, &atomic).await.unwrap();
+        assert_eq!(reloaded, Level::Verbose);
+    });
 }
