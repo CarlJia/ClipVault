@@ -112,7 +112,10 @@
                 </div>
               </div>
               <div class="settings-section settings-hotkeys-section">
-                <div class="settings-section-title">快捷键</div>
+                <div class="settings-section-title">
+                  <span>快捷键</span>
+                  <button id="hotkey-reset" class="banner-btn hotkey-rebind">重置默认</button>
+                </div>
                 <div class="hotkey-group" id="hotkey-group-global">
                   <div class="hotkey-group-title">全局热键</div>
                   <ul class="hotkey-list" id="hotkey-list-global"></ul>
@@ -120,6 +123,31 @@
                 <div class="hotkey-group" id="hotkey-group-panel">
                   <div class="hotkey-group-title">面板内快捷键</div>
                   <ul class="hotkey-list" id="hotkey-list-panel"></ul>
+                </div>
+              </div>
+              <!-- U4：诊断日志区块。复用 .settings-section 视觉层,无新 CSS。
+                   进入设置时由 main.ts 调 refreshLogSection 拉取;切级别 / 清空
+                   后再拉一次以反映。 -->
+              <div class="settings-section settings-log-section">
+                <div class="settings-section-title">诊断日志</div>
+                <div class="settings-row">
+                  <label class="editor-label" for="settings-log-level">级别</label>
+                  <select id="settings-log-level" class="slider">
+                    <option value="info">标准（INFO+）</option>
+                    <option value="verbose">详细（DEBUG+）</option>
+                  </select>
+                </div>
+                <div class="settings-row">
+                  <span class="editor-label">文件</span>
+                  <span id="settings-log-path" class="settings-value" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px" title=""></span>
+                </div>
+                <div class="settings-row">
+                  <span class="editor-label">大小</span>
+                  <span id="settings-log-size" class="settings-value"></span>
+                </div>
+                <pre id="settings-log-tail" class="settings-log-tail" aria-label="诊断日志尾部"></pre>
+                <div class="settings-row" style="justify-content:flex-end">
+                  <button id="settings-log-clear" class="banner-btn">清空日志</button>
                 </div>
               </div>
             </div>

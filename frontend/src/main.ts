@@ -33,19 +33,24 @@ import {
 } from "./panel";
 import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
+  type LogInfoDto,
   type PasteResult,
+  clearLog,
   clearUndecryptable,
   getGuestMode,
   getPanelOpacity,
   listVault,
   moveToVault,
+  readLog,
   refreshAccessibilityBanner,
   refreshKeychainBanner,
   renderHotkeysSection,
   setGuestMode,
+  setLogLevel,
   setPanelOpacity,
   skipNextCopy,
 } from "./settings";
+import { formatSize, formatTailForView } from "./logview";
 import {
   closeEditor,
   isEditorOpen,
@@ -111,6 +116,12 @@ const opacityValueEl = document.querySelector<HTMLSpanElement>("#settings-opacit
 // 设置卡片内容区（透明度字段 + 快捷键区块）。超长时在此滚动，标题栏与底部提示
 // 常驻不滚动（U4）。
 const settingsBodyEl = document.querySelector<HTMLDivElement>("#settings-body")!;
+// U4 诊断日志区元素
+const logLevelEl = document.querySelector<HTMLSelectElement>("#settings-log-level")!;
+const logPathEl = document.querySelector<HTMLSpanElement>("#settings-log-path")!;
+const logSizeEl = document.querySelector<HTMLSpanElement>("#settings-log-size")!;
+const logTailEl = document.querySelector<HTMLPreElement>("#settings-log-tail")!;
+const logClearEl = document.querySelector<HTMLButtonElement>("#settings-log-clear")!;
 
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
@@ -574,8 +585,35 @@ async function openSettings(): Promise<void> {
   settingsBodyEl.scrollTop = 0;
   // 渲染快捷键区块（U4）
   void renderHotkeysSection();
+  // U4 拉取诊断日志元信息 + 尾部。
+  void refreshLogSection();
   // 焦点交还搜索框：modal 内部无其它交互，esc 关闭即可。
   searchEl.focus();
+}
+
+/** U4 拉取一次诊断日志元信息 + 尾部,渲染到设置区。失败时显示「(无法读取)」。 */
+async function refreshLogSection(): Promise<void> {
+  const info: LogInfoDto | null = await readLog();
+  if (!info) {
+    logPathEl.textContent = "(无法读取)";
+    logSizeEl.textContent = "—";
+    logTailEl.textContent = "";
+    return;
+  }
+  // 后端级别 → 下拉框同步(可能因用户改了但 UI 还没拉)。
+  if (logLevelEl.value !== info.level) {
+    logLevelEl.value = info.level;
+  }
+  logPathEl.textContent = info.path;
+  logPathEl.title = info.path; // 完整路径 hover 提示
+  // 当前 + .1 一并显示;后者为 0 时省略。
+  const sizeText =
+    info.backup_size_bytes > 0
+      ? `${formatSize(info.size_bytes)}（旧日志 ${formatSize(info.backup_size_bytes)}）`
+      : formatSize(info.size_bytes);
+  logSizeEl.textContent = sizeText;
+  // textContent 写入,R14 严格:不当作 HTML。
+  logTailEl.textContent = formatTailForView(info.lines);
 }
 
 function closeSettings(): void {
@@ -593,6 +631,26 @@ opacityEl.addEventListener("input", () => {
 });
 opacityEl.addEventListener("change", () => {
   void setPanelOpacity(Number(opacityEl.value));
+});
+
+// U4 诊断日志交互：级别切换写库 + 清空按钮。
+logLevelEl.addEventListener("change", () => {
+  void (async () => {
+    const v = await setLogLevel(logLevelEl.value);
+    if (v !== logLevelEl.value) logLevelEl.value = v;
+    await refreshLogSection();
+  })();
+});
+logClearEl.addEventListener("click", () => {
+  void (async () => {
+    try {
+      await clearLog();
+      toast("诊断日志已清空");
+      await refreshLogSection();
+    } catch (e) {
+      toast(`清空失败：${String(e)}`);
+    }
+  })();
 });
 
 // ----------------------------------------------------------------

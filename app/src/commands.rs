@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use clipvault_core::Entry;
 use rusqlite::Result as SqliteResult;
@@ -32,6 +32,8 @@ pub struct AppState {
     pub skip_next: Arc<AtomicBool>,
     pub panel_opacity: Arc<AtomicU32>,
     pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
+    /// U2：日志级别原子,`set_log_level` / `get_log_level` 路径写入与读取。
+    pub log_level: Arc<AtomicU8>,
     /// U2：AppHandle，用于 apply_global_hotkey 和 hotkey::register。
     pub app: tauri::AppHandle,
 }
@@ -579,6 +581,73 @@ pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Resu
 }
 
 // ----------------------------------------------------------------
+// 诊断日志（U2 / U4）
+// ----------------------------------------------------------------
+
+/// 当前日志级别字符串,以运行时共享原子为准。
+#[tauri::command]
+pub fn get_log_level(state: State<'_, AppState>) -> String {
+    crate::log::Level::from_u8(state.log_level.load(Ordering::SeqCst))
+        .as_str()
+        .to_string()
+}
+
+/// 设置日志级别。接受 `\"info\"` / `\"verbose\"`,其它值回落 `info`。
+/// 写路径经 [`crate::log::apply_log_level`]:clamp + 原子更新 + 持久化。
+#[tauri::command]
+pub async fn set_log_level(level: String, state: State<'_, AppState>) -> Result<String, String> {
+    let parsed = crate::log::parse_level(Some(&level));
+    crate::log::apply_log_level(&state.storage, &state.log_level, parsed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(parsed.as_str().to_string())
+}
+
+/// 日志视图元信息 + 尾部内容。`lines` 字段已按 R13 cap(64 KiB / 400 行)
+/// 截断,前端按 R14 再 cap 一道「最多渲染 200 行」。
+#[tauri::command]
+pub async fn read_log(state: State<'_, AppState>) -> Result<crate::log::LogInfo, String> {
+    let path = crate::log::default_log_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    let lines = crate::log::read_tail(dir, 64 * 1024, 400).map_err(|e| e.to_string())?;
+    let mut info = crate::log::read_info(&path, &state.log_level);
+    info.lines = lines;
+    Ok(info)
+}
+
+/// 清空日志(R12):截断 `clipvault.log` 到 0 + 删除 `clipvault.log.1`。
+/// 实际工作由 `log::clear` 走 `LOG_STATE` 锁内路径完成,与 `write_line` 互斥。
+#[tauri::command]
+pub async fn clear_log() -> Result<(), String> {
+    let path = crate::log::default_log_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    crate::log::clear(dir).map_err(|e| e.to_string())?;
+    ::log::info!(target: "main", "用户清空诊断日志");
+    Ok(())
+}
+
+// ----------------------------------------------------------------
+// 「查看日志…」(U5 / R10)
+// ----------------------------------------------------------------
+
+/// 在系统文件管理器中显示日志文件(macOS Finder / Windows 资源管理器)。
+///
+/// 走 KTD6 的纯函数 `reveal_argv` 拿参数数组,`std::process::Command::new(prog).args(args).spawn()`
+/// 启动对应命令。错误以 `Err(String)` 返回,UI 端只发 log 警告。
+pub fn reveal_log(_app: &tauri::AppHandle) -> Result<(), String> {
+    use std::process::Command;
+    let path = crate::log::default_log_path();
+    let path_str = path.to_string_lossy().into_owned();
+    let (prog, args) = crate::log::reveal_argv(cfg!(target_os = "macos"), &path_str);
+    // `Command` 在 Windows 上需要 std 句柄,这里允许 inherit。
+    Command::new(&prog)
+        .args(&args)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("reveal_log: spawn `{prog}` 失败: {e}"))
+}
+
+// ----------------------------------------------------------------
 // HotkeyMap（U1）
 // ----------------------------------------------------------------
 
@@ -643,6 +712,32 @@ pub async fn set_hotkey(
         return Err(e.to_string());
     }
 
+    Ok(())
+}
+
+/// 把全部 13 个热键重置为出厂默认(R4 之外的「恢复原状」入口)。
+///
+/// 流程与 `set_hotkey` 同形:
+/// 1. 内存构造一份 default_map()（同 `parse_persist_hotkeys` 的回落路径）。
+/// 2. 先在 OS 侧重新注册全局热键(失败即返回,不动持久化)。
+/// 3. 持久化到 `settings` 表(失败则把 OS 侧退回旧 combo,与 `set_hotkey` 的回退一致)。
+/// 4. 写成功后再更新 in-memory slot。
+#[tauri::command]
+pub async fn reset_hotkeys(state: State<'_, AppState>) -> Result<(), String> {
+    use clipvault_core::keymap::HotkeyMap;
+
+    let default_map = HotkeyMap::default_map();
+    let old_map = state.keymap.read().unwrap().clone();
+
+    // 1. 先在 OS 侧注册新的全局热键;失败立即返回,不动任何状态。
+    crate::keymap::apply_global_hotkey(&state.app, &default_map)
+        .map_err(|e| format!("reset_global_hotkey 失败: {e}"))?;
+
+    // 2. 持久化;若失败把 OS 侧退回旧 combo,避免「OS 已切换但库未变」的不一致。
+    if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &default_map).await {
+        let _ = crate::keymap::apply_global_hotkey(&state.app, &old_map);
+        return Err(e.to_string());
+    }
     Ok(())
 }
 

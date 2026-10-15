@@ -321,7 +321,7 @@ mod imp {
                     crate::panel::show_panel(app);
                 } else {
                     // 未来新增全局 action 时在这里处理（现在只支持 OpenPanel）。
-                    eprintln!("[hotkey] 未实现的全局 action: {:?}", action);
+                    ::log::warn!(target: "hotkey", "未实现的全局 action: {:?}", action);
                 }
                 break;
             }

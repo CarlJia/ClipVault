@@ -37,8 +37,9 @@ pub async fn load_persist_hotkeys(storage: &Storage) -> SqliteResult<HotkeyMap> 
     match parse_hotkeys(raw.as_deref()) {
         Ok(map) => Ok(map),
         Err(e) => {
-            eprintln!(
-                "[keymap] load_persist_hotkeys: parse 失败（{}），使用默认映射",
+            ::log::warn!(
+                target: "keymap",
+                "load_persist_hotkeys: parse 失败（{}），使用默认映射",
                 e
             );
             Ok(HotkeyMap::default_map())
