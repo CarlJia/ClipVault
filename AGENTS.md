@@ -35,7 +35,8 @@ ClipVault 是 **macOS / Windows 双平台**的剪贴板管理器：Tauri 2.x 单
 - `app/` — Tauri 主 binary（storage / watcher / search / notes / pin / pasteback / crypto / privacy / commands）。
 - `frontend/` — WebView 静态资源（vanilla TS + Vite）。
 - `packaging/` — macOS：`codesign.sh`（ad-hoc 签名）、`dmg.sh`（DMG）、`build.sh`（按架构编排
-  `arm64` / `x64`）；Windows：`build-windows.ps1`（NSIS 安装包）；`make_icons.py`（从
+  `arm64` / `x64`）；Windows：`build-windows.ps1`（NSIS 安装包）、`check-windows.sh`（本机对
+  Windows 目标做整树 `check` / `clippy`，桩掉 C 侧，**不链接、不执行**）；`make_icons.py`（从
   `icon-source.png` 生成 `app/icons/` 下全部图标，纯 stdlib，无 PIL 依赖、不依赖 macOS，
   改图标只改源图后重跑：`python3 packaging/make_icons.py`）。
 - `docs/plans/` — 权威 plan。
@@ -52,6 +53,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo test --workspace
 (cd frontend && npm run build)
+
+# 改到 cfg(target_os = "windows") 的分支时必跑：本机整树类型检查 + lint（桩掉 C 侧；不链接、不执行）
+packaging/check-windows.sh
+packaging/check-windows.sh clippy
 
 # 打包（macOS：arm64 与 x64 分别出包）
 packaging/build.sh arm64
@@ -117,8 +122,10 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   CI 的 `windows` job 与真机上跑，不计入本机基线。`frontend/src/logview.test.ts` 6 例
   由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
-- **Windows 目标的整树编译与 lint 只能在 CI 上验证**：本地开发机是 macOS，
-  `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/ci.yml` 在**每个 PR**
-  上跑（macOS：fmt / clippy / `cargo test` / 前端构建 + vitest / R13 网络出口审计；Windows：
-  clippy + `cargo test`），所以涉及 Windows 分支的改动提 PR 即自动验证。`.github/workflows/
-  package.yml` 只在推 `v*` tag 或手动触发时做打包（DMG / NSIS / Release），不做校验。
+- **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
+  本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
+  与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：
+  `.github/workflows/ci.yml` 在**每个 PR** 上跑（macOS：fmt / clippy / `cargo test` / 前端构建 +
+  vitest / R13 网络出口审计；Windows：clippy + `cargo test`，真实 MSVC 工具链），所以涉及 Windows
+  分支的改动提 PR 即自动验证。`.github/workflows/package.yml` 只在推 `v*` tag 或手动触发时做打包
+  （DMG / NSIS / Release），不做校验。

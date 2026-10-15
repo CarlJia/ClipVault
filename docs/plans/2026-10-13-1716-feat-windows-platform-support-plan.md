@@ -349,6 +349,7 @@ app/src/crypto.rs                     [改] + cfg(windows) CredentialKeyProvider
 app/src/commands.rs                   [改] 5 个平台分支补 Windows + platform_info 新命令
 app/src/storage.rs                    [改] default_db_path 按平台分派
 app/src/tray.rs                       [改] Windows 图标与状态可见性
+app/src/single_instance.rs            [新] Windows 单实例守卫(KTD18 / U10)
 app/src/lib.rs                        [改] + cfg(test) 新测试模块(若有独立测试文件)
 app/src/winclip_test.rs               [新] DIB↔PNG / DROPFILES 纯函数单测
 app/src/commands_test.rs              [改] 新命令自动纳入注册守卫
@@ -357,6 +358,7 @@ app/icons/tray-windows.png            [新] 彩色托盘图标
 app/tauri.conf.json                   [改] bundle.icon 加 .ico + Windows 段
 packaging/make_icons.py               [改] + ICO 写出
 packaging/build-windows.ps1           [新] Windows 打包脚本(与 build.sh 对称)
+packaging/check-windows.sh            [新] 本机 windows 目标整树 check/clippy(桩掉 C 侧,不链接)
 packaging/build.sh                    [改] 顶部注释说明 Windows 走独立脚本?否——不改,仅在 README 说明
 .github/workflows/package.yml         [新] macOS + Windows 两个打包 job + tag 触发发布
 frontend/index.html                   [改] 快捷键提示文案槽位(由 JS 填充)
@@ -628,9 +630,11 @@ cargo test --workspace
 (cd frontend && npm run build)
 ```
 
-**Windows 目标的编译验证(A1 的落实手段)。** 本机(Apple Silicon macOS)无法对
-`x86_64-pc-windows-msvc` 做整树编译:`rusqlite` 的 `bundled` 特性需要 MSVC 工具链编译 `sqlite3.c`,
-本机只有 Apple clang,会在 `libsqlite3-sys` 的 C 编译阶段失败(缺 `stdlib.h`)。因此:
+**Windows 目标的编译验证。** 本机(Apple Silicon macOS)对 `x86_64-pc-windows-msvc` 做**真实整树编译**
+仍然不可能:`rusqlite` 的 `bundled` 特性要 MSVC 工具链编译 `sqlite3.c`,本机只有 Apple clang。
+但 `cargo check` / `cargo clippy` **不链接**,那两个 C 侧产物其实没人要 —— 于是整树的**类型检查与 lint**
+可以在本地做到:`packaging/check-windows.sh` 把 `cc` / `ar` / `llvm-rc` 三个桩放到 PATH 顶上,让 C 编译与
+资源编译「成功但无意义」地过去(几秒)。**它证明类型 / lint / feature 正确,不证明链接与运行。** 因此三层:
 
 1. **API 层(已建立,持续维护).** 用一次性探针 crate(仅依赖 `windows` 0.61 + 上述 feature)
    把每个将要用到的 Win32 调用写一遍并对 `x86_64-pc-windows-msvc` 做 `cargo check`。
@@ -640,8 +644,15 @@ cargo test --workspace
    `RegisterHotKey` 的 `id` 是 `i32`、`vk` 是 `u32`、修饰键是 `HOT_KEY_MODIFIERS`;
    `DragQueryFileW` 要 `HDROP`(需从 `HANDLE` 转型)而非 `HANDLE`;
    `CREDENTIALW::CredentialBlob` 是 `*mut u8` 而非 `PWSTR`;`INPUT` 的 union 字段是 `INPUT_0{ki}`。
-2. **整树层(CI).** `.github/workflows/package.yml` 的 `windows` job 是 Windows 目标整树编译的
-   唯一自动化验证点。**在 CI 首次跑绿之前,不得声明 Windows 支持已完成。**
+2. **整树类型层(`packaging/check-windows.sh`,本地).** 每个改动 `cfg(target_os = "windows")` 分支的
+   提交前都跑一次(check 与 clippy 两种模式),拿到整树(含 `--all-targets`,即 Windows-only 测试代码)
+   的真实类型检查与 clippy:`Send` 约束、Win32 常量路径、feature 缺失这类问题都在这里暴露。
+   与「不进仓库」的一次性探针 crate 不同,这个桩脚本**进仓库**:它不是一次性结论,而是可重复的核查手段,
+   且有一个不查文档就会踩的坑(`xcrun --find clang` 解析出的工具链 clang 不像 `/usr/bin/clang` 会自动问
+   xcrun 要 sysroot,必须显式给 `SDKROOT`,否则报 `'stdio.h' file not found`)。
+3. **构建与执行层(CI).** 桩不能替代真实构建:`ci.yml` 的 `windows` job(每个 PR 跑 clippy + `cargo test`)
+   与 `package.yml` 的 `windows` job(推 tag / 手动触发时真出 NSIS 包)才是唯一的链接与执行验证点。
+   **在 CI 首次跑绿之前,不得声明 Windows 支持已完成。**
 
 ### Tests
 
@@ -700,7 +711,8 @@ grep -rE 'reqwest::|hyper::|TcpStream|std::net::' app/src clipvault-core/src   #
 - 五个 `commands` 平台分支里不再存在「仅支持 macOS」这类在 Windows 上不可能触发的错误文案。
 - 前端不再出现写死的 `⌘` 与 SF Symbols 私有区码点。
 - 一次性探针 crate **不进仓库**(它是验证手段,不是产物),其覆盖的 API 结论固化在本文档
-  「Build & Lint」一节。
+  「Build & Lint」一节。**例外**:`packaging/check-windows.sh`(同类手段但可重复、有一个必须写下来的
+  `SDKROOT` 坑)进仓库,理由见同一节。
 
 ### 提交策略
 
