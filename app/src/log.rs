@@ -103,13 +103,9 @@ pub fn format_timestamp(epoch_millis: i64) -> String {
 ///
 /// `msg` 内的控制字符(除 `\n` 外)按 `?` 转写;`\n` 保留,允许多行消息。
 pub fn format_line(ts_millis: i64, level: log::Level, target: &str, msg: &str) -> String {
-    let level_str = match level {
-        log::Level::Error => "ERROR",
-        log::Level::Warn => "WARN",
-        log::Level::Info => "INFO",
-        log::Level::Debug => "DEBUG",
-        log::Level::Trace => "TRACE",
-    };
+    // `log::Level::as_str` 返回 "ERROR"/"WARN"/"INFO"/"DEBUG"/"TRACE",
+    // 与本函数原手写 match 完全一致;此处直接复用标准库以减少重复。
+    let level_str = level.as_str();
     let mut out = String::with_capacity(64 + target.len() + msg.len());
     out.push_str(&format_timestamp(ts_millis));
     out.push(' ');
@@ -534,7 +530,6 @@ pub struct LogInfo {
     pub path: String,
     /// 尾部内容(`.1` + current 拼接,后端已 cap 到 64 KiB / 400 行);
     /// 由 `read_log` 命令填,`read_info` 路径不填。
-    #[serde(skip_serializing_if = "String::is_empty")]
     pub lines: String,
 }
 
