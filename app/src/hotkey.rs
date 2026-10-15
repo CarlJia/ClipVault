@@ -48,6 +48,20 @@ impl std::fmt::Display for ConflictReason {
 
 impl std::error::Error for ConflictReason {}
 
+/// 热键命中后的动作分发。
+///
+/// 放在两个平台 `imp` 之外共用：分发逻辑是「后端有哪些全局 action」的单点，
+/// 各平台各写一份的话，将来新增 action 必然漏改一侧，表现为某个平台静默不响应。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn dispatch_hotkey_action(app: &tauri::AppHandle, action: clipvault_core::keymap::HotkeyAction) {
+    use clipvault_core::keymap::HotkeyAction;
+    match action {
+        HotkeyAction::OpenPanel => crate::panel::show_panel(app),
+        // 目前后端只注册 OpenPanel；其余 action 是面板内快捷键，不走全局。
+        other => ::log::warn!(target: "hotkey", "未实现的全局 action: {:?}", other),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // KeyCombo → Carbon 平台翻译（U2）
 // ---------------------------------------------------------------------------
@@ -317,12 +331,7 @@ mod imp {
         let hotkeys = HOTKEYS.lock().unwrap();
         for (_, id, action, _) in hotkeys.iter() {
             if id.signature == hotkey_id.signature && id.id == hotkey_id.id {
-                if *action == HotkeyAction::OpenPanel {
-                    crate::panel::show_panel(app);
-                } else {
-                    // 未来新增全局 action 时在这里处理（现在只支持 OpenPanel）。
-                    ::log::warn!(target: "hotkey", "未实现的全局 action: {:?}", action);
-                }
+                super::dispatch_hotkey_action(app, *action);
                 break;
             }
         }
@@ -500,6 +509,13 @@ pub use imp::{check_accessibility, register, unregister_all};
 /// 将 `clipvault_core::keymap::Mods` 翻译为 Win32 修饰掩码。
 ///
 /// MOD_ALT=0x0001 / MOD_CONTROL=0x0002 / MOD_SHIFT=0x0004 / MOD_WIN=0x0008。
+///
+/// **`Mods::META` 翻成 `MOD_CONTROL`，不是 `MOD_WIN`。** Windows 的主修饰键是 Ctrl：
+/// plan RW2/KTD4 把默认呼出键定为 `Ctrl+Alt+V`，设置面板把线格式的 `meta` 渲染成
+/// `Ctrl+`（`frontend/src/platform.ts`），前端录制也把 Windows 的 Ctrl 记作 `meta`
+/// （`frontend/src/keymap.ts`：`meta: ev.metaKey || (isWindows() && ev.ctrlKey)`）。
+/// 翻成 `MOD_WIN` 会注册出 Win+Alt+V，与显示的组合不一致。`META | CTRL` 因此折叠成
+/// 同一个 `MOD_CONTROL` —— 全局热键要的是「同时按住」，两者本就同义。
 #[cfg(target_os = "windows")]
 fn mods_to_win32(mods: clipvault_core::keymap::Mods) -> u32 {
     use clipvault_core::keymap::Mods;
@@ -514,7 +530,7 @@ fn mods_to_win32(mods: clipvault_core::keymap::Mods) -> u32 {
         mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_SHIFT.0;
     }
     if mods.contains(Mods::META) {
-        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_WIN.0;
+        mask |= windows::Win32::UI::Input::KeyboardAndMouse::MOD_CONTROL.0; // META 即 Ctrl
     }
     mask
 }
@@ -543,7 +559,7 @@ fn charkind_to_vk(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
 #[cfg(target_os = "windows")]
 mod imp_win {
     use super::ConflictReason;
-    use super::{charkind_to_vk, mods_to_win32};
+    use super::{charkind_to_vk, dispatch_hotkey_action, mods_to_win32};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::sync::mpsc;
@@ -552,18 +568,22 @@ mod imp_win {
 
     use clipvault_core::keymap::{HotkeyAction, KeyCombo};
     use tauri::AppHandle;
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage, WM_HOTKEY,
+        DispatchMessageW, GetMessageW, MSG, PM_NOREMOVE, PeekMessageW, PostQuitMessage,
+        PostThreadMessageW, TranslateMessage, WM_APP, WM_HOTKEY,
     };
 
     /// 消息泵线程状态。
     struct Pump {
+        /// 泵线程自己的 id。由泵线程在发布本结构之前写入 —— 主线程拿到 `tx` 的同时
+        /// 一定拿到可用的 `thread_id`，不会出现「唤醒消息投给 0 号线程」的窗口。
         thread_id: u32,
-        /// JoinHandle 在 ensure_pump 中从父线程写入。
+        /// JoinHandle 由父线程（`ensure_pump`）补写。
         handle: Option<JoinHandle<()>>,
         /// 注册指令 channel（发送方在主线程）。
         tx: mpsc::Sender<PumpMsg>,
@@ -585,6 +605,40 @@ mod imp_win {
     /// 热键 id 自增计数器（进程内唯一）。
     static NEXT_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
+    /// 热键命中时要执行的动作。
+    ///
+    /// 生产路径传的是「唤出面板」的闭包（捕获 `AppHandle`），而**不是**在 `run_pump`
+    /// 里直接用 `AppHandle` —— 这个接缝让消息泵能在没有 Tauri 应用时被测试驱动，
+    /// 见本文件 [`win_pump_tests`]。只在首次启动泵那一次生效，见 [`ensure_pump`]。
+    type HotkeyCallback = Box<dyn Fn(HotkeyAction) + Send>;
+
+    /// 唤醒消息泵线程用的线程消息（`WM_APP + 1`；`WM_APP` = 0x8000，WinUser.h）。
+    const WM_CLIPVAULT_WAKE: u32 = WM_APP + 1;
+
+    /// 告诉消息泵线程「channel 里有新指令了」。
+    ///
+    /// 泵线程阻塞在 `GetMessageW` 上，只有投给它自己的线程消息能把它唤醒。
+    /// 调用顺序由 [`send_cmd`] 统一保证，不要单独调用本函数。
+    fn wake_pump(pump: &Pump) -> windows::core::Result<()> {
+        unsafe { PostThreadMessageW(pump.thread_id, WM_CLIPVAULT_WAKE, WPARAM(0), LPARAM(0)) }
+    }
+
+    /// 投递指令并唤醒泵线程。
+    ///
+    /// **顺序固定：先 `send`，后唤醒。** 反过来先投唤醒消息再 send，泵会在 channel 还
+    /// 空着时醒过来、重新阻塞，那条指令就再也等不到读取 —— `register` 以
+    /// `pump reply timeout` 失败，`unregister_all` 卡死在 join 上。
+    fn send_cmd(pump: &Pump, msg: PumpMsg) -> Result<(), mpsc::SendError<PumpMsg>> {
+        let sent = pump.tx.send(msg);
+        if sent.is_ok()
+            && let Err(e) = wake_pump(pump)
+        {
+            // 指令投出去了却叫不醒泵 —— 调用方会走超时/卡死路径，留一行现场。
+            ::log::warn!(target: "hotkey", "唤醒消息泵失败：{e}");
+        }
+        sent
+    }
+
     /// 发送给消息泵的消息。
     enum PumpMsg {
         /// 注册热键。
@@ -604,20 +658,17 @@ mod imp_win {
     const REPLY_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// 确保消息泵线程已启动（如尚未启动则 spawn 并等待就绪）。
-    fn ensure_pump(app: &AppHandle) -> Result<(), ConflictReason> {
+    fn ensure_pump(on_hotkey: HotkeyCallback) -> Result<(), ConflictReason> {
         if STARTED.load(std::sync::atomic::Ordering::SeqCst) {
             return Ok(()); // 已启动
         }
 
-        // channel 用来让子线程回报 thread_id。
-        let (ready_tx, ready_rx) = mpsc::channel::<Result<u32, String>>();
+        // channel 只用来让子线程回报「泵已就绪」；`thread_id` 由泵线程自己写进 PUMP。
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<(), String>>();
 
         let spawned = std::thread::Builder::new()
             .name("clipvault-hotkey".into())
-            .spawn({
-                let app = app.clone();
-                move || run_pump(app, ready_tx)
-            });
+            .spawn(move || run_pump(on_hotkey, ready_tx));
 
         let handle = match spawned {
             Ok(h) => h,
@@ -628,12 +679,14 @@ mod imp_win {
         };
 
         match ready_rx.recv_timeout(STARTUP_TIMEOUT) {
-            Ok(Ok(thread_id)) => {
-                // 子线程已就绪，tx 已写入 PUMP；我们把 handle 也写入。
+            Ok(Ok(())) => {
+                // 子线程已就绪：`tx` 与 `thread_id` 都在 PUMP 里了；我们把 handle 补上。
                 let mut guard = PUMP.lock().expect("hotkey pump mutex poisoned");
                 if let Some(ref mut p) = *guard {
-                    p.thread_id = thread_id;
                     p.handle = Some(handle);
+                    // STARTED 只能在 PUMP 里确实有 pump 之后置位：并发 `register`
+                    // 先读到 true、却拿不到 pump 的话只能直接失败。
+                    STARTED.store(true, std::sync::atomic::Ordering::SeqCst);
                     return Ok(());
                 }
                 STARTED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -652,12 +705,28 @@ mod imp_win {
 
     /// 注册（或替换）某个 action 的全局热键（通道式）。
     ///
+    /// 生产路径：热键命中即唤出主面板。
+    pub fn register(
+        app: &AppHandle,
+        action: HotkeyAction,
+        combo: &KeyCombo,
+    ) -> Result<(), ConflictReason> {
+        let app = app.clone();
+        register_with(
+            Box::new(move |action| dispatch_hotkey_action(&app, action)),
+            action,
+            combo,
+        )
+    }
+
+    /// [`register`] 的实现：回调由调用方传入，见 [`HotkeyCallback`]。
+    ///
     /// **替换语义**（与 macOS 侧一致）：
     /// 1. 同一 `(action, combo)` 已注册 → no-op `Ok`。
     /// 2. 否则先注册新 id；**成功之后**才注销同 action 的旧 id ——
     ///    注册失败时旧热键原样保留。
-    pub fn register(
-        app: &AppHandle,
+    pub(crate) fn register_with(
+        on_hotkey: HotkeyCallback,
         action: HotkeyAction,
         combo: &KeyCombo,
     ) -> Result<(), ConflictReason> {
@@ -675,7 +744,7 @@ mod imp_win {
         }
 
         // 2. 确保 pump 线程在运行。
-        ensure_pump(app)?;
+        ensure_pump(on_hotkey)?;
 
         // 3. 注册新 id。
         let new_id = NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -685,14 +754,16 @@ mod imp_win {
                 .as_ref()
                 .ok_or_else(|| ConflictReason::Taken("pump not initialized".to_string()))?;
             let (reply_tx, reply_rx) = mpsc::channel();
-            pump.tx
-                .send(PumpMsg::Register {
+            send_cmd(
+                pump,
+                PumpMsg::Register {
                     id: new_id,
                     combo: *combo,
                     action,
                     reply: reply_tx,
-                })
-                .map_err(|_| ConflictReason::Taken("pump channel closed".to_string()))?;
+                },
+            )
+            .map_err(|_| ConflictReason::Taken("pump channel closed".to_string()))?;
             drop(pump_guard);
             reply_rx
                 .recv_timeout(REPLY_TIMEOUT)
@@ -717,13 +788,14 @@ mod imp_win {
         let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
         if let Some(pump) = pump_guard.as_ref() {
             let (reply_tx, reply_rx) = mpsc::channel();
-            if pump
-                .tx
-                .send(PumpMsg::Unregister {
+            if send_cmd(
+                pump,
+                PumpMsg::Unregister {
                     id,
                     reply: reply_tx,
-                })
-                .is_ok()
+                },
+            )
+            .is_ok()
             {
                 drop(pump_guard);
                 let _ = reply_rx.recv_timeout(REPLY_TIMEOUT);
@@ -735,7 +807,7 @@ mod imp_win {
     pub fn unregister_all() {
         let pump_guard = PUMP.lock().expect("hotkey pump mutex poisoned");
         if let Some(ref pump) = *pump_guard {
-            let _ = pump.tx.send(PumpMsg::Quit);
+            let _ = send_cmd(pump, PumpMsg::Quit);
         }
         drop(pump_guard);
 
@@ -751,32 +823,39 @@ mod imp_win {
     }
 
     /// 消息泵主体：在子线程中运行，接收主线程发来的 PumpMsg 并执行。
-    fn run_pump(app: AppHandle, ready_tx: mpsc::Sender<Result<u32, String>>) {
+    fn run_pump(on_hotkey: HotkeyCallback, ready_tx: mpsc::Sender<Result<(), String>>) {
         // channel 用来接收主线程的 PumpMsg。
         let (tx, rx) = mpsc::channel::<PumpMsg>();
 
         // id → HotkeyAction 路由表（在 pump 线程内维护）。
         let mut id_map: HashMap<i32, HotkeyAction> = HashMap::new();
 
-        // 把 tx 写入 PUMP（主线程在 ensure_pump 中等待这个）。
+        // 强制建出本线程的消息队列。`PostThreadMessageW` 对还没有消息队列的线程会直接
+        // 失败，而主线程收到「就绪」后可能立刻投唤醒消息 —— 不先建队列就留着一条
+        // 「就绪 → 唤醒消息丢失 → 指令永远读不到」的窗口。
+        // `PeekMessageW(..., PM_NOREMOVE)` 是建队列的官方手法：不取走任何消息。
+        let mut msg = MSG::default();
+        unsafe {
+            let _ = PeekMessageW(&mut msg, None, 0, 0, PM_NOREMOVE);
+        }
+
+        // 队列建好、`thread_id` 到手之后才发布 PUMP —— 主线程拿到 `tx` 时 `thread_id`
+        // 一定已经可用，唤醒消息不会投空。
+        let thread_id = unsafe { GetCurrentThreadId() };
         {
             let mut guard = PUMP.lock().expect("hotkey pump mutex poisoned");
             *guard = Some(Pump {
-                thread_id: 0, // filled by ensure_pump
-                handle: None, // filled by ensure_pump
+                thread_id,
+                handle: None, // 由 ensure_pump 补写
                 tx,
             });
         }
 
-        // 回报 thread_id。
-        let thread_id = unsafe { GetCurrentThreadId() };
-        if ready_tx.send(Ok(thread_id)).is_err() {
-            // 主线程已不等了。
-            return;
+        if ready_tx.send(Ok(())).is_err() {
+            return; // 主线程已不等了
         }
 
         // 主消息循环。
-        let mut msg = MSG::default();
         loop {
             // 先 try_recv PumpMsg（非阻塞）。
             match rx.try_recv() {
@@ -844,12 +923,13 @@ mod imp_win {
             }
             if msg.message == WM_HOTKEY {
                 let id = msg.wParam.0 as i32;
-                if let Some(action) = id_map.get(&id)
-                    && *action == HotkeyAction::OpenPanel
-                {
-                    crate::panel::show_panel(&app);
+                if let Some(action) = id_map.get(&id) {
+                    on_hotkey(*action);
                 }
             }
+            // 唤醒消息（`WM_CLIPVAULT_WAKE`）到这里已经完成使命：它只负责把阻塞在
+            // `GetMessageW` 上的本线程叫醒，真正的指令由下一轮循环顶部的 `rx.try_recv()`
+            // 取走。线程消息的 `DispatchMessageW` 本身是 no-op。
             unsafe {
                 let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -894,7 +974,7 @@ pub fn check_accessibility() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use clipvault_core::keymap::{CharKind, KeyCombo, Mods};
+    use clipvault_core::keymap::{CharKind, Mods};
 
     // ---- Carbon 翻译表测试（macOS only）----
     #[cfg(target_os = "macos")]
@@ -966,13 +1046,15 @@ mod tests {
     }
 
     // ---- Windows 翻译表测试（Windows only）----
+    //
+    // 回归：Windows 默认呼出键是 Ctrl+Alt+V（`META` 即 Ctrl），不是 Win+Alt+V。
     #[cfg(target_os = "windows")]
     #[test]
-    fn win32_mods_translation_meta_alt_v() {
+    fn win32_default_openpanel_is_ctrl_alt_v() {
         use crate::hotkey::mods_to_win32;
         let mods = Mods::META | Mods::ALT;
-        // MOD_WIN=0x0008 | MOD_ALT=0x0001 = 0x0009
-        assert_eq!(mods_to_win32(mods), 0x0009);
+        // MOD_CONTROL=0x0002 | MOD_ALT=0x0001 = 0x0003
+        assert_eq!(mods_to_win32(mods), 0x0003);
     }
 
     #[cfg(target_os = "windows")]
@@ -1007,17 +1089,17 @@ mod tests {
         use crate::hotkey::mods_to_win32;
         let cases = [
             (Mods::empty(), 0u32),
-            (Mods::META, 0x0008),               // MOD_WIN
+            (Mods::META, 0x0002),               // MOD_CONTROL
             (Mods::SHIFT, 0x0004),              // MOD_SHIFT
             (Mods::ALT, 0x0001),                // MOD_ALT
             (Mods::CTRL, 0x0002),               // MOD_CONTROL
-            (Mods::META | Mods::SHIFT, 0x000C), // MOD_WIN | MOD_SHIFT
-            (Mods::META | Mods::ALT, 0x0009),   // MOD_WIN | MOD_ALT
+            (Mods::META | Mods::SHIFT, 0x0006), // MOD_CONTROL | MOD_SHIFT
+            (Mods::META | Mods::ALT, 0x0003),   // MOD_CONTROL | MOD_ALT
             (Mods::CTRL | Mods::ALT, 0x0003),   // MOD_CONTROL | MOD_ALT
             (Mods::SHIFT | Mods::ALT, 0x0005),
             (Mods::CTRL | Mods::SHIFT, 0x0006),
-            (Mods::META | Mods::CTRL, 0x000A),
-            (Mods::META | Mods::SHIFT | Mods::ALT, 0x000D),
+            (Mods::META | Mods::CTRL, 0x0002), // 都落到 MOD_CONTROL（同义）
+            (Mods::META | Mods::SHIFT | Mods::ALT, 0x0007),
             (Mods::CTRL | Mods::SHIFT | Mods::ALT, 0x0007),
         ];
         for (mods, expected) in cases {
@@ -1077,24 +1159,76 @@ mod tests {
     // 无法在 macOS 上用 mock 测试 Windows 路径。以下测试覆盖转换正确性 + ConflictReason。
     // 端到端 smoke 在 plan 的真机 AE1 验收中覆盖。
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn keycombo_default_openpanel_translates() {
         // 验证默认 OpenPanel combo 可以被正确翻译
-        let combo = KeyCombo {
+        let combo = clipvault_core::keymap::KeyCombo {
             mods: Mods::META | Mods::ALT,
             key: CharKind::Char('v'),
         };
-        #[cfg(target_os = "macos")]
-        {
-            use crate::hotkey::{charkind_to_vkey, mods_to_carbon};
-            assert_eq!(charkind_to_vkey(combo.key), Some(0x09)); // kVK_ANSI_V
-            assert_eq!(mods_to_carbon(combo.mods), 0x0900); // cmdKey|optionKey
+        use crate::hotkey::{charkind_to_vkey, mods_to_carbon};
+        assert_eq!(charkind_to_vkey(combo.key), Some(0x09)); // kVK_ANSI_V
+        assert_eq!(mods_to_carbon(combo.mods), 0x0900); // cmdKey|optionKey
+    }
+}
+
+// ---------------------------------------------------------------------------
+// win_pump_tests：消息泵唤醒回归
+// ---------------------------------------------------------------------------
+
+/// 消息泵「能被唤醒」的回归。
+///
+/// 这些断言依赖真实的 Win32 消息循环，没有可以抽成纯函数的部分（与本文件其余测试
+/// 「翻译表抽出来、两平台都能单测」的手法不同），因此只能跑在 Windows 上：macOS 开发机
+/// 只负责 `cargo check --target x86_64-pc-windows-msvc`，**执行**归 CI 的 windows job
+/// 与真机 AEW3。
+#[cfg(all(test, target_os = "windows"))]
+mod win_pump_tests {
+    use super::imp_win::{register_with, unregister_all};
+    use clipvault_core::keymap::{CharKind, HotkeyAction, KeyCombo, Mods};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// 关停是否在给定时限内返回的等待上限。真机上一轮唤醒是毫秒级，10s 只可能是卡死。
+    const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// 测试用的组合。刻意不用 `v` —— 那正是 ClipVault 的默认呼出键，本机同时跑着应用时
+    /// 会注册失败，把失败误报成「泵没被唤醒」。
+    fn combo(key: char) -> KeyCombo {
+        KeyCombo {
+            mods: Mods::CTRL | Mods::ALT,
+            key: CharKind::Char(key),
         }
-        #[cfg(target_os = "windows")]
-        {
-            use crate::hotkey::{charkind_to_vk, mods_to_win32};
-            assert_eq!(charkind_to_vk(combo.key), Some(0x56)); // VK_V
-            assert_eq!(mods_to_win32(combo.mods), 0x0009); // MOD_WIN|MOD_ALT
-        }
+    }
+
+    /// 消息泵是进程级单例（`PUMP` / `STARTED` 都是静态量），所以四个场景串在同一个用例里
+    /// 跑 —— `cargo test` 默认多线程，并行的用例会互相停掉对方的泵。
+    #[test]
+    fn pump_wakes_up_for_commands() {
+        // 1. 首次注册。
+        register_with(Box::new(|_| {}), HotkeyAction::OpenPanel, &combo('j'))
+            .expect("首次 register 必须成功；失败即泵线程收不到 channel 指令");
+
+        // 2. 改键（同一 action 换 combo）：走 `STARTED` 已置位的分支，不另起泵线程。
+        register_with(Box::new(|_| {}), HotkeyAction::OpenPanel, &combo('k'))
+            .expect("改键（同 action 换 combo）必须成功");
+
+        // 3. 关停。放进子线程等，是为了让「卡死」表现为一条断言失败，
+        //    而不是让整个 job 挂到超时。
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            unregister_all();
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(SHUTDOWN_DEADLINE).is_ok(),
+            "unregister_all 必须在 {SHUTDOWN_DEADLINE:?} 内返回；卡住即 Quit 未被唤醒"
+        );
+
+        // 4. 关停后应能重新注册（设置面板改完键会再走一遍 register）。
+        register_with(Box::new(|_| {}), HotkeyAction::OpenPanel, &combo('j'))
+            .expect("关停后必须能重新注册");
+        unregister_all();
     }
 }
