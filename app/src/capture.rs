@@ -193,10 +193,6 @@ pub async fn insert_captured_with_metadata(
 // macOS 真实读取
 // ---------------------------------------------------------------
 
-/// NSPasteboard `NSFilenamesPboardType` 常量（property-list NSData blob）。
-#[cfg(target_os = "macos")]
-const NSFILENAMES_PBOARD_TYPE: &str = "NSFilenamesPboardType";
-
 /// 单次 NSPasteboard 轮询:按 `filenames → image → rtf → color → string`
 /// 顺序探测,首个非空胜出。返回 `None` 表示粘贴板未变化或所有 type 都空。
 ///
@@ -605,89 +601,72 @@ fn bytes_digest(bytes: &[u8]) -> String {
     hex
 }
 
-/// 读 NSFilenamesPboardType（property-list NSData）解析为路径数组。
+/// 读 `NSFilenamesPboardType` 得到文件 URL 数组,再转成 `Captured::file`。
 ///
-/// 解析失败或 property-list 不是 NSArray<NSString> 时返回 `None`。后续
-/// 增强可加上 canonicalize + resolved 标记（U2 metadata `resolved` 字段
-/// 已在 schema 保留,实际写入由调用方基于 NSURL 再算;MVP 阶段保留
-/// property-list 原文,canonicalize 失败标 `resolved = false`）。
+/// 走 `readObjectsForClasses(_:options:)` 而**不是**自己解 property list:Apple
+/// 文档明确推荐这个 API 读粘贴板上的文件引用,系统负责消化
+/// `NSFilenamesPboardType` 历史上用过的多种编码(NSKeyedArchiver bplist、XML
+/// plist、更早的 NSArchiver),我们只把每个 `NSURL` 的路径取出来。
+///
+/// 历史教训:这里曾经直接读 `dataForType` 的字节再"扫可打印 ASCII 片段"当作
+/// 路径(见 git 历史里的 `parse_filenames_plist`),对 NSKeyedArchiver bplist 几乎
+/// 拿不回完整路径,于是 file 优先级被整个旁路 —— 用户可见症状就是"Finder 复制
+/// 文件不进历史"。
+///
+/// 拿不到数组(None 或空)、或每个元素都 downcast 失败 / 非文件 URL 时返回
+/// `None`,让 `poll_first_non_empty` 继续走 image → rtf → color → string。
 #[cfg(target_os = "macos")]
 fn poll_filenames(pb: &objc2_app_kit::NSPasteboard) -> Option<Captured> {
-    use objc2_foundation::NSString;
+    use objc2::ClassType;
+    use objc2_foundation::{NSArray, NSURL};
 
-    let pb_type = NSString::from_str(NSFILENAMES_PBOARD_TYPE);
-    let data = pb.dataForType(&pb_type)?;
-    let bytes = data.to_vec();
+    // SAFETY: 该 API 要求 class_array 是有效的 ObjC 类数组、options 类型正确。
+    // 两者都满足:class_array 只放 `NSURL` 的类对象,options 传 None(不附加
+    // 读取选项 —— 我们要的就是粘贴板上全部文件 URL)。
+    let class_array = NSArray::from_slice(&[NSURL::class()]);
+    let objects = unsafe { pb.readObjectsForClasses_options(&class_array, None) }?;
 
-    // Property list (binary plist) 反序列化失败 → 视为 filenames 不可用。
-    // MVP 阶段直接走简单 split:property list 内 NSArray<NSString> 是
-    // 连续 NUL 分隔;使用 propertyListFromData 需要 NSPropertyListSerialization
-    // 桥接,在本单元内简化: 解析为 plist bytes,使用 plist crate 反序列化;
-    // 不可用时把 bytes 长度作为文件引用数量占位,UI 仍能展示。
-    let paths = parse_filenames_plist(&bytes);
-    if paths.is_empty() {
+    // 数组元素是 `AnyObject`,逐个 downcast 到 `NSURL`;不是 NSURL 的条目丢弃
+    // (同一粘贴板上不会混入别的类型,但 downcast 是唯一安全的取类型方式)。
+    let urls: Vec<_> = (0..objects.count())
+        .filter_map(|index| objects.objectAtIndex(index).downcast::<NSURL>().ok())
+        .collect();
+
+    paths_from_urls(&urls)
+}
+
+/// 把已 downcast 好的文件 URL 转成 `Captured::file`(纯函数,便于单测)。
+///
+/// `canonicalize` 成功用规范路径;失败保留 `NSURL` 给的路径并把 `resolved` 标成
+/// `false`(多类型 plan Assumptions:拿不到规范路径不是丢弃这条条目的理由)。
+/// `path()` 返回 nil 的条目(非文件 URL)跳过;全部被跳过时返回 `None`,与
+/// "filenames 这一优先级没内容"同义。
+#[cfg(target_os = "macos")]
+fn paths_from_urls(urls: &[objc2::rc::Retained<objc2_foundation::NSURL>]) -> Option<Captured> {
+    let mut all_resolved = true;
+    let mut resolved = Vec::with_capacity(urls.len());
+
+    for url in urls {
+        let Some(path) = url.path() else {
+            continue;
+        };
+        let path = path.to_string();
+        match std::fs::canonicalize(&path)
+            .ok()
+            .and_then(|canonical| canonical.to_str().map(str::to_string))
+        {
+            Some(canonical) => resolved.push(canonical),
+            None => {
+                resolved.push(path);
+                all_resolved = false;
+            }
+        }
+    }
+
+    if resolved.is_empty() {
         return None;
     }
-    // canonicalize 失败的标 `resolved = false`（多类型 plan Assumptions）。
-    let mut all_resolved = true;
-    let mut resolved = Vec::with_capacity(paths.len());
-    for p in paths {
-        let canonical = std::fs::canonicalize(&p)
-            .ok()
-            .and_then(|pb| pb.to_str().map(|s| s.to_string()));
-        if let Some(c) = canonical {
-            resolved.push(c);
-        } else {
-            resolved.push(p);
-            all_resolved = false;
-        }
-    }
     Some(Captured::file(resolved, all_resolved))
-}
-
-/// 简化版 NSFilenamesPboardType property-list 解析：MVP 阶段不引入
-/// `plist` crate，识别 binary plist NSArray<NSString> 的紧凑布局:
-/// bytes[0] = `bplist00` magic；跳过 header 8 字节，后续以 offset table
-/// 寻址。本 plan 不实现完整 plist 反序列化，简化处理：把原始字节长度
-/// 当作单条 path placeholder（FileVault/Notes app 拷贝路径多在多 KB
-/// 范围内，能让 auto_category/file 路径贯通）；后续增强可换用
-/// `plist` crate 做完整解析。
-#[cfg(target_os = "macos")]
-fn parse_filenames_plist(bytes: &[u8]) -> Vec<String> {
-    if bytes.len() < 10 {
-        return Vec::new();
-    }
-    if &bytes[..8] != b"bplist00" {
-        // 早期 macOS 是 XML plist（plist XML）；这里简单返回空（plan
-        // 不展开 XML 反序列化）。
-        return Vec::new();
-    }
-    // MVP 短路：从 plist bytes 提取所有可打印 ASCII 片段作为路径占位。
-    // 真实部署应换 `plist` crate；这里给 unit test 一个稳定的非空输入。
-    extract_printable_paths(bytes)
-}
-
-#[cfg(target_os = "macos")]
-fn extract_printable_paths(bytes: &[u8]) -> Vec<String> {
-    let mut paths = Vec::new();
-    let mut start = None;
-    for (i, &b) in bytes.iter().enumerate() {
-        let is_printable = (0x20..=0x7e).contains(&b) && b != b'\\';
-        if is_printable {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(s) = start.take() {
-            let chunk = &bytes[s..i];
-            if let Ok(s) = std::str::from_utf8(chunk) {
-                let s = s.trim();
-                if s.starts_with('/') || s.starts_with("~") || s.contains(':') {
-                    paths.push(s.to_string());
-                }
-            }
-        }
-    }
-    paths
 }
 
 /// 从图片字节（PNG/TIFF）解析 (width, height)。失败时返回 (0, 0)。
@@ -959,6 +938,61 @@ mod tests {
         tiff.extend(4u32.to_be_bytes());
         tiff.extend(5u32.to_be_bytes());
         assert_eq!(tiff_dimensions(&tiff), Some((4, 5)));
+    }
+
+    /// `paths_from_urls` 的输入契约：已经是 NSURL 数组（由
+    /// `readObjectsForClasses_options` 的 downcast 产出），纯函数不再触碰
+    /// NSPasteboard。
+    #[cfg(target_os = "macos")]
+    fn url(path: &str) -> objc2::rc::Retained<objc2_foundation::NSURL> {
+        use objc2_foundation::{NSString, NSURL};
+        NSURL::fileURLWithPath(&NSString::from_str(path))
+    }
+
+    /// 解出 file payload 里的路径数组（与 `Captured::file` 的编码同源）。
+    #[cfg(target_os = "macos")]
+    fn payload_paths(captured: &Captured) -> Vec<String> {
+        serde_json::from_slice(captured.payload.as_deref().unwrap_or(&[])).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_from_urls_resolves_existing_paths() {
+        let dir = std::env::temp_dir();
+        let dir_str = dir.to_str().expect("临时目录必须是 UTF-8");
+        let expected = std::fs::canonicalize(&dir)
+            .expect("临时目录必须存在")
+            .to_str()
+            .expect("规范路径必须是 UTF-8")
+            .to_string();
+
+        let captured = paths_from_urls(&[url(dir_str)]).expect("存在的目录应产出 Captured");
+
+        assert_eq!(captured.kind, ContentKind::File);
+        assert_eq!(payload_paths(&captured), vec![expected]);
+        assert_eq!(captured.metadata["resolved"], true);
+        assert_eq!(captured.mime.as_deref(), Some("text/uri-list"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_from_urls_unresolvable_keeps_original_with_resolved_false() {
+        let missing = "/nonexistent/path/that/does/not/exist";
+
+        let captured =
+            paths_from_urls(&[url(missing)]).expect("canonicalize 失败仍应产出 Captured");
+
+        assert_eq!(payload_paths(&captured), vec![missing.to_string()]);
+        assert_eq!(captured.metadata["resolved"], false);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_from_urls_empty_returns_none() {
+        assert!(
+            paths_from_urls(&[]).is_none(),
+            "空数组必须返回 None，让 watcher 走下一优先级"
+        );
     }
 
     #[test]
