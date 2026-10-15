@@ -20,14 +20,14 @@ execution: code
 `AccessibilityChecker` 两个 trait、`capture::Captured`、`storage`/`search`/`thumbnail`/`privacy`)
 **一行不改**,只为每个 `#[cfg(not(target_os = "macos"))]` 降级桩补一份 `#[cfg(target_os = "windows")]`
 实现。原生绑定用 `windows` crate 0.61(已在依赖树内),与 macOS 侧 objc2 家族对称且同样只在
-对应 target 下编译。`KTD10`–`KTD17`。
+对应 target 下编译。`KTD10`–`KTD18`。
 
 **Product authority.** 本 plan **显式取代** MVP plan 与多类型 plan 中「跨平台客户端 out of scope」
 的范围声明(`2026-09-24-0931-...md:19,207`、`2026-09-27-1038-...md:161`)。macOS 行为是**回归基线**,
 不得改变;Windows 是新增的第二个目标平台。Linux 不在本 plan 范围内。
 
-**Stop conditions.** 当 `U1`–`U9` 各自 Verification 全项通过、`AEW1`–`AEW8` 在 Windows 10/11 真机上
-跑通、且 macOS 既有测试基线(app 94 + core 22)不退化时,视为可交付;在此之前不得声明 Windows 可用。
+**Stop conditions.** 当 `U1`–`U10` 各自 Verification 全项通过、`AEW1`–`AEW9` 在 Windows 10/11 真机上
+跑通、且 macOS 既有测试基线不退化时,视为可交付;在此之前不得声明 Windows 可用。
 
 ---
 
@@ -128,6 +128,9 @@ Windows 一次 `OpenClipboard` 是**进程独占的临界区**,期间不能阻�
   scheme 白名单**(仅 `http://` / `https://`)。
 - **RW7.** Windows 上托盘图标在任何主题(浅色/深色任务栏)下可见,四态(监听中/访客/暂停/异常)
   有可观测的视觉或 tooltip 区分。
+- **RW10.** Windows 上重复启动(再点一次桌面图标/快捷方式、开始菜单再进一次)**不得产生第二个实例**:
+  通知区仍只有一个托盘图标,不得有第二个 watcher 写同一个库,新进程不得与主实例抢同一个全局热键
+  —— 已运行的实例被唤出主面板,新进程随即退出(不建托盘、不开库、不注册热键)。
 
 #### 平台差异(Platform divergence,须在 UI 与文档中如实表达)
 
@@ -177,6 +180,12 @@ file/rtf,图片条目带 64×64 缩略图,文件条目显示文件名与路径�
 重启应用后仍可解密 → 在目标应用回车可正常回贴明文 →
 用 `credential manager` 工具(`cmdkey /list` 或凭据管理器 UI)能看到 `ClipVault/data_key` 条目
 且其内容不是可直接读出的密钥文本 → 手工删除该凭据后重启,加密区条目显示为「不可解密」而**不崩溃**。
+
+#### AEW9. 重复启动只激活已有实例 (Covers RW10)
+应用已在托盘运行时,再双击一次桌面图标(或在开始菜单再点一次):通知区**仍只有一个**托盘图标,
+主面板被唤出,任务管理器里 `clipvault.exe` 只有一个进程;随后从托盘菜单点「退出」,进程立即消失
+且不卡顿(退出路径要注销热键并 join 消息泵线程)。第二次启动的进程在诊断日志里留下
+「已有实例在运行,已请求它唤出面板;本次启动退出」。
 
 ### Scope Boundaries
 
@@ -288,6 +297,21 @@ SF Symbols 私有区字形换成内联 SVG(仓库已有 `PIN_SVG` 先例,`fronte
 新增的 `windows` crate 不得引入任何对外 socket。审计命令在既有两条外增加 Windows 目标的交叉检查;
 `AGENTS.md` 的约束段同步更新为双平台措辞。
 
+#### KTD18. 单实例守卫 = `CreateMutexW` + 命名自动复位事件
+
+Windows 上「再点一次图标」是**再起一个进程**,不做守卫就会多一个托盘图标、第二个 watcher 写同一个库、
+并抢同一个全局热键(macOS 侧无此问题:`.app` 走 LaunchServices,重复打开只激活已有实例)。
+用 `CreateMutexW(None, false, "Local\ClipVault.<identifier>.instance")` 抢锁,但注意:**同名对象已存在
+时 `CreateMutexW` 仍然成功返回**,真正的判据是**紧接着读的** `GetLastError() == ERROR_ALREADY_EXISTS`
+(中间夹任何其它 kernel 调用都会覆盖 last error)。次实例通过命名自动复位事件
+`Local\ClipVault.<identifier>.activate` 唤醒主实例(主实例一条常驻线程 `WaitForSingleObject` 等它,
+收到即唤出面板),随后自行退出。名字用 `Local\` 而非 `Global\`:剪贴板本身是 per-session 的,
+快速用户切换下另一个登录会话该有自己的实例。两个 API 都在既有 `windows` crate 的
+`Win32_System_Threading` / `Win32_Foundation` feature 内,**不为此引入新依赖**(与热键侧不引入
+`tauri-plugin-global-shortcut` 同一取舍)。拿不到句柄时只记一行 WARN、按主实例继续跑,不阻塞启动。
+守卫在 `setup` 里 `log::init` 之后、`Storage::open` 之前执行:这样「点了图标却没反应」能在诊断日志里
+读到答案,同时仍拦住 DB / watcher / 托盘 / 热键的一切副作用。
+
 ### High-Level Technical Design
 
 ```
@@ -325,6 +349,7 @@ app/src/crypto.rs                     [改] + cfg(windows) CredentialKeyProvider
 app/src/commands.rs                   [改] 5 个平台分支补 Windows + platform_info 新命令
 app/src/storage.rs                    [改] default_db_path 按平台分派
 app/src/tray.rs                       [改] Windows 图标与状态可见性
+app/src/single_instance.rs            [新] Windows 单实例守卫(KTD18 / U10)
 app/src/lib.rs                        [改] + cfg(test) 新测试模块(若有独立测试文件)
 app/src/winclip_test.rs               [新] DIB↔PNG / DROPFILES 纯函数单测
 app/src/commands_test.rs              [改] 新命令自动纳入注册守卫
@@ -333,6 +358,7 @@ app/icons/tray-windows.png            [新] 彩色托盘图标
 app/tauri.conf.json                   [改] bundle.icon 加 .ico + Windows 段
 packaging/make_icons.py               [改] + ICO 写出
 packaging/build-windows.ps1           [新] Windows 打包脚本(与 build.sh 对称)
+packaging/check-windows.sh            [新] 本机 windows 目标整树 check/clippy(桩掉 C 侧,不链接)
 packaging/build.sh                    [改] 顶部注释说明 Windows 走独立脚本?否——不改,仅在 README 说明
 .github/workflows/package.yml         [新] macOS + Windows 两个打包 job + tag 触发发布
 frontend/index.html                   [改] 快捷键提示文案槽位(由 JS 填充)
@@ -395,15 +421,27 @@ README.md                             [改] Windows 安装/使用/限制/凭据�
 - **Requirements.** RW2、AEW3。
 - **Dependencies.** U1(面板能显示才有意义,但实现上无强依赖)。
 - **Files.** `app/src/hotkey.rs`。
-- **Approach.** 新增 `#[cfg(target_os = "windows")] mod imp`,保持 `register(&AppHandle)` /
-  `unregister()` / `check_accessibility() -> bool` 三个签名不变(前端与 main.rs 零改动)。
-  `register` 幂等(已注册则返回),spawn 专用线程:`GetCurrentThreadId` → `RegisterHotKey(None, 1,
-  MOD_CONTROL | MOD_ALT, VK_V.0 as u32)` → `GetMessageW` 循环 → `WM_HOTKEY` → `tray::show_panel`;
-  `WM_APP` → `UnregisterHotKey` + `PostQuitMessage`。线程 id 与 `AppHandle` 各存一个静态槽。
-  `check_accessibility` 返回 `true`(Windows 无此概念,RW8)。
-- **Test scenarios.** 纯逻辑有限(线程泵无法单测)。断言点是签名与幂等标记的静态结构,
-  由「macOS 侧三个测试基线不退化」间接保证接口未变。
-- **Verification.** macOS 基线不退化;真机 AEW3 前半段(面板能被热键唤出)+ 退出后热键失效。
+- **Approach.** 新增 `#[cfg(target_os = "windows")] mod imp_win`,保持 `register(&AppHandle)` /
+  `unregister_all()` / `check_accessibility() -> bool` 三个签名不变(前端与 main.rs 零改动)。
+  注册/注销必须在**同一条线程**上执行(MSDN 要求),主线程只经 mpsc channel 投指令,该线程:
+  `GetCurrentThreadId` → `PeekMessageW(..., PM_NOREMOVE)` 先把线程消息队列建出来 →
+  `RegisterHotKey(None, id, MOD_CONTROL | MOD_ALT, VK_V.0 as u32)` → `GetMessageW` 循环 →
+  命中 `WM_HOTKEY` 时调 `tray::show_panel`;`Quit` → `UnregisterHotKey` + `PostQuitMessage`。
+  **主线程每投一条指令后必须紧跟一次 `PostThreadMessageW(tid, WM_APP + 1, ...)`**(KTD11):
+  否则线程永远阻塞在 `GetMessageW` 上、指令读不到 —— `register` 以 500ms 回复超时失败(真机症状:
+  热键完全失灵),`unregister_all` 的 join 永久阻塞(真机症状:托盘「退出」点不动)。唤醒消息不携带
+  指令,指令由循环顶部的 `try_recv` 取走;顺序固定为「先 send 后唤醒」,收在一个 `send_cmd` 里。
+  `STARTED` 只能在泵已挂进静态槽之后置位。`check_accessibility` 返回 `true`(Windows 无此概念,RW8)。
+- **主修饰键语义.** `Mods::META` 在 Windows 上翻成 `MOD_CONTROL`(不是 `MOD_WIN`):RW2 与设置面板
+  显示的都是 `Ctrl+Alt+V`,前端录制也把 Windows 的 Ctrl 记作 `meta`(`frontend/src/keymap.ts`)。
+  翻成 `MOD_WIN` 会实际注册 `Win+Alt+V`,与显示的组合不一致 —— 按下无反应,重绑 Ctrl 系组合同理。
+- **Test scenarios.** 消息泵经 `HotkeyCallback = Box<dyn Fn(HotkeyAction) + Send>` 接缝与
+  `register_with` 脱离 Tauri 应用,`win_pump_tests` 覆盖:首次注册成功、同 action 改键成功、
+  `unregister_all` 在 10s 内返回(卡死表现为断言失败而非 job 超时)、关停后可重新注册。泵是进程级单例,
+  四个场景写在同一个 `#[test]` 里(`cargo test` 默认多线程会互相停泵)。修饰键翻译由
+  `win32_default_openpanel_is_ctrl_alt_v` 与穷举表钉住。
+- **Verification.** macOS 基线不退化;`cargo check` / `cargo clippy --all-targets -- -D warnings`
+  对 `x86_64-pc-windows-msvc` 通过;真机 AEW3(面板能被热键唤出 + 退出后热键失效)与 AEW9(退出不卡死)。
 
 ### U3. Windows 回贴
 
@@ -560,6 +598,22 @@ README.md                             [改] Windows 安装/使用/限制/凭据�
 - **Test scenarios.** 无。
 - **Verification.** 人工通读;确认 README 中每条限制都能在代码里找到对应实现或计划项。
 
+### U10. 单实例守卫
+
+- **Goal.** 重复启动只激活已有实例:通知区只有一个托盘图标、一个 watcher、一份全局热键占用。
+- **Requirements.** RW10、AEW9。
+- **Dependencies.** 无(独立于 U1–U9),但必须早于 `Storage::open` 与托盘/热键初始化。
+- **Files.** `app/src/single_instance.rs`(新增);`app/src/lib.rs`;`app/src/main.rs`。
+- **Approach.** 见 KTD18。`instance_name` / `activate_event_name` 是纯函数(两平台都能单测),
+  Windows 实现收在 `#[cfg(target_os = "windows")] mod imp_win` 内。`setup` 里 `log::init` 之后、
+  `Storage::open` 之前调 `acquire(&app.config().identifier)`:返回 `Secondary` 时记一行 info、
+  `app.handle().exit(0)`、`return Ok(())`;返回 `Primary` 时调
+  `spawn_activation_listener(app.handle().clone())`。macOS 不启用本模块(重复打开本就只激活已有实例)。
+- **Test scenarios.** `names_are_session_local_and_scoped_to_identifier`(纯函数,两平台);
+  `win_tests::second_acquire_in_same_process_is_secondary`(Windows only:同进程二次 `acquire` 得
+  `Primary → Secondary` —— 内核按名字判重,与真机跨进程同一条路径)。
+- **Verification.** macOS 基线不退化(模块不在 macOS 编译);真机 AEW9。
+
 ---
 
 ## Verification Contract
@@ -576,9 +630,11 @@ cargo test --workspace
 (cd frontend && npm run build)
 ```
 
-**Windows 目标的编译验证(A1 的落实手段)。** 本机(Apple Silicon macOS)无法对
-`x86_64-pc-windows-msvc` 做整树编译:`rusqlite` 的 `bundled` 特性需要 MSVC 工具链编译 `sqlite3.c`,
-本机只有 Apple clang,会在 `libsqlite3-sys` 的 C 编译阶段失败(缺 `stdlib.h`)。因此:
+**Windows 目标的编译验证。** 本机(Apple Silicon macOS)对 `x86_64-pc-windows-msvc` 做**真实整树编译**
+仍然不可能:`rusqlite` 的 `bundled` 特性要 MSVC 工具链编译 `sqlite3.c`,本机只有 Apple clang。
+但 `cargo check` / `cargo clippy` **不链接**,那两个 C 侧产物其实没人要 —— 于是整树的**类型检查与 lint**
+可以在本地做到:`packaging/check-windows.sh` 把 `cc` / `ar` / `llvm-rc` 三个桩放到 PATH 顶上,让 C 编译与
+资源编译「成功但无意义」地过去(几秒)。**它证明类型 / lint / feature 正确,不证明链接与运行。** 因此三层:
 
 1. **API 层(已建立,持续维护).** 用一次性探针 crate(仅依赖 `windows` 0.61 + 上述 feature)
    把每个将要用到的 Win32 调用写一遍并对 `x86_64-pc-windows-msvc` 做 `cargo check`。
@@ -588,20 +644,30 @@ cargo test --workspace
    `RegisterHotKey` 的 `id` 是 `i32`、`vk` 是 `u32`、修饰键是 `HOT_KEY_MODIFIERS`;
    `DragQueryFileW` 要 `HDROP`(需从 `HANDLE` 转型)而非 `HANDLE`;
    `CREDENTIALW::CredentialBlob` 是 `*mut u8` 而非 `PWSTR`;`INPUT` 的 union 字段是 `INPUT_0{ki}`。
-2. **整树层(CI).** `.github/workflows/package.yml` 的 `windows` job 是 Windows 目标整树编译的
-   唯一自动化验证点。**在 CI 首次跑绿之前,不得声明 Windows 支持已完成。**
+2. **整树类型层(`packaging/check-windows.sh`,本地).** 每个改动 `cfg(target_os = "windows")` 分支的
+   提交前都跑一次(check 与 clippy 两种模式),拿到整树(含 `--all-targets`,即 Windows-only 测试代码)
+   的真实类型检查与 clippy:`Send` 约束、Win32 常量路径、feature 缺失这类问题都在这里暴露。
+   与「不进仓库」的一次性探针 crate 不同,这个桩脚本**进仓库**:它不是一次性结论,而是可重复的核查手段,
+   且有一个不查文档就会踩的坑(`xcrun --find clang` 解析出的工具链 clang 不像 `/usr/bin/clang` 会自动问
+   xcrun 要 sysroot,必须显式给 `SDKROOT`,否则报 `'stdio.h' file not found`)。
+3. **构建与执行层(CI).** 桩不能替代真实构建:`ci.yml` 的 `windows` job(每个 PR 跑 clippy + `cargo test`)
+   与 `package.yml` 的 `windows` job(推 tag / 手动触发时真出 NSIS 包)才是唯一的链接与执行验证点。
+   **在 CI 首次跑绿之前,不得声明 Windows 支持已完成。**
 
 ### Tests
 
 - 既有基线(必须零退化):app 94 passed + core 22 passed,1 个 trigram 测试 ignored。
 - 新增(可在 macOS 上跑,因是纯函数):`dib_to_png` 的 6 个边界场景、`build_dropfiles` 布局、
   `db_path_for` 三平台分派、URL scheme 白名单纯函数、修饰键文案选择。
+- 新增(Windows 目标执行:macOS 开发机只做 `cargo check --target x86_64-pc-windows-msvc`,**跑**归
+  CI 的 `windows` job 与真机):消息泵唤醒回归 `win_pump_tests`、`single_instance::win_tests`
+  (同进程二次 `acquire` 得 `Primary → Secondary`)、Win32 翻译表断言(`Mods::META` → `MOD_CONTROL`)。
 - 不可自动化(与 macOS 侧 `imp` 的既有处境一致,归真机验收):真实剪贴板读写、按键注入、
   前台激活、凭据管理器读写。
 
 ### AE 手工验收
 
-在 **Windows 10 22H2** 与 **Windows 11** 真机各跑一遍 `AEW1`–`AEW8`;macOS 上回归 `AE1`–`AE12`
+在 **Windows 10 22H2** 与 **Windows 11** 真机各跑一遍 `AEW1`–`AEW9`;macOS 上回归 `AE1`–`AE12`
 各关键路径一次,确认平台分支改写未伤及 macOS。
 
 ### Static Network Egress Check
@@ -635,7 +701,7 @@ grep -rE 'reqwest::|hyper::|TcpStream|std::net::' app/src clipvault-core/src   #
 
 ### 全局完成标准
 
-- `U1`–`U9` 全部完成,`AEW1`–`AEW8` 在 Windows 10/11 各跑通一次,执行记录保留在 PR 描述或 README。
+- `U1`–`U10` 全部完成,`AEW1`–`AEW9` 在 Windows 10/11 各跑通一次,执行记录保留在 PR 描述或 README。
 - macOS 基线不退化;`cargo clippy -D warnings` 0 warning;R13 审计在双目标下为空。
 - CI 首次跑绿,Artifacts 内可下载 `.dmg` 与 NSIS `.exe`。
 - `AGENTS.md` 与 `README.md` 已反映双平台范围,Windows 的全部限制都有明文记载。
@@ -645,7 +711,8 @@ grep -rE 'reqwest::|hyper::|TcpStream|std::net::' app/src clipvault-core/src   #
 - 五个 `commands` 平台分支里不再存在「仅支持 macOS」这类在 Windows 上不可能触发的错误文案。
 - 前端不再出现写死的 `⌘` 与 SF Symbols 私有区码点。
 - 一次性探针 crate **不进仓库**(它是验证手段,不是产物),其覆盖的 API 结论固化在本文档
-  「Build & Lint」一节。
+  「Build & Lint」一节。**例外**:`packaging/check-windows.sh`(同类手段但可重复、有一个必须写下来的
+  `SDKROOT` 坑)进仓库,理由见同一节。
 
 ### 提交策略
 

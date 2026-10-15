@@ -18,6 +18,7 @@ pub mod pasteback;
 pub mod pin;
 pub mod privacy;
 pub mod search;
+pub mod single_instance;
 pub mod storage;
 pub mod thumbnail;
 pub mod tray;

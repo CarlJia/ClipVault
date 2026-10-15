@@ -10,6 +10,10 @@
 //! 7. 注册 Carbon 全局热键 ⌥⌘V（U4 / KTD2）。
 //! 8. 注册窗口事件钩子：面板失焦（点击面板之外）时自动收起，见 [`panel`]。
 //!
+//! 另有一处 **Windows 专属**步骤：`log::init` 之后、打开存储之前先抢单实例锁；
+//! 重复启动的进程（又点了一次图标）会请主实例唤出面板，然后自己退出 ——
+//! 见 [`clipvault::single_instance`]。
+//!
 //! 主窗口在 `tauri.conf.json` 中初始 `visible: false`，靠热键 / 托盘唤出，
 //! 符合 LSUIElement 菜单栏应用形态。
 
@@ -60,6 +64,23 @@ fn main() {
                 eprintln!("[clipvault] 初始化日志文件失败：{e}；日志将不会落到文件");
             }
             ::log::info!(target: "main", "ClipVault 启动");
+
+            // 1.5 单实例守卫（Windows）：必须早于 `Storage::open` / watcher / 托盘 /
+            //     全局热键 —— 次实例要去做的每一件事都会和主实例抢同一批资源。
+            //     理由（含为什么放在 `log::init` 之后）见 [`clipvault::single_instance`]。
+            #[cfg(target_os = "windows")]
+            if matches!(
+                clipvault::single_instance::acquire(&app.config().identifier),
+                clipvault::single_instance::Startup::Secondary
+            ) {
+                ::log::info!(target: "main", "已有实例在运行，已请求它唤出面板；本次启动退出");
+                app.handle().exit(0);
+                return Ok(());
+            }
+
+            // 1.6 主实例接管「又点了一次图标」的信号：收到就唤出面板。
+            #[cfg(target_os = "windows")]
+            clipvault::single_instance::spawn_activation_listener(app.handle().clone());
 
             // 2. 打开存储。
             let storage = Arc::new(Storage::open(&default_db_path())?);
