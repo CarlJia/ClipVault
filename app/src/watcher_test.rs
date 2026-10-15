@@ -14,7 +14,7 @@ use crate::capture::Captured;
 use crate::classify::{AutoCategory, classify};
 use crate::storage::Storage;
 use crate::storage::test_helpers::open_test_db;
-use crate::watcher::{Watcher, should_dedup};
+use crate::watcher::{Watcher, duplicate_fingerprint_log, should_dedup};
 
 /// 组装一个由内存数据库支撑的 Watcher。
 ///
@@ -125,6 +125,60 @@ async fn process_dedups_within_window() {
         row_count(&storage).await,
         1,
         "5 秒窗口内的同内容重复只应入库一次"
+    );
+}
+
+#[test]
+fn duplicate_fingerprint_log_keeps_prefix_and_truncates_hash() {
+    // 这条日志降到 verbose 之后,它是该分支**唯一可被自动化断言的部分**:测试构建不安装
+    // 全局 logger(log.rs 的 install_global_logger 在 cfg(test) 下是空实现),真实的
+    // log 记录捕获不到,所以格式契约落在这个纯函数上。
+    let msg = duplicate_fingerprint_log(
+        "Error code 2067: A UNIQUE constraint failed",
+        "abcdef0123456789",
+    );
+    assert!(
+        msg.starts_with("[capture] skipped: "),
+        "保持 grep 前缀:{msg}"
+    );
+    assert!(
+        msg.contains("hash abcdef01.."),
+        "指纹只留前 8 字符(KTD4):{msg}"
+    );
+    assert!(
+        msg.contains("duplicate fingerprint, no new entry"),
+        "文案要说清是重复而非故障:{msg}"
+    );
+
+    // 短于 8 字符照旧全量输出;为空时不能打出残缺的 `hash ..`。
+    assert!(duplicate_fingerprint_log("e", "abc").contains("hash abc.."));
+    assert!(duplicate_fingerprint_log("e", "").contains("hash <empty>"));
+}
+
+#[tokio::test]
+async fn process_swallows_duplicate_fingerprint_already_in_db() {
+    // 库层去重:换一个 Watcher(内存里没有指纹)再捕获同一内容,必然绕过 5 秒窗口去重、
+    // 走到 `content_hash` UNIQUE 冲突分支。该分支应把冲突当「同条」吞掉 —— 不报错、
+    // 不新增行、不 panic,只在 verbose 留一行日志(见 duplicate_fingerprint_log)。
+    let storage = Arc::new(open_test_db());
+    let first = Watcher::new(
+        storage.clone(),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    first.process(Captured::text("same payload twice")).await;
+    assert_eq!(row_count(&storage).await, 1);
+
+    let second = Watcher::new(
+        storage.clone(),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    second.process(Captured::text("same payload twice")).await;
+    assert_eq!(
+        row_count(&storage).await,
+        1,
+        "同一指纹已在库中时应视为同条,不新增行"
     );
 }
 
