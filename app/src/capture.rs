@@ -1002,6 +1002,63 @@ mod tests {
         assert!(result.is_none());
     }
 
+    /// U1 的核心假设的自动化证明：**一致地**写进 `.filenames` 的
+    /// `NSArray<NSString>`（U2 的回贴写侧正是这个形状）能被
+    /// `readObjectsForClasses(_:options:)` 以 `NSURL` 读回来、再由
+    /// [`paths_from_urls`] 还原成路径数组。
+    ///
+    /// 这条链路之前在两边都是断的（采集侧扫 ASCII 字节、回贴侧只写纯文本），
+    /// 单测各自"通过"却谁也没覆盖"写进去读得回来"。这里用**命名**粘贴板而不是
+    /// `generalPasteboard`：测试绝不碰用户正在用的剪贴板。命名粘贴板会在本次登录
+    /// 会话里留存（objc2 0.3 未暴露 `releaseGlobally`），但它只装两个路径、用户不可见。
+    ///
+    /// 它证明的是「我们自己的写入形状读得回来」；Finder 复制文件时粘贴板上还有哪些
+    /// 附带类型，仍归真机 AE1 验收。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn read_objects_round_trips_filenames_written_as_property_list() {
+        use objc2::rc::Retained;
+        use objc2_app_kit::NSPasteboard;
+        use objc2_foundation::{NSArray, NSString};
+
+        // 取两个一定存在的路径（macOS 上 /tmp 是指向 /private/tmp 的符号链接，
+        // 正好顺带覆盖 canonicalize 这一步）。
+        let sources = ["/tmp", "/usr"];
+
+        let pb = NSPasteboard::pasteboardWithName(&NSString::from_str("ClipVaultCaptureTest"));
+        pb.clearContents();
+
+        let ns_paths: Vec<Retained<NSString>> =
+            sources.iter().map(|p| NSString::from_str(p)).collect();
+        let array = NSArray::from_retained_slice(&ns_paths);
+        // SAFETY: 同 `imp::MacosBackend::write_clipboard` —— `AnyObject` 就是 `id`，
+        // 任何对象转过去都合法。
+        let plist: Retained<objc2::runtime::AnyObject> = unsafe { Retained::cast_unchecked(array) };
+        let wrote = unsafe {
+            pb.setPropertyList_forType(&plist, &NSString::from_str("NSFilenamesPboardType"))
+        };
+        assert!(wrote, "写 .filenames 应成功");
+
+        let captured = poll_filenames(&pb).expect("刚写进去的文件引用应能被读回");
+        assert_eq!(captured.kind, ContentKind::File);
+        assert_eq!(captured.metadata["resolved"], true, "两个路径都存在");
+
+        let mut got = payload_paths(&captured);
+        got.sort();
+        let mut expected: Vec<String> = sources
+            .iter()
+            .map(|p| {
+                std::fs::canonicalize(p)
+                    .expect("测试路径必须存在")
+                    .to_str()
+                    .expect("规范路径必须是 UTF-8")
+                    .to_string()
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
     #[test]
     fn poll_first_non_empty_returns_none_when_change_count_decreased() {
         let result = poll_first_non_empty(3, 5);
