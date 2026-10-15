@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "clipvault"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "clipvault-core",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "clipvault-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aes-gcm",
  "rand",
