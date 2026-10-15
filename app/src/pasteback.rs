@@ -257,7 +257,9 @@ pub fn file_paths(payload: Option<&[u8]>) -> Vec<String> {
 /// (TextEdit、部分网页输入框只认文本),那时候用户按了回贴却什么都贴不出来。所以两个
 /// 平台都**同时**挂"文件引用 + 纯文本"两种表示,由接收方各取所需 —— 见
 /// `imp::MacosBackend::write_clipboard` 与 `imp_win::WindowsBackend::write_clipboard`。
-/// Windows 侧同义,只把分隔符换成 `\r\n`。
+///
+/// 这里只管 macOS 的 `\n`;Windows 侧的纯文本用 `\r\n` 内联拼接(分隔符是接收方看得见的
+/// 序列化差异,不共用一个函数,免得为它长出 `separator` 参数)。
 pub fn file_text_fallback(paths: &[String]) -> String {
     paths.join("\n")
 }

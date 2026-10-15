@@ -210,7 +210,7 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
 
     let pb = NSPasteboard::generalPasteboard();
 
-    // 1. filenames: NSFilenamesPboardType 是 property-list bytes,直接读
+    // 1. filenames: 经 `readObjectsForClasses(_:options:)` 以 NSURL 读回文件引用
     if let Some(paths) = poll_filenames(&pb) {
         return Some(paths);
     }
@@ -940,9 +940,8 @@ mod tests {
         assert_eq!(tiff_dimensions(&tiff), Some((4, 5)));
     }
 
-    /// `paths_from_urls` 的输入契约：已经是 NSURL 数组（由
-    /// `readObjectsForClasses_options` 的 downcast 产出），纯函数不再触碰
-    /// NSPasteboard。
+    /// 构造一个文件 URL，作为 [`paths_from_urls`] 的测试输入
+    /// （生产侧这个数组由 `readObjectsForClasses(_:options:)` 产出）。
     #[cfg(target_os = "macos")]
     fn url(path: &str) -> objc2::rc::Retained<objc2_foundation::NSURL> {
         use objc2_foundation::{NSString, NSURL};
