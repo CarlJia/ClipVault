@@ -616,10 +616,9 @@ pub async fn read_log(state: State<'_, AppState>) -> Result<crate::log::LogInfo,
 }
 
 /// 清空日志(R12):截断 `clipvault.log` 到 0 + 删除 `clipvault.log.1`。
-///
-/// 状态参数保留供后续扩展(例如按用户限制大小);目前不需要。
+/// 实际工作由 `log::clear` 走 `LOG_STATE` 锁内路径完成,与 `write_line` 互斥。
 #[tauri::command]
-pub async fn clear_log(_state: State<'_, AppState>) -> Result<(), String> {
+pub async fn clear_log() -> Result<(), String> {
     let path = crate::log::default_log_path();
     let dir = path.parent().unwrap_or(std::path::Path::new(""));
     crate::log::clear(dir).map_err(|e| e.to_string())?;

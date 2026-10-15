@@ -19,7 +19,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// 单文件字节上限（1 MiB）。`MAX_LOG_BYTES * 2 = 2 MiB` 是磁盘总占用上限
 /// （main + `.1` 备份,R5 / KTD8）。
@@ -300,16 +300,29 @@ impl LogState {
                 )
             })?
             .to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        std::fs::create_dir_all(&dir).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("create data dir {}: {e}", dir.display()))
+        })?;
         let current = log_path_in(&dir);
         // 陈旧大文件 → 轮转(降级 set_len)。
         if let Ok(meta) = std::fs::metadata(&current)
             && meta.len() > MAX_LOG_BYTES
         {
             let backup = backup_log_path(&dir);
-            let _ = std::fs::remove_file(&backup);
-            if std::fs::rename(&current, &backup).is_err() {
-                // 降级:截断(权限/锁等场景下保留当前文件,清空内容)。
+            // 删既有 .1,rename 失败降级。这两处都只在极小概率下失败(权限/锁),
+            // 失败时记一行 stderr,因为此处的 init 可能早于 log::init(同一进程)安装。
+            if let Err(e) = std::fs::remove_file(&backup) {
+                eprintln!(
+                    "[clipvault] 警告: init 删除旧轮转备份 {} 失败：{e}（继续轮转）",
+                    backup.display()
+                );
+            }
+            if let Err(e) = std::fs::rename(&current, &backup) {
+                eprintln!(
+                    "[clipvault] 警告: init 轮转 {} → {} 失败：{e}（降级为截断 current）",
+                    current.display(),
+                    backup.display()
+                );
                 if let Ok(f) = std::fs::OpenOptions::new().open(&current) {
                     let _ = f.set_len(0);
                 }
@@ -355,7 +368,13 @@ impl LogState {
         // 1) 取出并 drop 当前的 file:Windows rename 需要源句柄关闭。
         *file = None;
         // 2) 删 .1(若有);失败忽略——后面 rename 会覆盖(Windows 不行,需先删)。
-        let _ = std::fs::remove_file(&backup);
+        //    这里失败通常意味着 .1 被另一个进程持锁(极小概率,跨实例),记一行便于排查。
+        if let Err(e) = std::fs::remove_file(&backup) {
+            eprintln!(
+                "[clipvault] 警告: 删除旧轮转备份 {} 失败：{e}（继续轮转）",
+                backup.display()
+            );
+        }
         // 3) rename。
         if let Err(e) = std::fs::rename(&current, &backup) {
             // 降级:重新打开空 current(原来的 current 没被 rename,内容仍在)。
@@ -379,6 +398,26 @@ impl LogState {
         Ok(())
     }
 
+    /// 在持锁状态下截断 current 到 0 字节并重置 size 原子。删除 `.1` 备份
+    /// 放在锁外(不与持锁 IO 互踩)。这是 IPC `clear_log` 的线程安全路径——
+    /// 文件系统层的 `set_len(0)` 与持锁的 `write_line` 之间存在竞态,此方法把
+    /// 截断与 size 重置都收进 LogState 的锁里(R12 + code review P1)。
+    pub fn truncate(&self) -> std::io::Result<()> {
+        let mut guard = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(f) = guard.as_mut() {
+            f.set_len(0)?;
+        }
+        self.size.store(0, Ordering::Relaxed);
+        drop(guard);
+        // 锁外删除 .1 备份(不与持锁 IO 互踩;失败最差是 .1 残留,下次轮转会覆盖)。
+        let backup = backup_log_path(&self.dir);
+        match std::fs::remove_file(&backup) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// 取得当前级别字符串(供 `read_info` / IPC 序列化用)。
     pub fn current_level_str(&self) -> String {
         Level::from_u8(self.level.load(Ordering::SeqCst))
@@ -390,6 +429,11 @@ impl LogState {
 /// `init` 的返回类型(IO error 的 thin alias,U2 内部统一签名)。
 pub type InitResult<T> = Result<T, std::io::Error>;
 
+/// 进程级 LogState 句柄(U2):`init` 成功后置入,`clear` 与未来
+/// 状态查询可拿到同一把锁。LoggerAdapter 另持一份 Arc,
+/// 写入路径仍走 `log::set_boxed_logger` 安装的全局 sink。
+static LOG_STATE: OnceLock<Arc<LogState>> = OnceLock::new();
+
 /// 初始化文件日志(R1):打开文件、处理陈旧大文件,安装全局 sink。
 ///
 /// 失败(权限/磁盘满/`APPDATA` 缺失等)不阻塞启动——应用继续运行,后续
@@ -400,6 +444,9 @@ pub type InitResult<T> = Result<T, std::io::Error>;
 /// `level` 是**用户设置级别**的共享原子,AppState 与 LogState 共持同一份。
 pub fn init(path: &Path, level: Arc<AtomicU8>) -> InitResult<()> {
     let state = Arc::new(LogState::open(path, level.clone())?);
+    // 注册到进程级表,让 `clear` / 未来状态查询可拿到同一把锁。
+    // init 可能被多次调用(测试 / 重启场景),OnceLock 拒绝覆盖,保留首次的实例。
+    let _ = LOG_STATE.set(state.clone());
     install_global_logger(state, &level);
     Ok(())
 }
@@ -576,14 +623,22 @@ pub fn read_tail(dir: &Path, max_bytes: usize, max_lines: usize) -> std::io::Res
 /// 注意:**不能**简单 `set_len(0)` 整个 `LogState` 持有的 file 句柄——IPC 路径
 /// 没有该句柄,只能通过文件系统层操作。轮转中把 file 句柄拿出又放回的设计
 /// 保证 U2 / U4 / `clear` 三处的"截断"语义一致:看 `LogState::write_line` 路径。
+/// 清空日志(R12):截断 `clipvault.log` 到 0 字节 + 删除 `clipvault.log.1`。
+///
+/// **线程安全路径**:若 `init` 已成功,有进程级 `LOG_STATE` 句柄,
+/// 走 `LogState::truncate`,在 LogState 的锁内截断 + 重置 size 原子,与
+/// `write_line` 互斥(code review P1)。否则(`init` 失败或未调用)退到
+/// 文件系统层兜底,与 `read_info` / `read_tail` 同样的 best-effort 路径。
 pub fn clear(dir: &Path) -> std::io::Result<()> {
+    if let Some(state) = LOG_STATE.get() {
+        return state.truncate();
+    }
+    // init 未成功 / 未调用 —— 退到文件系统层。
     let current = log_path_in(dir);
     let backup = backup_log_path(dir);
-    // 1) 截断 current
     let f = std::fs::OpenOptions::new().write(true).open(&current)?;
     f.set_len(0)?;
     drop(f);
-    // 2) 删除 .1(若存在)。NotFound 视为成功。
     match std::fs::remove_file(&backup) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
