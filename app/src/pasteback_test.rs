@@ -14,8 +14,9 @@ use clipvault_core::crypto::CryptoError;
 use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, InjectError, PasteBackend, PasteError, PasteOutcome, cgevent_fail_msg,
-    color_paste_text, modifier_label, no_accessibility_msg, perform_paste, should_replace_target,
-    vault_decrypt_fail_msg, wait_for_frontmost, window_switched_msg,
+    color_paste_text, file_paths, file_text_fallback, modifier_label, no_accessibility_msg,
+    perform_paste, should_replace_target, vault_decrypt_fail_msg, wait_for_frontmost,
+    window_switched_msg,
 };
 
 /// 固定返回布尔的 Accessibility mock。
@@ -730,5 +731,150 @@ fn color_paste_text_handles_missing_or_odd_metadata() {
     assert_eq!(
         color_paste_text(Some(r#"{"rgba":"rgba(0,0,0,1)"}"#)),
         "rgba(0,0,0,1)"
+    );
+}
+
+// ----------------------------------------------------------------
+// file 条目：payload 解析 + 剪贴板双写
+// ----------------------------------------------------------------
+
+/// 构造一条非加密 file 条目：payload 是 JSON 编码的绝对路径数组
+/// （与 `Captured::file` 的编码同源）。
+fn file_entry(paths: &[&str]) -> Entry {
+    Entry::from_row(
+        7,
+        "filehash".to_string(),
+        String::new(), // content 留空，路径在 payload
+        String::new(),
+        "file".to_string(),
+        0,
+        None,
+        0,
+        1,
+        0,
+        "file".to_string(),
+        Some("text/uri-list".to_string()),
+        Some(serde_json::to_vec(paths).unwrap()),
+        None,
+        Some(serde_json::json!({ "paths": paths, "resolved": true }).to_string()),
+    )
+}
+
+/// 构造一条加密区 file 条目（payload 是密文，payload_nonce 保护它）。
+fn vault_file_entry() -> Entry {
+    Entry::from_row(
+        8,
+        "vfilehash".to_string(),
+        String::new(),
+        String::new(),
+        "file".to_string(),
+        0,
+        None,
+        1, // is_vault
+        1,
+        0,
+        "file".to_string(),
+        Some("text/uri-list".to_string()),
+        Some(b"encrypted path json".to_vec()),
+        Some(vec![0u8; 12]), // payload_nonce
+        Some(r#"{"paths":[],"resolved":true}"#.to_string()),
+    )
+}
+
+/// file 条目的 payload 解出路径数组；非 JSON / 空 payload 得空数组，不 panic。
+#[test]
+fn file_paths_decodes_json_payload() {
+    let entry = file_entry(&["/a.pdf", "/b.csv"]);
+    assert_eq!(
+        file_paths(entry.payload.as_deref()),
+        vec!["/a.pdf".to_string(), "/b.csv".to_string()]
+    );
+}
+
+#[test]
+fn file_paths_tolerates_missing_or_malformed_payload() {
+    assert!(file_paths(None).is_empty());
+    assert!(file_paths(Some(b"")).is_empty());
+    assert!(file_paths(Some(b"not json")).is_empty());
+    assert!(
+        file_paths(Some(b"{\"paths\":[\"/a\"]}")).is_empty(),
+        "只认顶层数组"
+    );
+    assert!(
+        file_paths(Some(b"[\"/a\", 1]")).is_empty(),
+        "元素必须是字符串"
+    );
+    assert!(file_paths(Some(b"[]")).is_empty());
+}
+
+/// 纯文本回退内容：路径按 `\n` 拼接（Windows 侧同义，用 `\r\n`）。
+#[test]
+fn file_text_fallback_joins_paths_with_newline() {
+    let paths = vec!["/a.pdf".to_string(), "/b.csv".to_string()];
+    assert_eq!(file_text_fallback(&paths), "/a.pdf\n/b.csv");
+    assert_eq!(file_text_fallback(&[]), "");
+}
+
+/// `perform_paste` 把 file 条目的 payload 原样交给后端（后端再决定怎么写剪贴板）。
+#[test]
+fn pastebackend_file_reaches_write_clipboard_with_payload() {
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend {
+        frontmost: Some("com.apple.TextEdit".to_string()),
+        ..Default::default()
+    };
+    let entry = file_entry(&["/a.pdf", "/b.csv"]);
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &entry,
+        Some("com.apple.TextEdit"),
+        None,
+        None,
+        &NeverDecryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::File));
+    assert_eq!(
+        *backend.wrote_payload_len.borrow(),
+        Some(entry.payload.as_ref().unwrap().len()),
+        "file 条目应把 JSON payload 原样交给后端"
+    );
+}
+
+/// 加密区 file 条目：先解密 payload，再把明文交给后端
+/// （**不**把密文当路径贴出去）。
+#[test]
+fn pastebackend_file_vault_decrypts_payload_first() {
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend {
+        frontmost: Some("com.apple.TextEdit".to_string()),
+        ..Default::default()
+    };
+    let plaintext = serde_json::to_vec(&["/secret/report.pdf"]).unwrap();
+    let decryptor = MockDecryptor {
+        text: Ok(String::new()),
+        bytes: Ok(plaintext.clone()),
+    };
+    let nonce = [0u8; 12];
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_file_entry(),
+        Some("com.apple.TextEdit"),
+        None,
+        Some(&nonce),
+        &decryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::File));
+    assert_eq!(
+        *backend.wrote_payload_len.borrow(),
+        Some(plaintext.len()),
+        "交出去的应是解密后的明文路径 JSON，不是密文"
     );
 }

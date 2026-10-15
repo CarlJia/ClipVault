@@ -241,6 +241,29 @@ pub fn color_paste_text(metadata_json: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// file 条目的 payload(JSON 编码的 `Vec<String>`,与 `Captured::file` 同源)解出路径数组。
+///
+/// 抽成纯函数是为了让「payload 缺失 / 不是 JSON / 不是字符串数组」这些边界能在任意平台
+/// 单测。任何解不出来的情形都返回空数组 —— 调用方据此跳过写剪贴板,而不是贴出一串乱码。
+pub fn file_paths(payload: Option<&[u8]>) -> Vec<String> {
+    payload
+        .and_then(|bytes| serde_json::from_slice::<Vec<String>>(bytes).ok())
+        .unwrap_or_default()
+}
+
+/// file 条目的**纯文本回退**内容:绝对路径按 `\n` 拼接。
+///
+/// 文件类型不能只挂 `NSFilenamesPboardType` / `CF_HDROP`:目标应用未必消费文件引用
+/// (TextEdit、部分网页输入框只认文本),那时候用户按了回贴却什么都贴不出来。所以两个
+/// 平台都**同时**挂"文件引用 + 纯文本"两种表示,由接收方各取所需 —— 见
+/// `imp::MacosBackend::write_clipboard` 与 `imp_win::WindowsBackend::write_clipboard`。
+///
+/// 这里只管 macOS 的 `\n`;Windows 侧的纯文本用 `\r\n` 内联拼接(分隔符是接收方看得见的
+/// 序列化差异,不共用一个函数,免得为它长出 `separator` 参数)。
+pub fn file_text_fallback(paths: &[String]) -> String {
+    paths.join("\n")
+}
+
 /// 回贴编排(纯决策逻辑,平台副作用全走 trait)。
 ///
 /// 顺序对应计划 U8 Approach，并修正了「未授权时内容也进不了剪贴板」的缺陷：
@@ -361,6 +384,49 @@ pub fn wait_for_frontmost<F: Fn() -> Option<i32>>(
 // ================================================================
 // macOS 真实实现
 // ================================================================
+
+/// `NSPasteboard` 的文件列表类型。它没有 objc2 常量（Apple 从未把它列进
+/// `NSPasteboardType*` 一族），只能用字符串字面量取。
+#[cfg(target_os = "macos")]
+const NSFILENAMES_PBOARD_TYPE: &str = "NSFilenamesPboardType";
+
+/// 把文件路径按 file 条目的双写约定写进一块 `NSPasteboard`(仅 macOS)。
+///
+/// **生产写侧(`imp::MacosBackend::write_clipboard` 的 `ContentKind::File` 分支)与
+/// `capture.rs` 的写读往返测试共用这一份实现** —— 这样「我们写进去的形状读得回来」
+/// 由真代码保证,而不是测试里手搭一份可能与生产漂移的克隆写入器。
+///
+/// 两条写入(详细理由见 `imp::MacosBackend::write_clipboard`):
+///   - `paths` 非空时先写 `NSFilenamesPboardType`(`NSArray<NSString>`,文件引用),
+///     给 Finder / Slack 上传框这类认文件引用的应用;
+///   - 无论 `paths` 是否为空,**无条件**写 `NSPasteboardTypeString`(路径按 `\n`
+///     拼接,即 [`file_text_fallback`]),给 TextEdit / 网页输入框这类只认文本的应用。
+#[cfg(target_os = "macos")]
+pub(crate) fn write_file_paths_to_pasteboard(
+    pasteboard: &objc2_app_kit::NSPasteboard,
+    paths: &[String],
+) {
+    use objc2_app_kit::NSPasteboardTypeString;
+    use objc2_foundation::NSString;
+
+    if !paths.is_empty() {
+        let ns_paths: Vec<objc2::rc::Retained<NSString>> =
+            paths.iter().map(|p| NSString::from_str(p)).collect();
+        let array = objc2_foundation::NSArray::from_retained_slice(&ns_paths);
+        // SAFETY: `cast_unchecked` 只做类型擦除的指针转换，不改变对象的动态类型。
+        // `NSArray` 实例转成 `AnyObject`（即 Obj-C 的 `id`）总是合法的；这里转正是因为
+        // `setPropertyList_forType` 收 `&AnyObject`。
+        let plist: objc2::rc::Retained<objc2::runtime::AnyObject> =
+            unsafe { objc2::rc::Retained::cast_unchecked(array) };
+        let _ = unsafe {
+            pasteboard.setPropertyList_forType(&plist, &NSString::from_str(NSFILENAMES_PBOARD_TYPE))
+        };
+    }
+
+    let ns = NSString::from_str(&file_text_fallback(paths));
+    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::sync::Mutex;
@@ -372,7 +438,8 @@ mod imp {
 
     use super::{
         AccessibilityChecker, ContentKind, FRONT_POLL_INTERVAL, FRONT_WAIT_MAX, HIDE_FENCE_MAX,
-        InjectError, KEY_WINDOW_SETTLE, PasteBackend, should_replace_target, wait_for_frontmost,
+        InjectError, KEY_WINDOW_SETTLE, PasteBackend, file_paths, should_replace_target,
+        wait_for_frontmost, write_file_paths_to_pasteboard,
     };
 
     // ---- Accessibility ----
@@ -572,20 +639,20 @@ mod imp {
                     let _ = pasteboard.setData_forType(Some(&nsdata), pb_type);
                 }
                 ContentKind::File => {
-                    // payload 是 JSON-encoded Vec<String>。真实生产应转 NSArray<NSString>
-                    // 写 .filenames (NSFilenamesPboardType) 以让 Finder / Slack 文件
-                    // 上传框等接受;objc2 0.3 当前未暴露 writeObjects 所需的
-                    // ProtocolObject<NSArray<NSString>> 路径，且 setPropertyList_forType
-                    // 需要 AnyObject 桥接（遗留 nspasteboard 类型常量为 NSFilenamesPboardType
-                    // 字符串字面量）。MVP U4 阶段采用 setString_forType 退化路径：
-                    // 把 paths 用 `\n` 拼接写为文本，目标应用收到纯文本路径列表
-                    // （AE10 已声明 "若目标应用不支持文件引用，toast 提示降级"）。
-                    // 后续增强：补 setPropertyList_forType 把 paths 转 NSArray 写 .filenames。
-                    let paths: Vec<String> =
-                        serde_json::from_slice(payload.unwrap_or(&[])).unwrap_or_default();
-                    let joined = paths.join("\n");
-                    let ns = objc2_foundation::NSString::from_str(&joined);
-                    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+                    // 双写：同一块剪贴板同时挂「文件引用」与「纯文本路径」，由接收方各取所需。
+                    //
+                    //   - `.filenames`（`NSFilenamesPboardType` = `NSArray<NSString>`）给
+                    //     Finder / Slack 上传框这类认文件引用的应用；
+                    //   - `.string`（路径按 `\n` 拼接）给 TextEdit / 网页输入框这类只认
+                    //     文本的应用。
+                    //
+                    // 为什么不是"先写文件引用、写失败再退回文本"：`setPropertyList_forType`
+                    // 的返回值只说明**写入剪贴板**是否成功（清空后写入，实际恒为 true），
+                    // 它不反映目标应用能否消费文件引用 —— 拿它当降级判据永远不会触发，
+                    // 只认文本的应用会什么都贴不出来。Windows 侧同义（`CF_HDROP` +
+                    // `CF_UNICODETEXT` 一起挂，见 `imp_win`）。
+                    let paths = file_paths(payload);
+                    write_file_paths_to_pasteboard(&pasteboard, &paths);
                 }
                 ContentKind::Rtf => {
                     let bytes = payload.unwrap_or(&[]);
