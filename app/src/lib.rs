@@ -12,6 +12,7 @@ pub mod commands;
 pub mod crypto;
 pub mod hotkey;
 pub mod keymap;
+pub mod log;
 pub mod panel;
 pub mod pasteback;
 pub mod pin;
@@ -27,6 +28,8 @@ pub mod winclip;
 mod commands_test;
 #[cfg(test)]
 mod crypto_test;
+#[cfg(test)]
+mod log_test;
 #[cfg(test)]
 mod notes_test;
 #[cfg(test)]
