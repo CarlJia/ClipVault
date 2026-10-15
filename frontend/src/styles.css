@@ -845,6 +845,14 @@ body {
   color: var(--muted);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+  /* 右对齐「重置默认」按钮到 .hotkey-rebind 同一列(行内 flex 让 span 占满
+     左侧剩余空间,button 自然被推到右端,与每行 .hotkey-rebind 的右边缘对齐)。 */
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-section-title > span {
+  flex: 1;
 }
 
 .hotkey-group {
