@@ -172,6 +172,7 @@ fn main() {
             commands::set_log_level,
             commands::read_log,
             commands::clear_log,
+            commands::reset_hotkeys,
         ])
         .run(tauri::generate_context!())
         .expect("error while running ClipVault");

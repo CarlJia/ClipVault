@@ -288,6 +288,11 @@ export async function setLogLevel(level: string): Promise<string> {
   }
 }
 
+/** 把全部 13 个热键重置为出厂默认。失败抛错(由 UI toast 展示)。 */
+export async function resetHotkeys(): Promise<void> {
+  await invoke("reset_hotkeys");
+}
+
 // ---------------------------------------------------------------------------
 // 快捷键设置区块（U4）
 // ---------------------------------------------------------------------------
@@ -484,6 +489,24 @@ export async function renderHotkeysSection(): Promise<void> {
 
   globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
   panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");
+
+  // 绑定「重置默认」按钮:IPC 把全部 13 条热键还原 + 全局热键 OS 侧重注册,
+  // 成功后再 reloadKeymap() + 重渲染本区(沿用 record 流程的 reload 模式)。
+  const resetBtn = document.getElementById("hotkey-reset");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      void (async () => {
+        try {
+          await resetHotkeys();
+          await reloadKeymap();
+          await renderHotkeysSection();
+          showToast("已重置为默认快捷键");
+        } catch (e) {
+          showToast(`重置失败：${String(e)}`);
+        }
+      })();
+    });
+  }
 
   // 绑定重绑按钮
   for (const list of [globalList, panelList]) {

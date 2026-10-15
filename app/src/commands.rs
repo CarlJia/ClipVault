@@ -715,6 +715,32 @@ pub async fn set_hotkey(
     Ok(())
 }
 
+/// 把全部 13 个热键重置为出厂默认(R4 之外的「恢复原状」入口)。
+///
+/// 流程与 `set_hotkey` 同形:
+/// 1. 内存构造一份 default_map()（同 `parse_persist_hotkeys` 的回落路径）。
+/// 2. 先在 OS 侧重新注册全局热键(失败即返回,不动持久化)。
+/// 3. 持久化到 `settings` 表(失败则把 OS 侧退回旧 combo,与 `set_hotkey` 的回退一致)。
+/// 4. 写成功后再更新 in-memory slot。
+#[tauri::command]
+pub async fn reset_hotkeys(state: State<'_, AppState>) -> Result<(), String> {
+    use clipvault_core::keymap::HotkeyMap;
+
+    let default_map = HotkeyMap::default_map();
+    let old_map = state.keymap.read().unwrap().clone();
+
+    // 1. 先在 OS 侧注册新的全局热键;失败立即返回,不动任何状态。
+    crate::keymap::apply_global_hotkey(&state.app, &default_map)
+        .map_err(|e| format!("reset_global_hotkey 失败: {e}"))?;
+
+    // 2. 持久化;若失败把 OS 侧退回旧 combo,避免「OS 已切换但库未变」的不一致。
+    if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &default_map).await {
+        let _ = crate::keymap::apply_global_hotkey(&state.app, &old_map);
+        return Err(e.to_string());
+    }
+    Ok(())
+}
+
 // ----------------------------------------------------------------
 // 加密区 / Vault（U9 / R12）
 // ----------------------------------------------------------------
