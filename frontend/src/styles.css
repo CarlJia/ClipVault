@@ -785,14 +785,14 @@ body {
 }
 /* …与 WebKit（Tauri 用的 WKWebView / WebView2 均走这里）的细滚动条。 */
 .settings-body::-webkit-scrollbar {
-  width: 4px;
+  width: 2px;
 }
 .settings-body::-webkit-scrollbar-track {
   background: transparent;
 }
 .settings-body::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 4px;
+  border-radius: 1px;
 }
 .settings-body::-webkit-scrollbar-thumb:hover {
   background: var(--muted);
