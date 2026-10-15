@@ -384,6 +384,49 @@ pub fn wait_for_frontmost<F: Fn() -> Option<i32>>(
 // ================================================================
 // macOS 真实实现
 // ================================================================
+
+/// `NSPasteboard` 的文件列表类型。它没有 objc2 常量（Apple 从未把它列进
+/// `NSPasteboardType*` 一族），只能用字符串字面量取。
+#[cfg(target_os = "macos")]
+const NSFILENAMES_PBOARD_TYPE: &str = "NSFilenamesPboardType";
+
+/// 把文件路径按 file 条目的双写约定写进一块 `NSPasteboard`(仅 macOS)。
+///
+/// **生产写侧(`imp::MacosBackend::write_clipboard` 的 `ContentKind::File` 分支)与
+/// `capture.rs` 的写读往返测试共用这一份实现** —— 这样「我们写进去的形状读得回来」
+/// 由真代码保证,而不是测试里手搭一份可能与生产漂移的克隆写入器。
+///
+/// 两条写入(详细理由见 `imp::MacosBackend::write_clipboard`):
+///   - `paths` 非空时先写 `NSFilenamesPboardType`(`NSArray<NSString>`,文件引用),
+///     给 Finder / Slack 上传框这类认文件引用的应用;
+///   - 无论 `paths` 是否为空,**无条件**写 `NSPasteboardTypeString`(路径按 `\n`
+///     拼接,即 [`file_text_fallback`]),给 TextEdit / 网页输入框这类只认文本的应用。
+#[cfg(target_os = "macos")]
+pub(crate) fn write_file_paths_to_pasteboard(
+    pasteboard: &objc2_app_kit::NSPasteboard,
+    paths: &[String],
+) {
+    use objc2_app_kit::NSPasteboardTypeString;
+    use objc2_foundation::NSString;
+
+    if !paths.is_empty() {
+        let ns_paths: Vec<objc2::rc::Retained<NSString>> =
+            paths.iter().map(|p| NSString::from_str(p)).collect();
+        let array = objc2_foundation::NSArray::from_retained_slice(&ns_paths);
+        // SAFETY: `cast_unchecked` 只做类型擦除的指针转换，不改变对象的动态类型。
+        // `NSArray` 实例转成 `AnyObject`（即 Obj-C 的 `id`）总是合法的；这里转正是因为
+        // `setPropertyList_forType` 收 `&AnyObject`。
+        let plist: objc2::rc::Retained<objc2::runtime::AnyObject> =
+            unsafe { objc2::rc::Retained::cast_unchecked(array) };
+        let _ = unsafe {
+            pasteboard.setPropertyList_forType(&plist, &NSString::from_str(NSFILENAMES_PBOARD_TYPE))
+        };
+    }
+
+    let ns = NSString::from_str(&file_text_fallback(paths));
+    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+}
+
 #[cfg(target_os = "macos")]
 mod imp {
     use std::sync::Mutex;
@@ -395,13 +438,9 @@ mod imp {
 
     use super::{
         AccessibilityChecker, ContentKind, FRONT_POLL_INTERVAL, FRONT_WAIT_MAX, HIDE_FENCE_MAX,
-        InjectError, KEY_WINDOW_SETTLE, PasteBackend, file_paths, file_text_fallback,
-        should_replace_target, wait_for_frontmost,
+        InjectError, KEY_WINDOW_SETTLE, PasteBackend, file_paths, should_replace_target,
+        wait_for_frontmost, write_file_paths_to_pasteboard,
     };
-
-    /// `NSPasteboard` 的文件列表类型。它没有 objc2 常量（Apple 从未把它列进
-    /// `NSPasteboardType*` 一族），只能用字符串字面量取。
-    const NSFILENAMES_PBOARD_TYPE: &str = "NSFilenamesPboardType";
 
     // ---- Accessibility ----
     #[link(name = "ApplicationServices", kind = "framework")]
@@ -613,25 +652,7 @@ mod imp {
                     // 只认文本的应用会什么都贴不出来。Windows 侧同义（`CF_HDROP` +
                     // `CF_UNICODETEXT` 一起挂，见 `imp_win`）。
                     let paths = file_paths(payload);
-                    if !paths.is_empty() {
-                        let ns_paths: Vec<objc2::rc::Retained<NSString>> =
-                            paths.iter().map(|p| NSString::from_str(p)).collect();
-                        let array = objc2_foundation::NSArray::from_retained_slice(&ns_paths);
-                        // SAFETY: `cast_unchecked` 只做类型擦除的指针转换，不改变对象的
-                        // 动态类型。`NSArray` 实例转成 `AnyObject`（即 Obj-C 的 `id`）总是
-                        // 合法的；这里转正是因为 `setPropertyList_forType` 收 `&AnyObject`。
-                        let plist: objc2::rc::Retained<objc2::runtime::AnyObject> =
-                            unsafe { objc2::rc::Retained::cast_unchecked(array) };
-                        let _ = unsafe {
-                            pasteboard.setPropertyList_forType(
-                                &plist,
-                                &NSString::from_str(NSFILENAMES_PBOARD_TYPE),
-                            )
-                        };
-                    }
-
-                    let ns = NSString::from_str(&file_text_fallback(&paths));
-                    let _ = unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+                    write_file_paths_to_pasteboard(&pasteboard, &paths);
                 }
                 ContentKind::Rtf => {
                     let bytes = payload.unwrap_or(&[]);

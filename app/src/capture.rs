@@ -637,16 +637,27 @@ fn poll_filenames(pb: &objc2_app_kit::NSPasteboard) -> Option<Captured> {
 
 /// 把已 downcast 好的文件 URL 转成 `Captured::file`(纯函数,便于单测)。
 ///
+/// 只认真正的文件 URL:`isFileURL()` 为 false 的 URL 先被跳过。这一层过滤不能省 ——
+/// `readObjectsForClasses(_:options:)` 会返回粘贴板上的**任意** `NSURL`,包括浏览器
+/// "拷贝链接"写下的 `public.url`(如 `https://example.com/page`);而层级 URL 的
+/// `path()` 不是 nil(那个例子得到 `/page`,只有 origin 时得到 `""`)。少了这道过滤,
+/// 一个链接会被采集成一条假 File 条目,而本该捕获的 URL 文本被 filenames 优先级挡掉、
+/// 永久丢失。
+///
 /// `canonicalize` 成功用规范路径;失败保留 `NSURL` 给的路径并把 `resolved` 标成
 /// `false`(多类型 plan Assumptions:拿不到规范路径不是丢弃这条条目的理由)。
-/// `path()` 返回 nil 的条目(非文件 URL)跳过;全部被跳过时返回 `None`,与
-/// "filenames 这一优先级没内容"同义。
+/// `isFileURL()` 为 true 但 `path()` 仍返回 nil 的条目同样跳过;全部被跳过时返回
+/// `None`,与 "filenames 这一优先级没内容"同义。
 #[cfg(target_os = "macos")]
 fn paths_from_urls(urls: &[objc2::rc::Retained<objc2_foundation::NSURL>]) -> Option<Captured> {
     let mut all_resolved = true;
     let mut resolved = Vec::with_capacity(urls.len());
 
     for url in urls {
+        // 非文件 URL(public.url 等)必须在取 path 之前排除。
+        if !url.isFileURL() {
+            continue;
+        }
         let Some(path) = url.path() else {
             continue;
         };
@@ -994,6 +1005,77 @@ mod tests {
         );
     }
 
+    /// 回归:浏览器"拷贝链接"写下的 `public.url`(层级 URL)也是 `NSURL`,且 `path()`
+    /// 在它上面不是 nil(`https://example.com/page` → `/page`)。混在文件 URL 里时必须
+    /// 被 `isFileURL` 过滤掉,不能当成假文件路径采集。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_from_urls_skips_non_file_urls() {
+        use objc2_foundation::{NSString, NSURL};
+
+        let link = NSURL::URLWithString(&NSString::from_str("https://example.com/page"))
+            .expect("示例 URL 必须合法");
+
+        let captured =
+            paths_from_urls(&[url("/tmp"), link]).expect("至少一个文件 URL 应产出 Captured");
+
+        let expected = std::fs::canonicalize("/tmp")
+            .expect("/tmp 必须存在")
+            .to_str()
+            .expect("规范路径必须是 UTF-8")
+            .to_string();
+        assert_eq!(captured.kind, ContentKind::File);
+        assert_eq!(
+            payload_paths(&captured),
+            vec![expected],
+            "只应命中真正的文件路径,链接的 `/page` 不得混进来"
+        );
+    }
+
+    /// 回归:粘贴板上只有非文件 URL 时必须返回 `None`,让链路落到 string 优先级去
+    /// 捕获 URL 文本 —— 否则 URL 文本永久丢失、只剩一条假 File 条目。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paths_from_urls_all_non_file_returns_none() {
+        use objc2_foundation::{NSString, NSURL};
+
+        let link = NSURL::URLWithString(&NSString::from_str("https://example.com/page"))
+            .expect("示例 URL 必须合法");
+
+        assert!(
+            paths_from_urls(&[link]).is_none(),
+            "全是非文件 URL 时必须返回 None"
+        );
+    }
+
+    /// 回归:只有文本(例如 URL 以 `public.utf8-plain-text` 落在粘贴板上)时,
+    /// filenames 这一优先级不得命中,免得把普通文本采成 File 条目。
+    ///
+    /// 用**命名**粘贴板而不是 `generalPasteboard`(同
+    /// [`read_objects_round_trips_filenames_written_as_property_list`] 的理由);名字与那个
+    /// 测试不同,避免两个用例并发跑时互相 `clearContents` 造成 flake。
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn poll_filenames_returns_none_for_text_only_pasteboard() {
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        use objc2_foundation::NSString;
+
+        let pb = NSPasteboard::pasteboardWithName(&NSString::from_str("ClipVaultCaptureTextOnly"));
+        pb.clearContents();
+
+        let _ = unsafe {
+            pb.setString_forType(
+                &NSString::from_str("https://example.com/page"),
+                NSPasteboardTypeString,
+            )
+        };
+
+        assert!(
+            poll_filenames(&pb).is_none(),
+            "只有文本的粘贴板不得被采集为 File 条目"
+        );
+    }
+
     #[test]
     fn poll_first_non_empty_returns_none_when_change_count_unchanged() {
         // 非 macOS 路径返回 None;但 macOS 路径也会因 change_count 未增返回 None
@@ -1007,18 +1089,21 @@ mod tests {
     /// [`paths_from_urls`] 还原成路径数组。
     ///
     /// 这条链路之前在两边都是断的（采集侧扫 ASCII 字节、回贴侧只写纯文本），
-    /// 单测各自"通过"却谁也没覆盖"写进去读得回来"。这里用**命名**粘贴板而不是
-    /// `generalPasteboard`：测试绝不碰用户正在用的剪贴板。命名粘贴板会在本次登录
-    /// 会话里留存（objc2 0.3 未暴露 `releaseGlobally`），但它只装两个路径、用户不可见。
+    /// 单测各自"通过"却谁也没覆盖"写进去读得回来"。写侧直接调**生产**的
+    /// [`crate::pasteback::write_file_paths_to_pasteboard`]，生产写侧一旦漂移这里就会红，
+    /// 而不是对着测试里手搭的克隆写入器自说自话。
+    ///
+    /// 这里用**命名**粘贴板而不是 `generalPasteboard`：测试绝不碰用户正在用的剪贴板。
+    /// 命名粘贴板会在本次登录会话里留存（objc2 0.3 未暴露 `releaseGlobally`），但它只装
+    /// 两个路径、用户不可见。
     ///
     /// 它证明的是「我们自己的写入形状读得回来」；Finder 复制文件时粘贴板上还有哪些
     /// 附带类型，仍归真机 AE1 验收。
     #[cfg(target_os = "macos")]
     #[test]
     fn read_objects_round_trips_filenames_written_as_property_list() {
-        use objc2::rc::Retained;
-        use objc2_app_kit::NSPasteboard;
-        use objc2_foundation::{NSArray, NSString};
+        use objc2_app_kit::{NSPasteboard, NSPasteboardTypeString};
+        use objc2_foundation::NSString;
 
         // 取两个一定存在的路径（macOS 上 /tmp 是指向 /private/tmp 的符号链接，
         // 正好顺带覆盖 canonicalize 这一步）。
@@ -1027,16 +1112,18 @@ mod tests {
         let pb = NSPasteboard::pasteboardWithName(&NSString::from_str("ClipVaultCaptureTest"));
         pb.clearContents();
 
-        let ns_paths: Vec<Retained<NSString>> =
-            sources.iter().map(|p| NSString::from_str(p)).collect();
-        let array = NSArray::from_retained_slice(&ns_paths);
-        // SAFETY: 同 `imp::MacosBackend::write_clipboard` —— `AnyObject` 就是 `id`，
-        // 任何对象转过去都合法。
-        let plist: Retained<objc2::runtime::AnyObject> = unsafe { Retained::cast_unchecked(array) };
-        let wrote = unsafe {
-            pb.setPropertyList_forType(&plist, &NSString::from_str("NSFilenamesPboardType"))
-        };
-        assert!(wrote, "写 .filenames 应成功");
+        // 走生产写侧（与 `MacosBackend::write_clipboard` 的 File 分支同一份实现）。
+        let paths: Vec<String> = sources.iter().map(|p| p.to_string()).collect();
+        crate::pasteback::write_file_paths_to_pasteboard(&pb, &paths);
+
+        // 双写契约：文件引用之外还必须无条件挂纯文本表示（路径按 `\n` 拼接），
+        // 给只认文本的接收方（此处此前无人证明）。
+        let string_repr = pb.stringForType(unsafe { NSPasteboardTypeString });
+        assert_eq!(
+            string_repr.map(|s| s.to_string()),
+            Some(paths.join("\n")),
+            "写侧必须同时挂 `\\n` 拼接的纯文本表示"
+        );
 
         let captured = poll_filenames(&pb).expect("刚写进去的文件引用应能被读回");
         assert_eq!(captured.kind, ContentKind::File);
