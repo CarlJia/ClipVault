@@ -110,6 +110,9 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
     let vault = MenuItem::with_id(app, "vault", "加密区", true, None::<&str>)?;
     // 设置(U12)：弹出主面板 + 通过 "open-settings" 事件让前端打开 #settings 模态。
     let settings = MenuItem::with_id(app, "settings", "设置…", true, None::<&str>)?;
+    // U5：「查看日志…」—— 在系统文件管理器中显示日志文件(R10)。
+    // 不打开主面板,只 reveal;同目录 .1 备份在 Finder/Explorer 中自然可见。
+    let logs = MenuItem::with_id(app, "logs", "查看日志…", true, None::<&str>)?;
     let about = MenuItem::with_id(app, "about", "关于 ClipVault", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -120,7 +123,7 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
     let menu = Menu::with_items(
         app,
         &[
-            &open, &skip, &guest, &vault, &settings, &sep, &about, &sep, &quit,
+            &open, &skip, &guest, &vault, &settings, &logs, &sep, &about, &sep, &quit,
         ],
     )?;
 
@@ -214,6 +217,13 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
             crate::panel::show_panel(app);
             // emit 失败不影响窗口已显示；前端 listen 见 §main.ts openSettings 入口。
             let _ = app.emit("open-settings", ());
+        }
+        // U5：在系统文件管理器中显示日志文件。KTD6 走纯函数 reveal_argv，
+        // 失败 best-effort(打 log + 不阻塞其它动作)。
+        "logs" => {
+            if let Err(e) = crate::commands::reveal_log(app) {
+                ::log::warn!(target: "tray", "查看日志失败：{e}");
+            }
         }
         "quit" => {
             crate::hotkey::unregister_all();

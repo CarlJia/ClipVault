@@ -628,6 +628,27 @@ pub async fn clear_log(_state: State<'_, AppState>) -> Result<(), String> {
 }
 
 // ----------------------------------------------------------------
+// 「查看日志…」(U5 / R10)
+// ----------------------------------------------------------------
+
+/// 在系统文件管理器中显示日志文件(macOS Finder / Windows 资源管理器)。
+///
+/// 走 KTD6 的纯函数 `reveal_argv` 拿参数数组,`std::process::Command::new(prog).args(args).spawn()`
+/// 启动对应命令。错误以 `Err(String)` 返回,UI 端只发 log 警告。
+pub fn reveal_log(_app: &tauri::AppHandle) -> Result<(), String> {
+    use std::process::Command;
+    let path = crate::log::default_log_path();
+    let path_str = path.to_string_lossy().into_owned();
+    let (prog, args) = crate::log::reveal_argv(cfg!(target_os = "macos"), &path_str);
+    // `Command` 在 Windows 上需要 std 句柄,这里允许 inherit。
+    Command::new(&prog)
+        .args(&args)
+        .spawn()
+        .map(|_child| ())
+        .map_err(|e| format!("reveal_log: spawn `{prog}` 失败: {e}"))
+}
+
+// ----------------------------------------------------------------
 // HotkeyMap（U1）
 // ----------------------------------------------------------------
 
