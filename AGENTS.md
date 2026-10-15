@@ -97,6 +97,10 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
 
 - **macOS MVP**：U1–U11 全部完成（`git log` 可见各 U 的 commit）。
 - **多类型采集**：U1–U6 完成（见多类型 plan）。
+- **诊断日志与查看入口**：U1–U6 完成（见 `docs/plans/2026-10-15-1642-feat-diagnostics-log-viewer-plan.md`）——
+  `app/src/log.rs` 纯函数 + 文件 sink、轮转（main + .1）、`log` crate facade、`Level`
+  持久化到 `settings` 表、设置面板「诊断日志」区、托盘「查看日志…」在系统文件管理器
+  中显示。R13 仍为空（`log` 0.4.34 早就在依赖树内,升为直接依赖零新 crate）。
 - **Windows 支持**：U1–U9 完成 —— 采集 / 热键 / 回贴 / 凭据、命令收口、托盘、前端跨平台化、
   打包与 CI、文档均已落地。剩余的是 **Windows 真机验收**（Windows plan 的 AEW1–AEW8：
   托盘在浅/深色任务栏下的可见性、`Ctrl+X` 文案与 SVG 字形、无授权横幅、加密区端到端等）。
@@ -106,7 +110,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 189 passed + core 27 passed（合计 216），1 个 trigram 测试 ignored
+- **测试基线**：app 216 passed + core 27 passed（合计 243），1 个 trigram 测试 ignored；
+  增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）。`frontend/src/logview.test.ts` 6 例
+  由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 目标的整树编译与 lint 只能在 CI 上验证**：本地开发机是 macOS，
   `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/ci.yml` 在**每个 PR**
