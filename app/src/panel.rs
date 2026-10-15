@@ -227,7 +227,7 @@ pub fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
         return;
     }
     if let Err(e) = window.hide() {
-        eprintln!("clipvault: 面板失焦自动收起失败：{e}");
+        ::log::warn!(target: "panel", "面板失焦自动收起失败：{e}");
     }
 }
 
@@ -293,7 +293,7 @@ fn log_skip_once(path: &'static str, detail: &str) {
         seen.push(path);
     }
     // 先放锁再写 stderr：日志路径不值得让别的线程等 I/O。
-    eprintln!("clipvault: 面板定位跳过（{path}）：{detail}");
+    ::log::warn!(target: "panel::display", "面板定位跳过（{path}）：{detail}");
 }
 
 /// macOS 定位适配层（KTD3）：全程 AppKit 点坐标，直接用 `NSWindow.setFrameTopLeftPoint`。

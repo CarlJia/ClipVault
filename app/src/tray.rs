@@ -145,7 +145,7 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
             builder = builder.icon(icon).icon_as_template(tray_icon_as_template());
         }
         Err(e) => {
-            eprintln!("clipvault: 托盘图标加载失败，回退窗口图标：{e}");
+            ::log::warn!(target: "tray", "托盘图标加载失败，回退窗口图标：{e}");
             if let Some(icon) = app.default_window_icon() {
                 builder = builder
                     .icon(icon.clone())
@@ -202,7 +202,7 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                 let storage = state.storage.clone();
                 tauri::async_runtime::spawn(async move {
                     if let Err(e) = crate::privacy::persist_guest_mode(&storage, new).await {
-                        eprintln!("clipvault: 访客模式持久化失败：{e}");
+                        ::log::error!(target: "tray", "访客模式持久化失败：{e}");
                     }
                 });
             }

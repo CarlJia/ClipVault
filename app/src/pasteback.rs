@@ -563,7 +563,7 @@ mod imp {
         if !restored {
             // 不在这里失败：⌘V 照常注入，真丢了下游 `perform_paste` 的失焦比对
             // 会返回 WindowSwitched，前端提示用户手动 ⌘V。留一条日志便于排障。
-            eprintln!("clipvault: 目标应用未在 {FRONT_WAIT_MAX:?} 内回到前台，⌘V 可能落空");
+            ::log::warn!(target: "pasteback", "目标应用未在 {FRONT_WAIT_MAX:?} 内回到前台，⌘V 可能落空");
         }
         // 激活完成 ≠ 输入框已恢复，留稳定期再注入按键。
         std::thread::sleep(KEY_WINDOW_SETTLE);
@@ -910,7 +910,7 @@ mod imp_win {
         if !restored {
             // 不在这里失败：按键照常注入，真落空了由下游的失焦比对返回 WindowSwitched，
             // 前端提示用户手动 Ctrl+V。留一行日志便于排障。
-            eprintln!("clipvault: 目标窗口未在 {FRONT_WAIT_MAX:?} 内回到前台，Ctrl+V 可能落空");
+            ::log::warn!(target: "pasteback", "目标窗口未在 {FRONT_WAIT_MAX:?} 内回到前台，Ctrl+V 可能落空");
         }
 
         window.hide().map_err(|e| e.to_string())?;
@@ -957,7 +957,7 @@ mod imp_win {
             ) {
                 // 剪贴板被别的进程长时间占着，连清空都做不到。放弃并留日志：
                 // 用户侧表现为"回车后什么都没发生"，比贴错内容安全。
-                eprintln!("clipvault: 打开剪贴板失败（被其它进程占用），本次未写入内容");
+                ::log::error!(target: "pasteback", "打开剪贴板失败（被其它进程占用），本次未写入内容");
                 return;
             }
 
@@ -1024,7 +1024,7 @@ mod imp_win {
             // 1. 等物理修饰键抬起。用户很可能按着 Alt 就用方向键选完了条目，
             //    此时注入的 Ctrl+V 会被系统解读成 Ctrl+Alt+V。
             if !wait_for_modifiers_released(MODIFIER_RELEASE_MAX) {
-                eprintln!("clipvault: 修饰键在 {MODIFIER_RELEASE_MAX:?} 内未抬起，放弃自动回贴");
+                ::log::warn!(target: "pasteback", "修饰键在 {MODIFIER_RELEASE_MAX:?} 内未抬起，放弃自动回贴");
                 return Err(InjectError);
             }
 
@@ -1041,7 +1041,7 @@ mod imp_win {
                 // 典型成因是 UIPI：目标进程以更高完整性级别（管理员）运行时，
                 // 系统会静默丢弃注入。这是 Windows 的安全设计，不绕过 ——
                 // 交给调用方降级为"仅剪贴板"。
-                eprintln!("clipvault: SendInput 被拒绝（目标应用权限更高？），已降级为仅写剪贴板");
+                ::log::error!(target: "pasteback", "SendInput 被拒绝（目标应用权限更高？），已降级为仅写剪贴板");
                 return Err(InjectError);
             }
 

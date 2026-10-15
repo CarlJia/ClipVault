@@ -167,7 +167,7 @@ impl Watcher {
             && payload.len() > MAX_PAYLOAD_BYTES
         {
             let mb = payload.len() / 1024 / 1024;
-            eprintln!("[capture] skipped: payload too large ({mb} MB)");
+            ::log::warn!(target: "watcher::capture", "[capture] skipped: payload too large ({mb} MB)");
             return;
         }
 
@@ -244,10 +244,20 @@ impl Watcher {
                 // 而丢弃的新内容」在这里完全无法区分,只有日志能事后发现。
                 // 打 `e` 而不是写死「duplicate content_hash」:这个分支按错误码匹配,
                 // 将来加了别的约束(NOT NULL / CHECK)进来时,日志会自己说明是哪个约束。
-                eprintln!("[capture] skipped: {e} (hash {hash})");
+                // KTD4：仅取 hash 前 8 字符,避免日志里出现可被字典攻击的剪贴板指纹。
+                // hash 可能极短(< 8 字符)甚至为空,加防御:为短串/空串跳过打印。
+                let hash_prefix: String = hash.chars().take(8).collect();
+                if hash_prefix.is_empty() {
+                    ::log::warn!(target: "watcher::capture", "[capture] skipped: {e} (hash <empty>)");
+                } else {
+                    ::log::warn!(
+                        target: "watcher::capture",
+                        "[capture] skipped: {e} (hash {hash_prefix}..)"
+                    );
+                }
             }
             Err(e) => {
-                eprintln!("clipvault watcher: insert failed: {e}");
+                ::log::error!(target: "watcher::capture", "clipvault watcher: insert failed: {e}");
             }
         }
     }
