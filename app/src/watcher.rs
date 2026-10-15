@@ -30,6 +30,9 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const DEDUP_WINDOW: Duration = Duration::from_secs(5);
 /// 指纹长度:SHA-256 十六进制的前 16 个字符。
 const HASH_PREFIX_LEN: usize = 16;
+/// verbose 日志里保留的指纹长度(KTD4):8 个十六进制字符,全量指纹在共享日志时
+/// 等于泄露剪贴板内容的内容派生指纹。
+const LOG_HASH_PREFIX_LEN: usize = 8;
 
 /// 计算文本的 SHA-256 指纹前缀（16 位十六进制,即前 8 字节)。
 pub fn hash_prefix(text: &str) -> String {
@@ -44,6 +47,21 @@ pub fn hash_prefix(text: &str) -> String {
         let _ = write!(hex, "{byte:02x}");
     }
     hex
+}
+
+/// 组装「同一指纹已在库中」的 verbose 文案。
+///
+/// 抽成纯函数是为了可测:测试构建不安装全局 logger(`log.rs` 的
+/// `install_global_logger` 在 `cfg(test)` 下是空实现),日志级别与文案无法在单测里
+/// 捕获,只有这里能被断言。保留 `[capture] skipped:` 前缀(既有 grep 习惯),
+/// 并把「重复、未新增条目」说清楚 —— 它曾被读成故障。
+pub fn duplicate_fingerprint_log(err: &str, hash: &str) -> String {
+    let prefix: String = hash.chars().take(LOG_HASH_PREFIX_LEN).collect();
+    if prefix.is_empty() {
+        format!("[capture] skipped: {err} (duplicate fingerprint, no new entry; hash <empty>)")
+    } else {
+        format!("[capture] skipped: {err} (duplicate fingerprint, no new entry; hash {prefix}..)")
+    }
 }
 
 /// 纯函数去重判定，便于单测。
@@ -238,23 +256,23 @@ impl Watcher {
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,不入库。
-                // 留一行日志是必要的:指纹算法一旦退化(如 binary 分支曾漏掉 payload,
-                // 让同 kind 的所有内容共用一个指纹),真正的「重复」与「被误判为重复
-                // 而丢弃的新内容」在这里完全无法区分,只有日志能事后发现。
-                // 打 `e` 而不是写死「duplicate content_hash」:这个分支按错误码匹配,
-                // 将来加了别的约束(NOT NULL / CHECK)进来时,日志会自己说明是哪个约束。
-                // KTD4：仅取 hash 前 8 字符,避免日志里出现可被字典攻击的剪贴板指纹。
-                // hash 可能极短(< 8 字符)甚至为空,加防御:为短串/空串跳过打印。
-                let hash_prefix: String = hash.chars().take(8).collect();
-                if hash_prefix.is_empty() {
-                    ::log::warn!(target: "watcher::capture", "[capture] skipped: {e} (hash <empty>)");
-                } else {
-                    ::log::warn!(
-                        target: "watcher::capture",
-                        "[capture] skipped: {e} (hash {hash_prefix}..)"
-                    );
-                }
+                // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,不入库
+                // (MVP plan「重复指纹去重(content_hash UNIQUE 触发冲突 → 视为同条)」)。
+                // 级别取 verbose(debug!)而非 WARN:这是**设计内的常见路径** —— `new` 把
+                // 序列号初值设成 -1,启动后第一次轮询就会捕获既有剪贴板,只要那份内容此前
+                // 已入库就必然命中一次;日志在设置面板里给用户看,每次启动一条 WARN 会被
+                // 读成故障(实测就是这样被报回来的)。
+                // 仍要留痕的理由:指纹算法一旦退化(如 binary 分支曾漏掉 payload,让同 kind
+                // 的所有内容共用一个指纹),真正的「重复」与「被误判为重复而丢弃的新内容」
+                // 在代码里完全无法区分,只有 verbose 日志能事后分辨。
+                // 打 `e` 而不是写死「duplicate content_hash」:这个分支按错误码匹配,将来
+                // 加了别的约束(NOT NULL / CHECK)进来时,日志会自己说明是哪个约束。
+                // 文案由 `duplicate_fingerprint_log` 组装(格式与 KTD4 的指纹截断有单测)。
+                ::log::debug!(
+                    target: "watcher::capture",
+                    "{}",
+                    duplicate_fingerprint_log(&e.to_string(), &hash)
+                );
             }
             Err(e) => {
                 ::log::error!(target: "watcher::capture", "clipvault watcher: insert failed: {e}");
