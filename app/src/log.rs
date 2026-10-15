@@ -532,6 +532,10 @@ pub struct LogInfo {
     pub level: String,
     /// 日志文件绝对路径,供 UI 显示与复制。
     pub path: String,
+    /// 尾部内容(`.1` + current 拼接,后端已 cap 到 64 KiB / 400 行);
+    /// 由 `read_log` 命令填,`read_info` 路径不填。
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub lines: String,
 }
 
 /// 收集给 IPC 用的元信息(R11 / U4)。
@@ -549,6 +553,7 @@ pub fn read_info(path: &Path, atomic: &AtomicU8) -> LogInfo {
         backup_size_bytes,
         level,
         path: path.to_string_lossy().to_string(),
+        lines: String::new(),
     }
 }
 

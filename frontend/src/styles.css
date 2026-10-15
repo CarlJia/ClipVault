@@ -859,6 +859,23 @@ body {
   margin-bottom: 2px;
 }
 
+/* U4 诊断日志区尾部<pre>：等宽字体,固定高度,内部滚动,避免撑开设置卡片。 */
+.settings-log-tail {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .hotkey-list {
   list-style: none;
   display: flex;

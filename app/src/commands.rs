@@ -581,6 +581,53 @@ pub async fn set_panel_opacity(opacity: u32, state: State<'_, AppState>) -> Resu
 }
 
 // ----------------------------------------------------------------
+// 诊断日志（U2 / U4）
+// ----------------------------------------------------------------
+
+/// 当前日志级别字符串,以运行时共享原子为准。
+#[tauri::command]
+pub fn get_log_level(state: State<'_, AppState>) -> String {
+    crate::log::Level::from_u8(state.log_level.load(Ordering::SeqCst))
+        .as_str()
+        .to_string()
+}
+
+/// 设置日志级别。接受 `\"info\"` / `\"verbose\"`,其它值回落 `info`。
+/// 写路径经 [`crate::log::apply_log_level`]:clamp + 原子更新 + 持久化。
+#[tauri::command]
+pub async fn set_log_level(level: String, state: State<'_, AppState>) -> Result<String, String> {
+    let parsed = crate::log::parse_level(Some(&level));
+    crate::log::apply_log_level(&state.storage, &state.log_level, parsed)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(parsed.as_str().to_string())
+}
+
+/// 日志视图元信息 + 尾部内容。`lines` 字段已按 R13 cap(64 KiB / 400 行)
+/// 截断,前端按 R14 再 cap 一道「最多渲染 200 行」。
+#[tauri::command]
+pub async fn read_log(state: State<'_, AppState>) -> Result<crate::log::LogInfo, String> {
+    let path = crate::log::default_log_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    let lines = crate::log::read_tail(dir, 64 * 1024, 400).map_err(|e| e.to_string())?;
+    let mut info = crate::log::read_info(&path, &state.log_level);
+    info.lines = lines;
+    Ok(info)
+}
+
+/// 清空日志(R12):截断 `clipvault.log` 到 0 + 删除 `clipvault.log.1`。
+///
+/// 状态参数保留供后续扩展(例如按用户限制大小);目前不需要。
+#[tauri::command]
+pub async fn clear_log(_state: State<'_, AppState>) -> Result<(), String> {
+    let path = crate::log::default_log_path();
+    let dir = path.parent().unwrap_or(std::path::Path::new(""));
+    crate::log::clear(dir).map_err(|e| e.to_string())?;
+    ::log::info!(target: "main", "用户清空诊断日志");
+    Ok(())
+}
+
+// ----------------------------------------------------------------
 // HotkeyMap（U1）
 // ----------------------------------------------------------------
 

@@ -242,6 +242,52 @@ export async function setPanelOpacity(v: number): Promise<number> {
   }
 }
 
+// ----------------------------------------------------------------
+// 诊断日志（U4）
+// ----------------------------------------------------------------
+
+/** 后端 `read_log` 返回的 DTO 形状（对应 Rust `log::LogInfo`）。 */
+export interface LogInfoDto {
+  size_bytes: number;
+  backup_size_bytes: number;
+  level: string;
+  path: string;
+  /** `.1` + current 拼接的尾部,后端已 cap 64 KiB / 400 行。 */
+  lines: string;
+}
+
+/** 拉取一次日志元信息 + 尾部内容。失败时返回 null,UI 静默。 */
+export async function readLog(): Promise<LogInfoDto | null> {
+  try {
+    return await invoke<LogInfoDto>("read_log");
+  } catch {
+    return null;
+  }
+}
+
+/** 清空日志。失败抛错,UI 弹 toast。 */
+export async function clearLog(): Promise<void> {
+  await invoke("clear_log");
+}
+
+/** 读取当前日志级别字符串 ("info" / "verbose")。失败回落 "info"。 */
+export async function getLogLevel(): Promise<string> {
+  try {
+    return await invoke<string>("get_log_level");
+  } catch {
+    return "info";
+  }
+}
+
+/** 设置日志级别。返回后端 clamp 后的值,失败回落原值。 */
+export async function setLogLevel(level: string): Promise<string> {
+  try {
+    return await invoke<string>("set_log_level", { level });
+  } catch {
+    return level === "verbose" ? "info" : "verbose";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 快捷键设置区块（U4）
 // ---------------------------------------------------------------------------
