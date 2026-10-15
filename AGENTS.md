@@ -106,7 +106,7 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 189 passed + core 27 passed（合计 216），1 个 trigram 测试 ignored
+- **测试基线**：app 190 passed + core 27 passed（合计 217），1 个 trigram 测试 ignored
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 目标的整树编译与 lint 只能在 CI 上验证**：本地开发机是 macOS，
   `cfg(target_os = "windows")` 的分支根本不参与编译。`.github/workflows/ci.yml` 在**每个 PR**
