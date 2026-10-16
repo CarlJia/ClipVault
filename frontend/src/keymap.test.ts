@@ -1,5 +1,7 @@
 // frontend/src/keymap.test.ts
 //
+/// <reference types="vite/client" />
+//
 // keymap.ts 的回归护栏。这个文件存在的直接理由：`get_hotkeys` 的**线格式**
 // （`{"mods":["meta"],"key":"e"}`，`key` 是字符串）与**内部表示**（`key` 是带标签的
 // `Key`）曾被 `JSON.parse(json) as HotkeyMap` 的裸断言混为一谈，后果是面板内
@@ -8,6 +10,11 @@
 // 这里把那两条边界钉成可执行断言 —— 删掉对应的生产代码，这些用例必须变红。
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
+
+// 命名键 token 的跨语言对照要读后端的源码（见文件末尾的 describe）。
+// `?raw` 由 Vite 提供，运行时（vitest）与 tsc 都认 —— 不必给前端引入 @types/node，
+// 前端跑在 WebView 里，本来就不该有 node 内置模块可用。
+import coreKeymapRs from "../../clipvault-core/src/keymap.rs?raw";
 
 /** `KeyboardEvent` 的最小替身：keymap 只读这几个字段，故测试不需要 DOM 环境。 */
 type EvInit = Partial<
@@ -303,8 +310,9 @@ describe("平台主修饰键规则", () => {
 // 加密区模态内的 keydown（handleVaultKey）
 // ---------------------------------------------------------------------------
 //
-// 模态内的快捷键是硬编码的默认镜像（不走 keymap 表），所以这里单独钉一遍：
-// 新加的 ⌘⌫ 必须命中删除，且不能把方向键 / esc / ↩ 这类既有键吞掉。
+// 模态与主面板共用**同一张 keymap**（含用户重绑），所以这里除了钉「默认键照常工作」，
+// 还要钉「重绑能传导进模态」—— 曾经的实现把 ⌘⌫ / ⌘E 写死在模态里，用户重绑后
+// 模态内按新键没反应、按旧键反而生效。
 
 describe("handleVaultKey：加密区模态内的快捷键", () => {
   /** 记录 handler 调用序与 `preventDefault` 次数的最小 ctx。 */
@@ -369,6 +377,77 @@ describe("handleVaultKey：加密区模态内的快捷键", () => {
     km.handleVaultKey(ev({ key: "Enter", code: "Enter" }), ctx);
     km.handleVaultKey(ev({ key: "e", code: "KeyE", metaKey: true }), ctx);
     expect(calls).toEqual(["close", "move:1", "move:-1", "paste", "edit"]);
+  });
+
+  it("⌘⇧V（open_vault）再按一次收起模态", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx();
+    expect(
+      km.handleVaultKey(ev({ key: "V", code: "KeyV", metaKey: true, shiftKey: true }), ctx),
+    ).toBe(true);
+    expect(calls).toEqual(["close"]);
+  });
+
+  it("重绑 delete_entry 后模态跟着走：新键删，旧 ⌘⌫ 不再删", async () => {
+    const km = await freshKeymap({
+      wire: {
+        version: 1,
+        actions: { delete_entry: { mods: ["meta", "shift"], key: "d" } },
+      },
+    });
+    const { calls, ctx } = vaultCtx();
+
+    // 旧绑定落空：既不该删，也不该落到别的 handler。
+    expect(
+      km.handleVaultKey(ev({ key: "Backspace", code: "Backspace", metaKey: true }), ctx),
+    ).toBe(false);
+    expect(calls).toEqual([]);
+
+    // 新绑定生效（且仍吞掉事件）。
+    expect(
+      km.handleVaultKey(ev({ key: "D", code: "KeyD", metaKey: true, shiftKey: true }), ctx),
+    ).toBe(true);
+    expect(calls).toEqual(["delete"]);
+  });
+
+  it("Esc 是无条件逃生口：close 被重绑走，Esc 仍关得掉模态", async () => {
+    const km = await freshKeymap({
+      wire: { version: 1, actions: { close: { mods: [], key: "q" } } },
+    });
+    const { calls, ctx } = vaultCtx();
+    expect(km.handleVaultKey(ev({ key: "Escape", code: "Escape" }), ctx)).toBe(true);
+    expect(calls).toEqual(["close"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 命名键 token：前后端必须认同一张表（跨语言对照）
+// ---------------------------------------------------------------------------
+
+describe("命名键 token 的跨语言对照", () => {
+  it("前端 NAMED_KEY_TOKENS 与后端 CharKind::from_json_str 逐项一致", async () => {
+    const src = coreKeymapRs;
+    // `CharKind::from_json_str` 函数体里的字符串字面量就是后端认的命名键全集
+    // （首个匹配是 CharKind 的那个；`_ => None` 是它的收尾）。
+    const start = src.indexOf("pub fn from_json_str");
+    expect(start, "没找到 CharKind::from_json_str，后端重构后请更新这条测试").toBeGreaterThan(0);
+    const body = src.slice(start, src.indexOf("_ => None", start));
+    const backendTokens = [...body.matchAll(/"([a-z_]+)"\s*=>/g)].map((m) => m[1]).sort();
+    expect(backendTokens).toHaveLength(6);
+
+    const km = await freshKeymap();
+    // 后端新增一个命名键而前端没跟 → 这里红；前端多加 token 而没改后端 → 也红。
+    expect([...km.NAMED_KEY_TOKENS].sort()).toEqual(backendTokens);
+  });
+
+  it("认不出的 token 被丢弃，不再降级成永远匹配不上的多字符 char", async () => {
+    const km = await freshKeymap({
+      wire: { version: 1, actions: { toggle_pin: { mods: ["meta"], key: "f13" } } },
+    });
+    // 旧写法会得到 {kind:"char",ch:"f13"}：键帽显示假字符、匹配永远落空。
+    // 现在直接丢掉这个动作（设置面板那行显示 `—`，仍可重绑救回来）。
+    expect(km.currentKeyMap?.actions.toggle_pin).toBeUndefined();
+    expect(km.matches(ev({ key: "f13", code: "F13", metaKey: true }))).toBeNull();
   });
 });
 

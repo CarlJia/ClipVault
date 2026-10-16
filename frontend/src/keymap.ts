@@ -6,7 +6,7 @@
 // - parseKeyCombo(ev) -> KeyCombo | null  反向解析（录制态用）
 // - loadKeymap() / reloadKeymap()  从 get_hotkeys IPC 拉取
 // - dispatchHotkeyAction(action)  单一派发入口
-// - handleVaultKey(ev)  加密区模态内 keydown（保留原有逻辑）
+// - handleVaultKey(ev)  加密区模态内 keydown（走同一张 keymap，含重绑）
 
 import { invoke } from "@tauri-apps/api/core";
 import { isWindows, keys } from "./platform";
@@ -294,18 +294,29 @@ const NAMED_KEY_KINDS = [
   "backspace",
 ] as const;
 
+/** [`NAMED_KEY_KINDS`] 的表外可读别名（`keymap.test.ts` 用它做跨语言对照）。 */
+export const NAMED_KEY_TOKENS: readonly string[] = NAMED_KEY_KINDS;
+
 function isNamedKeyKind(raw: string): raw is (typeof NAMED_KEY_KINDS)[number] {
   return (NAMED_KEY_KINDS as readonly string[]).includes(raw);
 }
 
 /**
- * 线格式的 `key` 字符串 → 内部 `Key`。
+ * 线格式的 `key` 字符串 → 内部 `Key`；不认识的 token 返回 `null`。
  *
- * 命名键按 [`NAMED_KEY_KINDS`] 识别；其余一律当单字符处理（不校验长度，与后端
- * `serialize` 的实际产出 —— 命名键或单字符 —— 一致）。
+ * 命名键按 [`NAMED_KEY_KINDS`] 识别，其余只接受**单字符** —— 后端 `serialize` 只产出
+ * 这两种。多字符又不在命名表里意味着版本错配（后端新增了命名键、前端还没跟上）：
+ * 此时返回 `null`，让 [`keyMapFromWire`] 丢掉这个动作（设置面板那行显示 `—`，仍然
+ * 可以重绑）。**不要**退回「一律当单字符」的宽松写法 —— 那会静默造出一个永远匹配
+ * 不上的 `{kind:"char", ch:"◊◊"}`：绑定静默失效，键帽还显示一串假字符。
  */
-function keyFromWire(raw: string): Key {
-  return isNamedKeyKind(raw) ? { kind: raw } : { kind: "char", ch: raw.toLowerCase() };
+function keyFromWire(raw: string): Key | null {
+  if (isNamedKeyKind(raw)) return { kind: raw };
+  if (raw.length === 1) return { kind: "char", ch: raw.toLowerCase() };
+  console.warn(
+    `[keymap] 不认识的线格式 key token：「${raw}」—— 该动作不绑定任何键（后端加了新命名键而前端没跟上？）`,
+  );
+  return null;
 }
 
 /** 内部 `Key` → 线格式的 `key` 字符串（[`keyFromWire`] 的逆，共用同一张表）。 */
@@ -323,9 +334,13 @@ function keyToWire(key: Key): string {
 function keyMapFromWire(wire: WireHotkeyMap): HotkeyMap {
   const actions = {} as Record<HotkeyAction, KeyCombo>;
   for (const [action, combo] of Object.entries(wire.actions)) {
+    const key = keyFromWire(combo.key);
+    // 认不出的 token（见 keyFromWire）：跳过该动作，不写半个绑定。设置面板那行
+    // 会显示 `—`，用户可以直接重绑一个新的键把它救回来。
+    if (!key) continue;
     actions[action as HotkeyAction] = {
       mods: combo.mods,
-      key: keyFromWire(combo.key),
+      key,
     };
   }
   return { actions };
@@ -573,7 +588,7 @@ export function textFieldOwnsDeleteKey(target: EventTarget | null): boolean {
 
 // ---------------------------------------------------------------------------
 // handleVaultKey — 加密区模态内 keydown
-// 逻辑与原有 main.ts:653-685 完全一致，保留以便 keydown listener 调用。
+// 走与主面板同一张 keymap（含用户重绑），语义 = 该动作作用在当前选中的加密区条目上。
 // ---------------------------------------------------------------------------
 
 export function handleVaultKey(
@@ -586,44 +601,50 @@ export function handleVaultKey(
     deleteVaultEntry: () => Promise<void>;
   },
 ): boolean {
+  // Esc 是无条件的逃生口：模态必须永远关得掉，与 keymap 是否加载完、`close` 被
+  // 重绑到哪个键都无关。
   if (ev.key === "Escape") {
     ev.preventDefault();
     ctx.closeVault();
     return true;
   }
-  if (ev.key === "ArrowDown") {
-    ev.preventDefault();
-    ctx.moveVaultSelection(1);
-    return true;
+
+  // 其余按键一律查 keymap —— 不再硬编码默认键。原先这里写死 `⌘⌫` / `⌘E`，用户在
+  // 设置里把 `delete_entry` / `edit_note` 重绑到别的键后，模态里按新键毫无反应、
+  // 按旧键反而生效（review finding：重绑不传导进模态）。
+  //
+  // keymap 还没加载完时 `matches` 返回 null：模态里除 Esc 外都不响应 —— 与主面板
+  // 此时的行为一致（两侧一起失效，而不是一边可用一边不可用）。
+  switch (matches(ev)) {
+    // `⌘⇧V`（`open_vault`）再按一次 = 收起模态，与唤出是同一个动作；
+    // `close`（默认 Esc，可能被重绑）在模态里也是收起。
+    case "open_vault":
+    case "close":
+      ev.preventDefault();
+      ctx.closeVault();
+      return true;
+    case "move_down":
+      ev.preventDefault();
+      ctx.moveVaultSelection(1);
+      return true;
+    case "move_up":
+      ev.preventDefault();
+      ctx.moveVaultSelection(-1);
+      return true;
+    case "paste":
+      ev.preventDefault();
+      void ctx.pasteVaultEntry();
+      return true;
+    case "edit_note":
+      ev.preventDefault();
+      ctx.editVaultNote();
+      return true;
+    case "delete_entry":
+      ev.preventDefault();
+      // 自动重复：按住不放会连删下去，只认第一次 keydown（事件仍然吞掉）。
+      if (!ev.repeat) void ctx.deleteVaultEntry();
+      return true;
+    default:
+      return false;
   }
-  if (ev.key === "ArrowUp") {
-    ev.preventDefault();
-    ctx.moveVaultSelection(-1);
-    return true;
-  }
-  if (ev.key === "Enter") {
-    ev.preventDefault();
-    void ctx.pasteVaultEntry();
-    return true;
-  }
-  if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
-    ev.preventDefault();
-    ctx.editVaultNote();
-    return true;
-  }
-  // ⌘⌫：删除选中的加密区条目（与主列表 delete_entry 的默认绑定同一组键）。
-  // 加密区内快捷键是硬编码的默认镜像（⌘E 亦同），不经 keymap 表。
-  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && ev.key === "Backspace") {
-    ev.preventDefault();
-    // 自动重复：按住不放会连删下去，只认第一次 keydown（仍然吞掉事件）。
-    if (!ev.repeat) void ctx.deleteVaultEntry();
-    return true;
-  }
-  // ⌘⇧V：再次按下收起加密区模态
-  if ((ev.metaKey || ev.ctrlKey) && ev.shiftKey && (ev.key === "v" || ev.key === "V")) {
-    ev.preventDefault();
-    ctx.closeVault();
-    return true;
-  }
-  return false;
 }
