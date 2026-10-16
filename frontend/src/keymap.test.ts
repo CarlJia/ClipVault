@@ -38,10 +38,11 @@ function ev(init: EvInit): KeyboardEvent {
   } as unknown as KeyboardEvent;
 }
 
-/** 后端 `clipvault_core::keymap::serialize` 产出的线格式（`key` 为字符串）。 */
+/** 后端 `clipvault_core::keymap::serialize` 产出的线格式（`key` 为字符串）。
+ *  某条 action 的值是 `null` → 该 action 未绑定。 */
 interface WireMap {
   version: number;
-  actions: Record<string, { mods: string[]; key: string }>;
+  actions: Record<string, { mods: string[]; key: string } | null>;
 }
 
 /** 与 `HotkeyMap::default_map()` 一致的 14 条默认映射（`key` 为线格式字符串）。 */
@@ -68,7 +69,12 @@ const DEFAULT_WIRE: WireMap = {
 type KeymapModule = typeof import("./keymap");
 
 /** `set_hotkey` 收到的 IPC 入参（时间序）。 */
-let setHotkeyCalls: Array<{ action: string; combo: { mods: string[]; key: string | null } }>;
+let setHotkeyCalls: Array<{
+  action: string;
+  combo: { mods: string[]; key: string | null };
+  /** 「强行换绑」标志：默认 false，用户确认过才 true。 */
+  force: boolean | undefined;
+}>;
 
 /**
  * 取一份**全新的** keymap 模块。
@@ -85,7 +91,7 @@ async function freshKeymap(
   const invoke = vi.fn(
     async (
       cmd: string,
-      args?: { action: string; combo: { mods: string[]; key: string | null } },
+      args?: { action: string; combo: { mods: string[]; key: string | null }; force?: boolean },
     ) => {
       switch (cmd) {
         case "platform_info":
@@ -93,7 +99,9 @@ async function freshKeymap(
         case "get_hotkeys":
           return JSON.stringify(options.wire ?? DEFAULT_WIRE);
         case "set_hotkey":
-          if (args) setHotkeyCalls.push({ action: args.action, combo: args.combo });
+          if (args) {
+            setHotkeyCalls.push({ action: args.action, combo: args.combo, force: args.force });
+          }
           return undefined;
         default:
           return undefined;
@@ -189,7 +197,7 @@ describe("loadKeymap：线格式 key 字符串 → 内部带标签 Key", () => {
 
     for (const token of namedTokens) {
       const action = owners[token] as Parameters<typeof km.setHotkey>[0];
-      const combo = map.actions[action];
+      const combo = map.actions[action]!;
       expect(combo, token).toBeDefined();
       expect(combo.key, token).toEqual({ kind: token });
       await km.setHotkey(action, combo);
@@ -202,12 +210,13 @@ describe("loadKeymap：线格式 key 字符串 → 内部带标签 Key", () => {
     const km = await freshKeymap({
       wire: { version: 1, actions: { toggle_pin: { mods: ["meta"], key: "x" } } },
     });
-    const combo = km.currentKeyMap!.actions.toggle_pin;
+    const combo = km.currentKeyMap!.actions.toggle_pin!;
     expect(combo.key).toEqual({ kind: "char", ch: "x" });
     await km.setHotkey("toggle_pin", combo);
     expect(setHotkeyCalls[0]).toEqual({
       action: "toggle_pin",
       combo: { mods: ["meta"], key: "x" },
+      force: false,
     });
   });
 });
@@ -242,7 +251,7 @@ describe("parseKeyCombo：以物理键 ev.code 判定", () => {
     await km.setHotkey("toggle_pin", combo!);
     // 后端 `CharKind::from_json_str` 按字节长度校验，`"≈"` 会被判非法键
     expect(setHotkeyCalls).toEqual([
-      { action: "toggle_pin", combo: { mods: ["alt"], key: "x" } },
+      { action: "toggle_pin", combo: { mods: ["alt"], key: "x" }, force: false },
     ]);
   });
 
@@ -307,6 +316,51 @@ describe("平台主修饰键规则", () => {
 });
 
 // ---------------------------------------------------------------------------
+// actionOwningCombo — 组合键在表内必须唯一
+// ---------------------------------------------------------------------------
+//
+// 录制路径据此把「已被别的 action 占着」的组合拦下来。判定必须是**结构相等**
+// （mods 集合 + 键 token 都相同），否则会把「同键不同修饰键」误判成冲突；
+// 线格式里 mods 的顺序不做承诺，所以比较前要归一化。
+
+describe("actionOwningCombo：找出已经占着这个组合的 action", () => {
+  it("找到占用者，且 mods 顺序无关（⌥⌘V 与 ⌘⌥V 是同一个）", async () => {
+    const km = await freshKeymap();
+    expect(
+      km.actionOwningCombo({ mods: ["alt", "meta"], key: { kind: "char", ch: "v" } }, "paste"),
+    ).toBe("open_panel");
+    expect(
+      km.actionOwningCombo({ mods: ["meta", "alt"], key: { kind: "char", ch: "v" } }, "paste"),
+    ).toBe("open_panel");
+  });
+
+  it("排除正在改绑的那条：自己占着自己不算冲突", async () => {
+    const km = await freshKeymap();
+    expect(km.actionOwningCombo({ mods: [], key: { kind: "enter" } }, "paste")).toBeNull();
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "e" } }, "edit_note"))
+      .toBeNull();
+  });
+
+  it("mods 与 key 必须都相同：只撞一半不算冲突", async () => {
+    const km = await freshKeymap();
+    // 对照：⌘P 确实是 toggle_pin 的。
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "p" } }, "paste"))
+      .toBe("toggle_pin");
+    // 键同、mods 不同（⇧E 在表里没人占）。
+    expect(km.actionOwningCombo({ mods: ["shift"], key: { kind: "char", ch: "e" } }, "paste"))
+      .toBeNull();
+    // mods 同、键不同（⌘Z 在表里没人占）。
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "z" } }, "paste"))
+      .toBeNull();
+  });
+
+  it("命名键与字符键不互相冒充（enter ≠ 'e'）", async () => {
+    const km = await freshKeymap();
+    expect(km.actionOwningCombo({ mods: [], key: { kind: "char", ch: "e" } }, "paste")).toBeNull();
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "enter" } }, "paste")).toBeNull();
+  });
+});
+
 // 加密区模态内的 keydown（handleVaultKey）
 // ---------------------------------------------------------------------------
 //
@@ -421,6 +475,60 @@ describe("handleVaultKey：加密区模态内的快捷键", () => {
 });
 
 // ---------------------------------------------------------------------------
+// 未绑定（线格式 null）：不参与匹配，也不占着任何组合
+// ---------------------------------------------------------------------------
+
+describe("未绑定的 action", () => {
+  it("线格式 null → 内部 null（不是被丢掉、也不是变成 undefined）", async () => {
+    const km = await freshKeymap({
+      wire: {
+        version: 1,
+        actions: { paste: null, edit_note: { mods: ["meta"], key: "e" } },
+      },
+    });
+    // 显式 null：与「keymap 未加载」的 undefined 是两种状态，键帽文案不同（见 settings.ts）。
+    expect(km.currentKeyMap!.actions.paste).toBeNull();
+    // 同一条线格式里别的 action 照常转换。
+    expect(km.currentKeyMap!.actions.edit_note).toEqual({
+      mods: ["meta"],
+      key: { kind: "char", ch: "e" },
+    });
+  });
+
+  it("不参与 matches（未绑定就没有键能触发它）", async () => {
+    const km = await freshKeymap({
+      wire: {
+        version: 1,
+        actions: { paste: null, edit_note: { mods: ["meta"], key: "e" } },
+      },
+    });
+    expect(km.matches(ev({ key: "Enter", code: "Enter" }))).toBeNull();
+    // 别的 action 不受影响。
+    expect(km.matches(ev({ key: "e", code: "KeyE", metaKey: true }))).toBe("edit_note");
+  });
+
+  it("不再占着它原来的组合：别人可以拿走", async () => {
+    const km = await freshKeymap({ wire: { version: 1, actions: { edit_note: null } } });
+    expect(
+      km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "e" } }, "paste"),
+    ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// setHotkey 的 force 标志（「强行换绑」）
+// ---------------------------------------------------------------------------
+
+describe("setHotkey：force 标志", () => {
+  it("默认不带 force（被占用时后端会拒绝），显式 true 才带上", async () => {
+    const km = await freshKeymap();
+    await km.setHotkey("paste", { mods: ["meta"], key: { kind: "char", ch: "e" } });
+    await km.setHotkey("paste", { mods: ["meta"], key: { kind: "char", ch: "e" } }, true);
+
+    expect(setHotkeyCalls.map((c) => c.force)).toEqual([false, true]);
+  });
+});
+
 // 命名键 token：前后端必须认同一张表（跨语言对照）
 // ---------------------------------------------------------------------------
 

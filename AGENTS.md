@@ -122,8 +122,20 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   它的 `content_hash` 是 salted 变体、永远不匹配明文指纹，回来的是一条**明文**普通条目。
   代价：ClipVault 未运行时复制的内容不再于启动后补录。纯规则抽在 `watcher::initial_change_count`
   里（吃 `Option`），跨平台可单测。
-- **测试基线**：app 223 passed + core 33 passed（合计 256），1 个 trigram 测试 ignored；
-  本轮增量（「删除单条记录」的评审收尾，10 条 finding 全部处理）：app +2
+- **测试基线**：app 230 passed + core 43 passed（合计 273），1 个 trigram 测试 ignored；
+  本轮增量是「快捷键冲突 → 弹框 → 强行换绑 + 未绑定」（plan R14 / R15）：core +6
+  （`clipvault-core/src/keymap.rs` 的 `unbound_action_roundtrips_as_json_null` /
+  `unbound_action_does_not_own_its_old_combo` / `entry_with_null_key_is_still_rejected` /
+  `claim_takes_combo_and_unbinds_owner` / `claim_unbinds_every_other_holder_only` /
+  `claim_on_own_combo_is_noop`）、app +5（`app/src/keymap.rs` 的 `conflict_error_skips_unbound`
+  与 `global_hotkey_changed` 4 条：改面板动作不碰 OS / 改 `open_panel` 自己碰 OS /
+  被抢占解绑时也要碰 OS / 值没变不碰）、前端 +16（弹框的三条出口与换绑失败路径、
+  弹框期间按键不改绑、重开设置把没答完的弹框收掉、抢全局热键时的警告、未绑定的渲染、
+  `force` 标志、未绑定不参与匹配 / 不占组合）。
+  再往前是本 PR 的前半段「重绑到已被占用的组合」：core `conflict_for_*` 4 条（找到占用者 /
+  排除自己与空闲组合 / 默认表本身无重复 / 多条同时占用时取排序靠前那条）与 app 的
+  `conflict_error_*` 2 条（会指名道姓 / 空闲或自己放行）。
+  更早的增量（「删除单条记录」的评审收尾）：app +2
   （`app/src/storage.rs` 的 `delete_entry_handles_vault_row_without_touching_others_fts`、
   `clear_undecryptable_also_removes_tags`）、core +4（`clipvault-core/src/keymap.rs` 的
   `serialize_default_schema_shape` / `parse_rejects_malformed_input` /
@@ -137,18 +149,16 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `last_change_count_is_seeded_with_current_sequence_number`（app +2）与
   `clipvault-core/src/keymap.rs` 的 `default_delete_entry_is_meta_backspace`、
   `default_map_covers_every_action`（core +2）。
-  前端 3 个文件共 43 例 + 1 todo（`npm --prefix frontend test` 覆盖）：
-  `frontend/src/keymap.test.ts` 26 例 + 1 todo（含加密区模态的重绑传导与 `Esc` 逃生口、
-  命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs` 源码，
-  经 Vite 的 `?raw`，不给前端引 `@types/node`）、
-  `frontend/src/settings.test.ts` 10 例（重绑取消后的键帽还原、重建行时不重复绑 /
-  不留隐形监听器、关掉设置面板与等 keymap 的轮询窗口内重绑这两条也不留隐形录制监听器、
-  录制成功 / 失败两条路径、**动作基数与分组**：1 全局 + 13 面板 = 14，与 keymap 的动作集合
-  逐项一致）、`frontend/src/logview.test.ts` 7 例。
   更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
+  前端 3 个文件共 63 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
+  `Esc` 逃生口、命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs`
+  源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 22（其中 11 例钉住
+  「强行换绑」弹框的三条出口与「未绑定」的显示，4 例钉住录制态的收口路径 —— 关掉设置面板、
+  等 keymap 的轮询窗口内重绑、录制成功 / 失败，1 例钉住「1 全局 + 13 面板 = 14」的动作基数
+  与分组）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查

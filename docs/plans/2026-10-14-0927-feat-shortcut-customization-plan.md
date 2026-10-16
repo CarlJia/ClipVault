@@ -64,6 +64,8 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 
 - R12. ClipVault 必须从主面板底部 `.hint` div 完全移除快捷键展示;`styles.css` 移除 `.hint` / `.hint kbd` / `.hint .keycap` / `.hint-note` 样式;保留 `.editor-hint`(编辑器底栏仍需)。
 - R13. ClipVault 必须不引入「快捷键在设置里」的指引条(用户选定完全静默移除)。
+- R14. 组合键在快捷键表内必须 1:1。Carbon / `RegisterHotKey` 只管「全局热键被系统或别的程序占了」,管不到「同一张表里另一条 action 已经占着它」—— 后者放进去是静默的:前端 `matches()` 只派发给排序靠前的那条,另一条永远不触发而它那一行仍显示着这个组合。前端录制路径写库前查表(`actionOwningCombo`),命中则**不直接写库**,而是弹确认框说清占用者与后果;用户选「强行换绑」→ 抢过来(见 R15),选「取消」/`Esc` → 键帽回原绑定、`settings` 表未改。后端 `set_hotkey` 在不带 `force` 时同样拒收(写入口兜底,覆盖前端查不到的路径),`force` 只由用户在弹框里确认后由前端传。已存在的历史重复不自动改写 —— 重绑任一条、或点「重置默认」即可。
+- R15. 快捷键表必须能表示「未绑定」(某个 action 没有键):用户确认「强行换绑」后,原来占着该组合的 action 变成未绑定,而不是两条共用同一个组合。模型上 `HotkeyMap.actions` 的值是 `Option<KeyCombo>`,线格式里该 action 写成 `null`;`conflict_for` 不把未绑定算作占用,前端 `matches()` / `actionOwningCombo` 跳过未绑定。设置里那一行显示「未绑定」,点「重绑」可以重新给它绑一个键。未绑定的若是全局热键 `open_panel`,OS 侧那条也要一并注销(否则界面写着「未绑定」、实际还能按出来);此后面板只能从托盘/菜单栏图标唤出——弹框必须提前把这句警告说出来。
 
 ### Acceptance Examples
 
@@ -71,6 +73,8 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 - AE2. 用户把面板内 `⌘P`(置顶)改成 `⌘T`,选中条目按 `⌘T` → 切换置顶,`⌘P` 不再响应。
 - AE3. 把全局热键改成已被其它程序占用的组合,Toast 提示「被占用」并保持原 binding,settings 表 `hotkeys` 行未改。
 - AE4. 重启 ClipVault,自定义 binding 仍然生效(从 `settings` 表 `hotkeys` 行恢复)。
+- AE5. 用户把 `paste` 重绑成 `edit_note` 已占用的 `⌘E`:弹出确认框,文案说出「`⌘E` 已被「编辑备注 / 标签」占用」以及「强行换绑后「编辑备注 / 标签」会变成「未绑定」」。点「取消」或按 `Esc` → `paste` 仍是 `↩`、`edit_note` 仍是 `⌘E`、`settings` 表未改;点「强行换绑」或按 `Enter` → `paste` 变成 `⌘E`、`edit_note` 那行显示「未绑定」、`settings` 表随之更新。即使绕过前端直呼 `set_hotkey` IPC(不带 `force`),后端也返回 `Err` 且不动库与内存 slot。
+- AE6. 未绑定的 action:`edit_note` 被抢走键位后,按 `⌘E` 触发 `paste`(不再被 `edit_note` 抢走派发),设置里 `edit_note` 那行显示「未绑定」,点它的「重绑」仍可重新绑一个键;重启后未绑定状态保持(线格式里是 `null`)。若被抢的是全局热键 `⌥⌘V`,弹框额外警告「解绑后只能从托盘/菜单栏图标打开面板」,确认后 `⌥⌘V` 不再响应,从托盘仍能唤出面板。
 
 ### Scope Boundaries
 
@@ -78,7 +82,7 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 
 - 1 个全局热键(目前只有 `⌥⌘V`)+ 11 个面板内主要快捷键(`↩` / `↑↓` / `⌘E` / `⌘P` / `⌘L` / `⌘O` / `⌘⇧V` / `⌘⇧G` / `⌘⇧N` / `⌘,` / `esc`)可重绑。
 - 数据驱动 dispatch + 持久化 + 设置 UI + 点击捕获 + 冲突反馈。
-- 冲突检查 = Carbon / `RegisterHotKey` 返回非 0。
+- 冲突检查 = 表内组合键唯一性(前端录制路径查表弹框 + 后端写入口兜底,表内唯一性靠「拒收」或「用户确认后抢占、对方变未绑定」两条路径之一维持)+ Carbon / `RegisterHotKey` 返回非 0。
 
 **Out of scope (本 plan 不做).**
 
@@ -211,7 +215,7 @@ U1 → U2 → U3 → U4 → U5 → U6。U1 是数据基础(必须先),U2 必须�
 2. `KeyCombo { mods: Mods, key: CharKind }`,`Mods` 是 bitflags(`Meta/Ctrl/Alt/Shift`),`CharKind` 是 `Enter / Escape / ArrowUp / ArrowDown / Comma / Backspace / Char(char)`(letter / digit / symbol 都走 `Char`)
 3. `Mods` bit 编号:Meta=0x01 / Shift=0x02 / Alt=0x04 / Ctrl=0x08(与 Carbon 位不对齐,由 `hotkey.rs` 在 register 时翻译)
 4. `HotkeyMap::default_map()` 14 条硬编码条目,字面与现行 keydown 列表 1:1
-5. JSON 格式:`{ "version": 1, "actions": { "open_panel": {"mods":["meta","alt"], "key":"v"}, ... } }`;`version` 字段为未来 schema 演进预留
+5. JSON 格式:`{ "version": 1, "actions": { "open_panel": {"mods":["meta","alt"], "key":"v"}, ... } }`;`version` 字段为未来 schema 演进预留。某条 action 的值写成 `null` 表示**未绑定**(见 R15)—— 与 `{"mods":[],"key":null}` 是两种形状,后者仍是非法 entry(modifier-only)
 6. `parse` 失败 → 返回 `Err`,具体值为哪个字段错;`load_hotkeys` 对 `Err` 时返回 `Ok(default())`,**不**修改库(R3 守得住)
 7. `boot_load_hotkeys(storage, slot)`:读 `hotkeys` 行,parse 失败则保持 slot 默认为 `HotkeyMap::default()`,返回 `bool`(true = 用了库,false = 用了默认)
 

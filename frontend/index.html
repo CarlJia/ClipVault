@@ -156,6 +156,32 @@
             </div>
           </div>
         </div>
+
+        <!-- 「强行换绑」确认弹框。录制到一个已被别的 action 占着的组合时弹出：
+             确认则把它抢过来（原来占着的那条变成「未绑定」），取消则保持原绑定。
+             可嵌套在 #settings 之上（z-index 40），只有这两个出口。 -->
+        <div
+          id="hotkey-confirm"
+          class="editor hidden"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="hotkey-confirm-msg"
+        >
+          <div class="editor-card confirm-card">
+            <div class="editor-head">
+              <span class="editor-title">这个组合已被占用</span>
+            </div>
+            <div class="confirm-msg" id="hotkey-confirm-msg"></div>
+            <div class="confirm-note" id="hotkey-confirm-note"></div>
+            <div class="editor-foot">
+              <span class="editor-hint"><kbd>↵</kbd> 换绑 · <kbd>esc</kbd> 取消</span>
+              <span class="confirm-actions">
+                <button id="hotkey-confirm-cancel" class="banner-btn">取消</button>
+                <button id="hotkey-confirm-ok" class="banner-btn banner-btn-primary">强行换绑</button>
+              </span>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
     <script type="module" src="/src/main.ts"></script>

@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WARN_SVG, type EntryDto } from "./panel";
 import { isWindows, isLinux, keys, whenPlatformReady } from "./platform";
 import {
+  actionOwningCombo,
   currentKeyMap,
   localizedCombo,
   parseKeyCombo,
@@ -361,6 +362,100 @@ let recordingAction: HotkeyAction | null = null;
 /** 当前录制态的 keydown 监听器清理函数。 */
 let recordingCleanup: (() => void) | null = null;
 
+// ---------------------------------------------------------------------------
+// 「强行换绑」确认弹框
+// ---------------------------------------------------------------------------
+
+/** 弹框正在等待的答复；null 表示弹框没开着。 */
+let rebindConfirmResolve: ((ok: boolean) => void) | null = null;
+/** 弹框自己挂在 `document` 上的 keydown 清理函数。 */
+let rebindConfirmCleanup: (() => void) | null = null;
+
+/** 关掉弹框并给出答复；没开着时什么都不做。 */
+function closeForceRebindDialog(ok: boolean): void {
+  if (rebindConfirmCleanup) {
+    rebindConfirmCleanup();
+    rebindConfirmCleanup = null;
+  }
+  document.getElementById("hotkey-confirm")?.classList.add("hidden");
+  const resolve = rebindConfirmResolve;
+  rebindConfirmResolve = null;
+  resolve?.(ok);
+}
+
+/**
+ * 弹出「强行换绑」确认框，返回用户的选择：`true` = 抢过来，`false` = 取消。
+ *
+ * 只有两个出口：`Enter` /「强行换绑」→ true，`Esc` /「取消」→ false。弹框期间不再
+ * 重绑任何键 —— 录制监听器在调用前已由 `cancelRecording()` 收掉，而弹框自己的
+ * keydown 走**捕获相**并 `stopPropagation()`：main.ts 的「设置里按 Esc 关设置」走
+ * 冒泡相，不挡掉的话取消弹框会顺手把整个设置面板一起关掉。
+ *
+ * 导出是为了让 `settings.test.ts` 能直接驱动；生产代码只在录制路径里调用它。
+ */
+export function askForceRebind(
+  action: HotkeyAction,
+  owner: HotkeyAction,
+  combo: KeyCombo,
+): Promise<boolean> {
+  const overlay = document.getElementById("hotkey-confirm");
+  const msgEl = document.getElementById("hotkey-confirm-msg");
+  const noteEl = document.getElementById("hotkey-confirm-note");
+  const okBtn = document.getElementById("hotkey-confirm-ok");
+  if (!overlay || !msgEl || !okBtn) {
+    // DOM 不完整（不该发生）：当作取消 —— 绑定保持不变是最安全的答复。
+    return Promise.resolve(false);
+  }
+
+  // 上一个弹框还没答复（连着重绑两行）→ 先按「取消」收掉，免得两个 resolver 打架。
+  closeForceRebindDialog(false);
+
+  const comboText = comboLabel(combo);
+  msgEl.textContent =
+    `${comboText} 已被「${ACTION_LABELS[owner]}」占用。` +
+    `强行换绑后，「${ACTION_LABELS[owner]}」会变成「未绑定」，` +
+    `「${ACTION_LABELS[action]}」改用 ${comboText}。`;
+  if (noteEl) {
+    // 被抢的是全局热键的键位：解绑后连面板都唤不出来（只剩托盘/菜单栏图标这条路）。
+    noteEl.textContent =
+      owner === "open_panel"
+        ? `注意：「${ACTION_LABELS.open_panel}」是全局热键，解绑后只能从托盘/菜单栏图标打开面板，可以之后再单独给它绑一个键。`
+        : "";
+  }
+
+  overlay.classList.remove("hidden");
+  okBtn.focus();
+
+  const onKeyDown = (ev: KeyboardEvent): void => {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeForceRebindDialog(false);
+      return;
+    }
+    if (ev.key === "Enter") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeForceRebindDialog(true);
+    }
+  };
+  document.addEventListener("keydown", onKeyDown, { capture: true });
+  rebindConfirmCleanup = () => document.removeEventListener("keydown", onKeyDown, { capture: true });
+
+  return new Promise<boolean>((resolve) => {
+    rebindConfirmResolve = resolve;
+  });
+}
+
+// 两个按钮常驻在 index.html（不随行的 innerHTML 重建），与 #hotkey-reset 同理在模块
+// 作用域绑一次 —— 放进 askForceRebind() 里会让每开一次弹框多绑一个监听器。
+document.getElementById("hotkey-confirm-ok")?.addEventListener("click", () => {
+  closeForceRebindDialog(true);
+});
+document.getElementById("hotkey-confirm-cancel")?.addEventListener("click", () => {
+  closeForceRebindDialog(false);
+});
+
 /**
  * 设置模态是否已经关掉（`#settings` 带上 `hidden`）。
  *
@@ -428,6 +523,32 @@ export function startRecording(action: HotkeyAction): void {
     const combo = parseKeyCombo(ev);
     if (!combo) return;
 
+    // 表内冲突：这个组合已经被另一条 action 占着。写进去不会报错（后端只查语法与
+    // 全局热键的 OS 注册），但两条 action 同组合时 `matches()` 只会派发给排序靠前的
+    // 那条 —— 另一条从此永远不触发，而它那一行仍然显示着这个组合（把 `paste` 改成
+    // `⌘E` 之后，旧的 `↩` 没了、新的 `⌘E` 又永远不灵，回贴快捷键实际失效）。
+    // 处理：先收掉录制态（弹框期间不该还能改绑），再让用户选 —— 确认则「强行换绑」：
+    // 组合归本行，原来占着它的那条变成「未绑定」（后端 `HotkeyMap::claim`）；
+    // 取消则什么都不写，键帽回到原绑定。
+    const owner = actionOwningCombo(combo, action);
+    if (owner) {
+      cancelRecording();
+      void (async () => {
+        if (!(await askForceRebind(action, owner, combo))) return; // 取消：绑定不变
+        const result = await setHotkey(action, combo, true);
+        if (result.ok) await reloadKeymap();
+        // 顺序同下面那条路径：reload 在前、重画在后，键帽不会先回旧值再切到新值。
+        // 强行换绑会同时改两行（抢到的那行 + 变成「未绑定」的那行），故整区重画。
+        refreshAllRows();
+        showToast(
+          result.ok
+            ? `已强行换绑：「${ACTION_LABELS[owner]}」变成未绑定，「${ACTION_LABELS[action]}」改用 ${comboLabel(combo)}`
+            : `换绑失败：${result.err}，已保留原绑定`,
+        );
+      })();
+      return;
+    }
+
     void (async () => {
       const result = await setHotkey(action, combo);
       // 顺序：成功路径必须 reloadKeymap() 在前、cancelRecording() 在后 —— 后者里的
@@ -461,8 +582,10 @@ export function cancelRecording(): void {
   }
 }
 
-/** 键帽文本。绑定取不到（keymap 尚未加载）时用与 `renderRow` 同一个占位符。 */
-function comboLabel(combo: KeyCombo | undefined): string {
+/** 键帽文本。三种状态：有绑定 → 平台化组合键；未绑定（`null`）→「未绑定」；
+ * keymap 尚未加载（`undefined`）→ 与 `renderRow` 同一个占位符。 */
+function comboLabel(combo: KeyCombo | null | undefined): string {
+  if (combo === null) return "未绑定";
   return combo ? localizedCombo(combo) : "—";
 }
 
@@ -478,6 +601,16 @@ function refreshRow(action: HotkeyAction): void {
   const kbd = row.querySelector<HTMLElement>(".hotkey-row-combo kbd");
   if (!kbd) return;
   kbd.textContent = comboLabel(currentKeyMap?.actions[action]);
+}
+
+/**
+ * 重画每一行的键帽。
+ *
+ * 强行换绑会同时改两行（抢到组合的那行 + 变成「未绑定」的那行），逐行 `refreshRow`
+ * 容易只刷一半 —— 行的显示只有一个来源，整区重画最省事也最不容易漏。
+ */
+function refreshAllRows(): void {
+  for (const action of [...GLOBAL_ACTIONS, ...PANEL_ACTIONS]) refreshRow(action);
 }
 
 /**
@@ -523,7 +656,11 @@ export async function renderHotkeysSection(): Promise<void> {
   // 「按任意键悄悄改绑」的隐形状态。清理要贴着 innerHTML，不能放在上面那段轮询之前 ——
   // 轮询最长 1s（keymap 拉不到时走满 20 次），这 1s 内点「重绑」照样会留下一份隐形
   // 监听器：新行没有 `recording` 态，而 recordingAction 还指着它。
+  //
+  // 「强行换绑」弹框同理一起收掉（它的待答组合来自上一轮的行），也贴着 innerHTML：
+  // 弹框的 promise 在轮询窗口里悬着的话，用户看到的是一行已经被替换掉的行。
   cancelRecording();
+  closeForceRebindDialog(false);
 
   globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
   panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");

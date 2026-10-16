@@ -4,6 +4,8 @@
 //!
 //! `register(app, action: HotkeyAction, combo: &KeyCombo) -> Result<(), ConflictReason>`
 //! 接受显式 `KeyCombo`，失败时返回 `ConflictReason`。
+//! `unregister(action)` 摘掉某个 action 的热键（该 action 变成「未绑定」时用），
+//! `unregister_all()` 清空（应用退出路径）。
 //!
 //! macOS：`Mutex<Vec<(EventHotKeyRef, EventHotKeyID, HotkeyAction)>>` 支持多 hotkey，
 //! 通过 `EventHotKeyID.id` 路由。`unregister_all()` 遍历注销。
@@ -456,6 +458,28 @@ mod imp {
         }
     }
 
+    /// 注销某个 action 的全局热键（该 action 变成「未绑定」时走这里）。
+    ///
+    /// 与 [`register`] 同一条纪律：取旧条目与改真值表在锁内，`UnregisterEventHotKey`
+    /// 在锁外；没有该 action 的条目时不做任何事。
+    pub fn unregister(action: HotkeyAction) {
+        let old_refs: Vec<EventHotKeyRef> = {
+            let mut hotkeys = HOTKEYS.lock().unwrap();
+            let old: Vec<EventHotKeyRef> = hotkeys
+                .iter()
+                .filter(|(_, _, a, _)| *a == action)
+                .map(|(r, _, _, _)| r.0)
+                .collect();
+            hotkeys.retain(|(_, _, a, _)| *a != action);
+            old
+        };
+        for old in old_refs {
+            unsafe {
+                UnregisterEventHotKey(old);
+            }
+        }
+    }
+
     // ---- Accessibility ----
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -501,7 +525,7 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{check_accessibility, register, unregister_all};
+pub use imp::{check_accessibility, register, unregister, unregister_all};
 
 // ---------------------------------------------------------------------------
 // KeyCombo → Win32 平台翻译（U2）
@@ -824,6 +848,23 @@ mod imp_win {
         *REGISTERED.lock().unwrap() = None;
     }
 
+    /// 注销某个 action 的热键（该 action 变成「未绑定」时走这里）。
+    ///
+    /// 与 [`register`] 同形：先在真值表里摘掉，再 fire-and-forget 注销旧 id；
+    /// 没有该 action 时不做任何事（不启动 pump）。
+    pub fn unregister(action: HotkeyAction) {
+        let old_id = {
+            let mut registered = REGISTERED.lock().unwrap();
+            match registered.as_mut() {
+                Some(map) => map.remove(&action).map(|(id, _)| id),
+                None => None,
+            }
+        };
+        if let Some(id) = old_id {
+            unregister_id(id);
+        }
+    }
+
     /// 消息泵主体：在子线程中运行，接收主线程发来的 PumpMsg 并执行。
     fn run_pump(on_hotkey: HotkeyCallback, ready_tx: mpsc::Sender<Result<(), String>>) {
         // channel 用来接收主线程的 PumpMsg。
@@ -946,7 +987,7 @@ mod imp_win {
 }
 
 #[cfg(target_os = "windows")]
-pub use imp_win::{check_accessibility, register, unregister_all};
+pub use imp_win::{check_accessibility, register, unregister, unregister_all};
 
 // ---- 其余平台：no-op 降级，保证跨平台可编译 ----
 
@@ -963,6 +1004,10 @@ pub fn register(
 /// 其余平台：注销所有热键（no-op）。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn unregister_all() {}
+
+/// 其余平台：注销单个 action 的热键（no-op）。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn unregister(_action: clipvault_core::keymap::HotkeyAction) {}
 
 /// 其余平台：无 Accessibility 概念，视为已授权。
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]

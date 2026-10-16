@@ -9,9 +9,15 @@
 // 再绑一个监听器；进行中的录制态在重建行时不清理，会留下「按任意键就悄悄改绑」的
 // 隐形 keydown 监听器。
 //
-// 最后两条收的是同一个根因（录制态监听器挂在 `document` 上）漏掉的两条路径：关掉设置
-// 面板没有收掉录制态，用户回到列表敲的第一个字符被吞掉并静默改绑；重建行与取消录制
-// 之间还隔着等 keymap 的轮询窗口，窗口里点「重绑」照样留下一份隐形监听器。
+// 末尾两组收的都是「录制态监听器挂在 `document` 上」这条根因剩下的静默路径：
+//
+// 1. **关掉设置面板 / 重建行的窗口**：关掉设置没有收掉录制态，用户回到列表敲的第一个
+//    字符被吞掉并静默改绑；重建行与取消录制之间还隔着等 keymap 的轮询窗口，窗口里点
+//    「重绑」照样留下一份隐形监听器。
+// 2. **录到的组合已经被另一条 action 占着**：写进去不会报错（后端只查语法与全局热键的
+//    OS 注册），但 `matches()` 只会派发给排序靠前的那条 —— 另一条永远不触发，而它那一
+//    行还显示着这个组合。处理是弹框让用户选：确认 = 强行换绑（原来占着它的那条变成
+//    「未绑定」），取消 = 什么都不写。
 //
 // 另有录制**成功 / 失败**两条：按下新组合键 → set_hotkey →（成功时 reloadKeymap）→ cancelRecording。
 // 两条此前都只有人工验收 —— 成功那条钉的是顺序（reload 必须在 cancel 之前，否则 refreshRow
@@ -44,6 +50,11 @@ class FakeEl {
 
   constructor(text = "") {
     this.textContent = text;
+  }
+
+  /** `askForceRebind` 打开弹框时会把焦点给「强行换绑」按钮。 */
+  focus(): void {
+    /* noop */
   }
 }
 
@@ -125,17 +136,26 @@ const ALL_ACTIONS: HotkeyAction[] = ["open_panel", ...PANEL_ACTIONS];
 interface FakeDom {
   rows: Map<string, FakeRow>;
   resetBtn: FakeButton;
+  /** 快捷键列表容器（`renderRow` 的产物写在 `innerHTML` 里，只做文本断言）。 */
+  globalList: FakeList;
+  panelList: FakeList;
   /** `#settings` 模态替身：`classList.add("hidden")` = 用户关掉了设置。 */
   settingsModal: FakeEl;
-  /** `#toast` 替身：失败的录制会往这里写提示。 */
+  /** `#toast` 替身：重绑 / 换绑失败会往这里写提示。 */
   toast: FakeEl;
+  /** 「强行换绑」弹框：遮罩 + 文案 + 两个按钮。 */
+  confirmOverlay: FakeEl;
+  confirmMsg: FakeEl;
+  confirmNote: FakeEl;
+  confirmOk: FakeButton;
+  confirmCancel: FakeButton;
   document: {
     querySelector: (sel: string) => FakeEl | null;
     getElementById: (id: string) => FakeEl | null;
     addEventListener: (type: string, fn: EventListener) => void;
     removeEventListener: (type: string, fn: EventListener) => void;
   };
-  /** 当前挂在 `document` 上的 keydown 监听器（录制态注册的那一个）。 */
+  /** 当前挂在 `document` 上的 keydown 监听器（录制态或弹框态注册的那一个）。 */
   keydownListeners: () => EventListener[];
 }
 
@@ -144,13 +164,26 @@ function makeDom(): FakeDom {
   const resetBtn = new FakeButton("重置默认");
   const settingsModal = new FakeEl();
   const toast = new FakeEl();
+  const globalList = new FakeList(["open_panel"], rows);
+  const panelList = new FakeList(PANEL_ACTIONS, rows);
+  const confirmOverlay = new FakeEl();
+  confirmOverlay.classList.add("hidden"); // index.html 里初始就是 hidden
+  const confirmMsg = new FakeEl();
+  const confirmNote = new FakeEl();
+  const confirmOk = new FakeButton("强行换绑");
+  const confirmCancel = new FakeButton("取消");
   const byId = new Map<string, FakeEl>([
     ["settings", settingsModal],
     ["toast", toast],
     ["hotkey-group-global", new FakeEl()],
-    ["hotkey-list-global", new FakeList(["open_panel"], rows)],
-    ["hotkey-list-panel", new FakeList(PANEL_ACTIONS, rows)],
+    ["hotkey-list-global", globalList],
+    ["hotkey-list-panel", panelList],
     ["hotkey-reset", resetBtn],
+    ["hotkey-confirm", confirmOverlay],
+    ["hotkey-confirm-msg", confirmMsg],
+    ["hotkey-confirm-note", confirmNote],
+    ["hotkey-confirm-ok", confirmOk],
+    ["hotkey-confirm-cancel", confirmCancel],
   ]);
   let keydown: EventListener[] = [];
   const document = {
@@ -166,7 +199,21 @@ function makeDom(): FakeDom {
       if (type === "keydown") keydown = keydown.filter((f) => f !== fn);
     },
   };
-  return { rows, resetBtn, settingsModal, toast, document, keydownListeners: () => keydown };
+  return {
+    rows,
+    resetBtn,
+    globalList,
+    panelList,
+    settingsModal,
+    toast,
+    confirmOverlay,
+    confirmMsg,
+    confirmNote,
+    confirmOk,
+    confirmCancel,
+    document,
+    keydownListeners: () => keydown,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -194,39 +241,72 @@ const DEFAULT_WIRE = {
   },
 };
 
-/** 最近一次 `freshSettings()` 装上的 IPC 替身：用来断言「没有发生静默改绑」。 */
-let invokeMock: ReturnType<typeof vi.fn>;
+/** 线格式 combo（`key` 为字符串）；`null` 整条 = 该 action 未绑定。 */
+type WireCombo = { mods: string[]; key: string } | null;
 
-/** `get_hotkeys` 当下要返回的线格式。改它 = 模拟后端已经写入新绑定。 */
-let wireToReturn: unknown = DEFAULT_WIRE;
+/** `set_hotkey` 收到的 IPC 入参（时间序）—— 用来断言「被拦下的重绑一次都没写库」。 */
+let setHotkeyCalls: Array<{
+  action: string;
+  combo: { mods: string[]; key: string };
+  force: boolean | undefined;
+}>;
 
-/** 非 null 时 `set_hotkey` 抛这个错误 = 模拟后端拒绝这次改绑。 */
-let setHotkeyError: string | null = null;
+/** `get_hotkeys` 当前会返回的线格式状态；`set_hotkey` 成功时像后端一样改动它。 */
+let wire: { version: number; actions: Record<string, WireCombo> };
 
-/** 后端写入新绑定之后的线格式：`paste` 由 Enter 改成 ⇧⌘K。 */
-const NEW_WIRE = {
-  version: 1,
-  actions: {
-    ...DEFAULT_WIRE.actions,
-    paste: { mods: ["meta", "shift"], key: "k" },
-  },
-};
-async function freshSettings(): Promise<typeof import("./settings")> {
+/** `mods` 是两个集合（顺序无关）：按固定顺序拼成 token 再比。 */
+function modsToken(mods: string[]): string {
+  return ["meta", "shift", "alt", "ctrl"].filter((m) => mods.includes(m)).join("+");
+}
+
+/** 取一份全新的 settings 模块（模块级录制态 / 弹框态不能跨用例复用）。
+ *  `failSetHotkey` 传一个字符串 = 模拟后端拒绝这次改绑，这个字符串就是错误文案。 */
+async function freshSettings(
+  options: {
+    wire?: { version: number; actions: Record<string, WireCombo> };
+    failSetHotkey?: string;
+  } = {},
+): Promise<typeof import("./settings")> {
   vi.resetModules();
-  const invoke = vi.fn(async (cmd: string) => {
-    switch (cmd) {
-      case "platform_info":
-        return { os: "macos" };
-      case "get_hotkeys":
-        return JSON.stringify(wireToReturn);
-      case "set_hotkey":
-        if (setHotkeyError !== null) throw setHotkeyError;
-        return undefined;
-      default:
-        return undefined;
-    }
-  });
-  invokeMock = invoke;
+  setHotkeyCalls = [];
+  wire = options.wire ?? (JSON.parse(JSON.stringify(DEFAULT_WIRE)) as typeof wire);
+  const invoke = vi.fn(
+    async (
+      cmd: string,
+      args?: {
+        action: string;
+        combo: { mods: string[]; key: string };
+        force?: boolean;
+      },
+    ) => {
+      switch (cmd) {
+        case "platform_info":
+          return { os: "macos" };
+        case "get_hotkeys":
+          return JSON.stringify(wire);
+        case "set_hotkey": {
+          if (!args) return undefined;
+          setHotkeyCalls.push({ action: args.action, combo: args.combo, force: args.force });
+          if (options.failSetHotkey !== undefined) throw options.failSetHotkey;
+          // 像后端一样落库：force 时把原来占着这个组合的其它 action 解绑（`claim`）。
+          for (const [action, bound] of Object.entries(wire.actions)) {
+            if (
+              action !== args.action &&
+              bound &&
+              modsToken(bound.mods) === modsToken(args.combo.mods) &&
+              bound.key === args.combo.key
+            ) {
+              wire.actions[action] = null;
+            }
+          }
+          wire.actions[args.action] = args.combo;
+          return undefined;
+        }
+        default:
+          return undefined;
+      }
+    },
+  );
   vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
   vi.stubGlobal("window", {
     setTimeout: globalThis.setTimeout,
@@ -250,8 +330,6 @@ function seedRow(dom: FakeDom, action: string, comboText: string): FakeRow {
 beforeEach(() => {
   vi.resetModules();
   vi.unstubAllGlobals();
-  wireToReturn = DEFAULT_WIRE;
-  setHotkeyError = null;
 });
 
 describe("录制态取消：键帽必须回到当前绑定", () => {
@@ -383,7 +461,7 @@ describe("设置面板关掉后录制态必须失效", () => {
     // 修复前 `a` 会被吞掉（preventDefault）并写成 paste 的新绑定。
     expect(prevented).toBe(false);
     expect(stopped).toBe(false);
-    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "set_hotkey")).toHaveLength(0);
+    expect(setHotkeyCalls).toHaveLength(0);
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(row.kbd.textContent).toBe("↩");
     expect(row.btn.textContent).toBe("重绑");
@@ -419,7 +497,6 @@ describe("录制成功：按下新组合键", () => {
     vi.stubGlobal("document", dom.document);
     const { startRecording } = await freshSettings();
     const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
-    wireToReturn = NEW_WIRE; // set_hotkey 之后 get_hotkeys 会读到的新绑定
 
     startRecording("paste");
     const { prevented } = pressRecordedKey(dom);
@@ -427,12 +504,13 @@ describe("录制成功：按下新组合键", () => {
     // 录制态先吞掉这一下（它就是被录进去的那一下），再把组合键交给 IPC。
     expect(prevented).toBe(true);
     // 等 set_hotkey → reloadKeymap → cancelRecording 这条链跑完。
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flush();
 
-    expect(invokeMock).toHaveBeenCalledWith("set_hotkey", {
-      action: "paste",
-      combo: { mods: ["meta", "shift"], key: "k" },
-    });
+    // ⇧⌘K 没被别的 action 占着 → 走普通路径（`force` 为 false），替身像后端一样落库，
+    // 所以这一条同时覆盖「IPC 拿到新组合」与「reloadKeymap 读到的就是新绑定」。
+    expect(setHotkeyCalls).toEqual([
+      { action: "paste", combo: { mods: ["meta", "shift"], key: "k" }, force: false },
+    ]);
     // 顺序护栏：refreshRow 必须读到 reload 之后的新 keymap —— 反过来（先 cancel 再
     // reload）会把旧值「↩」写回键帽，再也没人纠正它。
     expect(row.kbd.textContent).toBe("⌘+⇧+K");
@@ -448,14 +526,15 @@ describe("录制失败：后端拒绝这次改绑", () => {
   it("键帽回退到原绑定并给出提示，录制态一样收干净", async () => {
     const dom = makeDom();
     vi.stubGlobal("document", dom.document);
-    const { startRecording } = await freshSettings();
+    const { startRecording } = await freshSettings({
+      failSetHotkey: "unrecognised key '≈'", // 后端拒绝（`wire` 不变 = 库里没改）
+    });
     const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
-    setHotkeyError = "unrecognised key '≈'"; // 后端拒绝（wireToReturn 不变 = 库里没改）
 
     startRecording("paste");
     const { prevented } = pressRecordedKey(dom);
     expect(prevented).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 0));
+    await flush();
 
     // 写库失败 → 不 reload → 键帽回到库里那一份（旧绑定），而不是刚按下的组合。
     expect(row.kbd.textContent).toBe("↩");
@@ -463,6 +542,294 @@ describe("录制失败：后端拒绝这次改绑", () => {
     expect(row.btn.textContent).toBe("重绑");
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.toast.textContent).toBe("重绑失败：unrecognised key '≈'，已回退到原绑定");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 表内冲突：重绑到另一条 action 已经占着的组合
+// ---------------------------------------------------------------------------
+//
+// 组合键在表里必须唯一：两条 action 共用一个组合时，`matches()` 只会派发给序列化
+// 排序（按 action 名）靠前的那条，另一条从此永远不触发 —— 而设置里那一行仍然显示着
+// 这个组合（`paste` 改成 `⌘E` 之后，旧的 `↩` 没了、新的 `⌘E` 又永远不灵，回贴快捷键
+// 实际失效，界面却不这么说）。
+//
+// 处理是「弹框让用户选」：确认 = 强行换绑（组合归本行，原来占着它的那条变成「未绑定」），
+// 取消 = 什么都不写、键帽回原绑定。写入的 `force` 标志只有在用户确认后才为 true。
+
+/** 把一次按键派发给**当前最后一个** document keydown 监听器（录制态或弹框态挂的那个），
+ *  并回报它有没有 `preventDefault` / `stopPropagation`。 */
+function pressKey(
+  dom: FakeDom,
+  init: { key: string; code: string; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean },
+): { prevented: boolean; stopped: boolean } {
+  const listeners = dom.keydownListeners();
+  const onKeyDown = listeners[listeners.length - 1];
+  let prevented = false;
+  let stopped = false;
+  onKeyDown({
+    key: init.key,
+    code: init.code,
+    metaKey: init.metaKey ?? false,
+    shiftKey: init.shiftKey ?? false,
+    altKey: init.altKey ?? false,
+    ctrlKey: false,
+    preventDefault: () => {
+      prevented = true;
+    },
+    stopPropagation: () => {
+      stopped = true;
+    },
+  } as unknown as KeyboardEvent);
+  return { prevented, stopped };
+}
+
+/** 让挂起的 IPC 链（setHotkey → reloadKeymap → 重画）跑完。 */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+describe("重绑到已被占用的组合：弹框让用户选", () => {
+  it("弹出确认框，说出占用者与后果；不写库、键帽不变", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const pasteRow = seedRow(dom, "paste", "↩");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+
+    // 修复前：这一次照样发给 set_hotkey，两行同时显示 ⌘E，没有任何提示。
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(false);
+    expect(dom.confirmMsg.textContent).toBe(
+      "⌘+E 已被「编辑备注 / 标签」占用。强行换绑后，「编辑备注 / 标签」会变成「未绑定」，「粘贴选中条目」改用 ⌘+E。",
+    );
+    expect(dom.confirmNote.textContent).toBe(""); // 占用者不是全局热键 → 没有额外警告
+    expect(pasteRow.kbd.textContent).toBe("↩");
+    expect(editRow.kbd.textContent).toBe("⌘+E");
+    expect(pasteRow.btn.textContent).toBe("重绑");
+    expect(pasteRow.classList.contains("recording")).toBe(false);
+  });
+
+  it("弹框期间按别的键不会改绑（录制监听器已收掉）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const pasteRow = seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true }); // 撞上 edit_note 的 ⌘E
+    pressKey(dom, { key: "k", code: "KeyK", metaKey: true }); // ⌘K 是空闲的
+
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(pasteRow.kbd.textContent).toBe("↩");
+  });
+
+  it("点「取消」：不写库、键帽不变、弹框收掉、无 toast", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const pasteRow = seedRow(dom, "paste", "↩");
+    seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    dom.confirmCancel.clickListeners[0]({} as Event);
+    await flush();
+
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(pasteRow.kbd.textContent).toBe("↩");
+    expect(dom.toast.textContent).toBe("");
+  });
+
+  it("按 Esc 取消：弹框收掉、不写库，且事件被 stopPropagation（不连带关掉设置面板）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "paste", "↩");
+    seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    const { prevented, stopped } = pressKey(dom, { key: "Escape", code: "Escape" });
+    await flush();
+
+    // main.ts 的「设置里按 Esc 关设置」在冒泡相，靠这两个标志挡在外面。
+    expect(prevented).toBe(true);
+    expect(stopped).toBe(true);
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.keydownListeners()).toHaveLength(0); // 弹框监听器也摘掉了
+  });
+
+  it("按 Enter 确认：以 force=true 抢占，抢到的有键、被抢的显示「未绑定」", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const pasteRow = seedRow(dom, "paste", "↩");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    pressKey(dom, { key: "Enter", code: "Enter" });
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([
+      { action: "paste", combo: { mods: ["meta"], key: "e" }, force: true },
+    ]);
+    expect(pasteRow.kbd.textContent).toBe("⌘+E");
+    expect(editRow.kbd.textContent).toBe("未绑定");
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
+    expect(dom.toast.textContent).toBe(
+      "已强行换绑：「编辑备注 / 标签」变成未绑定，「粘贴选中条目」改用 ⌘+E",
+    );
+    expect(dom.keydownListeners()).toHaveLength(0);
+  });
+
+  it("点「强行换绑」按钮：同样以 force=true 写入", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "paste", "↩");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    dom.confirmOk.clickListeners[0]({} as Event);
+    await flush();
+
+    expect(setHotkeyCalls[0].force).toBe(true);
+    expect(editRow.kbd.textContent).toBe("未绑定");
+  });
+
+  it("抢全局热键的键位：额外警告，确认后那行显示「未绑定」", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const panelRow = seedRow(dom, "open_panel", "⌘+⌥+V");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("edit_note");
+    pressKey(dom, { key: "v", code: "KeyV", metaKey: true, altKey: true });
+
+    expect(dom.confirmMsg.textContent).toBe(
+      "⌘+⌥+V 已被「唤出主面板」占用。强行换绑后，「唤出主面板」会变成「未绑定」，「编辑备注 / 标签」改用 ⌘+⌥+V。",
+    );
+    // 解绑全局热键 = 面板只剩托盘/菜单栏图标能唤出，必须说出来。
+    expect(dom.confirmNote.textContent).toContain("全局热键");
+
+    dom.confirmOk.clickListeners[0]({} as Event);
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([
+      { action: "edit_note", combo: { mods: ["meta", "alt"], key: "v" }, force: true },
+    ]);
+    expect(editRow.kbd.textContent).toBe("⌘+⌥+V");
+    expect(panelRow.kbd.textContent).toBe("未绑定");
+  });
+
+  it("全局热键想拿面板动作（⌘E）的键位：一样弹框，确认后面板那行变成未绑定", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const panelRow = seedRow(dom, "open_panel", "⌘+⌥+V");
+    const pasteRow = seedRow(dom, "paste", "↩");
+
+    startRecording("open_panel");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(false);
+    expect(dom.confirmMsg.textContent).toContain("「编辑备注 / 标签」");
+    expect(setHotkeyCalls).toHaveLength(0);
+
+    dom.confirmOk.clickListeners[0]({} as Event);
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([
+      { action: "open_panel", combo: { mods: ["meta"], key: "e" }, force: true },
+    ]);
+    expect(panelRow.kbd.textContent).toBe("⌘+E");
+    expect(pasteRow.kbd.textContent).toBe("↩"); // 被抢的是 edit_note，paste 不受影响
+    expect(dom.rows.get("edit_note")!.kbd.textContent).toBe("未绑定");
+  });
+
+  it("换绑（force）失败：toast 说清楚，两行键帽都不动", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings({ failSetHotkey: "boom" });
+    const pasteRow = seedRow(dom, "paste", "↩");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    dom.confirmOk.clickListeners[0]({} as Event);
+    await flush();
+
+    expect(setHotkeyCalls[0].force).toBe(true);
+    expect(dom.toast.textContent).toBe("换绑失败：boom，已保留原绑定");
+    expect(pasteRow.kbd.textContent).toBe("↩");
+    expect(editRow.kbd.textContent).toBe("⌘+E");
+  });
+
+  it("重开设置时把没答完的弹框按「取消」收掉（不会事后偷偷写库）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording, renderHotkeysSection } = await freshSettings();
+    seedRow(dom, "paste", "↩");
+    seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(false);
+
+    await renderHotkeysSection(); // 重建行 → 弹框先被收掉
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
+
+    dom.confirmOk.clickListeners[0]({} as Event); // 事后点确认不该再改任何东西
+    await flush();
+    expect(setHotkeyCalls).toHaveLength(0);
+  });
+
+  it("重绑成自己当前的组合：放行（不该被自己的旧值挡住）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    pressKey(dom, { key: "Enter", code: "Enter" });
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([
+      { action: "paste", combo: { mods: [], key: "enter" }, force: false },
+    ]);
+    expect(dom.toast.textContent).toBe("");
+    expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 未绑定（`null`）：行显示成「未绑定」，不是占位符「—」
+// ---------------------------------------------------------------------------
+
+describe("未绑定的行", () => {
+  it("渲染成「未绑定」（「—」留给 keymap 还没加载的状态）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { renderHotkeysSection } = await freshSettings({
+      wire: {
+        version: 1,
+        actions: { ...DEFAULT_WIRE.actions, paste: null },
+      },
+    });
+
+    await renderHotkeysSection();
+
+    expect(dom.panelList.innerHTML).toContain("<kbd>未绑定</kbd>");
+    expect(dom.panelList.innerHTML).not.toContain("<kbd>—</kbd>");
   });
 });
 

@@ -205,7 +205,11 @@ impl HotkeyAction {
         }
     }
 
-    fn json_key(&self) -> &'static str {
+    /// action → 线格式键名（[`HotkeyAction::from_json_str`] 的逆）。
+    ///
+    /// 公开是为了让写入口的错误信息能指名道姓（`app/src/keymap.rs` 的
+    /// `combo_conflict_error`）—— core 里没有中文标签表，也不该为一条兜底提示复制一份。
+    pub fn json_key(&self) -> &'static str {
         match self {
             HotkeyAction::OpenPanel => "open_panel",
             HotkeyAction::Paste => "paste",
@@ -227,13 +231,17 @@ impl HotkeyAction {
 
 /// Action → KeyCombo 全量映射表。
 ///
+/// 每个 action 的值是 `Option<KeyCombo>` —— `None` 表示**未绑定**（这条 action 没有
+/// 快捷键）。用户明确选「强行换绑」（[`HotkeyMap::claim`]）时，被抢走组合的那条会
+/// 变成 `None`，而不是让两条 action 共用同一个组合。
+///
 /// **不** 派生 `Default` —— `HashMap` 的派生 Default 产生空表，而本类型的"默认"
-/// 含义是 [`default_map`] 提供的 14 条硬编码条目。`parse` 路径从 default_map 出发、
-/// 缺失字段保留默认值；如果本类型有 `Default::default()`，调用方很容易拿到空表。
-/// 调用方请使用 [`HotkeyMap::default_map`].
+/// 含义是 [`default_map`] 提供的 14 条硬编码条目（14 条都有键，没有 `None`）。
+/// `parse` 路径从 default_map 出发、缺失字段保留默认值；如果本类型有
+/// `Default::default()`，调用方很容易拿到空表。调用方请使用 [`HotkeyMap::default_map`].
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HotkeyMap {
-    pub actions: std::collections::HashMap<HotkeyAction, KeyCombo>,
+    pub actions: std::collections::HashMap<HotkeyAction, Option<KeyCombo>>,
 }
 
 impl HotkeyMap {
@@ -242,103 +250,145 @@ impl HotkeyMap {
         let mut actions = std::collections::HashMap::new();
         actions.insert(
             HotkeyAction::OpenPanel,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META | Mods::ALT,
                 key: CharKind::Char('v'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::Paste,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::empty(),
                 key: CharKind::Enter,
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::EditNote,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Char('e'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::TogglePin,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Char('p'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::MoveToVault,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Char('l'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::DeleteEntry,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Backspace,
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::OpenUrl,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Char('o'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::OpenVault,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META | Mods::SHIFT,
                 key: CharKind::Char('v'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::ToggleGuestMode,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META | Mods::SHIFT,
                 key: CharKind::Char('g'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::SkipOnce,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META | Mods::SHIFT,
                 key: CharKind::Char('n'),
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::OpenSettings,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Comma,
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::Close,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::empty(),
                 key: CharKind::Escape,
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::MoveUp,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::empty(),
                 key: CharKind::ArrowUp,
-            },
+            }),
         );
         actions.insert(
             HotkeyAction::MoveDown,
-            KeyCombo {
+            Some(KeyCombo {
                 mods: Mods::empty(),
                 key: CharKind::ArrowDown,
-            },
+            }),
         );
         HotkeyMap { actions }
+    }
+
+    /// 除 `action` 之外，表里有没有别的 action 已经占着 `combo`。
+    ///
+    /// 组合键在表里必须唯一：两条 action 共用同一个组合时，前端 `matches()` 只会派发给
+    /// [`serialize`] 排序（`BTreeMap`，按 action 名）靠前的那条，另一条从此永远不触发
+    /// —— 而设置里那一行仍然显示着这个组合。写入口（`set_hotkey`）据此拒绝重绑。
+    ///
+    /// 返回**排序靠前**的那一条，也就是前端真正会拿到派发的那条；多条同时占用时结果
+    /// 因此是确定的（`HashMap` 的迭代顺序不承诺稳定，不能直接 `find`）。
+    ///
+    /// 「未绑定」（`None`）的条目不算占用 —— 没有键就抢不走任何键。
+    ///
+    /// 注意：只排除 `action` 自己，不做「全表查重」—— 库里可能已经存在历史重复（这个
+    /// 校验出现之前写进去的），全表查重会让用户连改别的快捷键都做不了。
+    pub fn conflict_for(&self, action: HotkeyAction, combo: KeyCombo) -> Option<HotkeyAction> {
+        let mut owners: Vec<HotkeyAction> = self
+            .actions
+            .iter()
+            .filter(|(a, c)| **a != action && **c == Some(combo))
+            .map(|(a, _)| *a)
+            .collect();
+        owners.sort_by_key(|a| a.json_key());
+        owners.first().copied()
+    }
+
+    /// 强行换绑：把 `combo` 归给 `action`，并把表里所有正占着它的 action 解绑
+    /// （写成 `None`，即「未绑定」）。
+    ///
+    /// [`conflict_for`] 只能拒绝；用户明确选「强行换绑」时走这里。组合键在表里仍然唯一，
+    /// 只是原来占着它的那条没有键了（与「两条共用、靠前的那条生效」相反 —— 那种状态在
+    /// 界面上看不出来，正是本次要关掉的那类静默失效）。
+    ///
+    /// 解绑**所有**占用者，而不是只解绑 [`conflict_for`] 报出来的那一条：库里可能留着
+    /// 历史重复（这个校验之前写进去的），只解一条会把这个 1:1 不变量再留个尾巴。
+    pub fn claim(&mut self, action: HotkeyAction, combo: KeyCombo) {
+        for (other, bound) in self.actions.iter_mut() {
+            if *other != action && *bound == Some(combo) {
+                *bound = None;
+            }
+        }
+        self.actions.insert(action, Some(combo));
     }
 }
 
@@ -347,38 +397,47 @@ impl HotkeyMap {
 // ---------------------------------------------------------------------------
 
 /// Serialize a HotkeyMap to a JSON string (version 1 schema).
+///
+/// 未绑定（`None`）的 action 写成 JSON `null`：`{"actions": {"paste": null, ...}}`。
+/// 与 `{"mods": [], "key": null}` 是两种形状 —— 后者一直是非法 entry（modifier-only），
+/// `parse` 仍然拒绝；前者是「这条没有快捷键」，`parse` 读成 `None`。
 pub fn serialize(map: &HotkeyMap) -> String {
     let mut entries = std::collections::BTreeMap::new(); // sorted for deterministic output
     for (action, combo) in &map.actions {
-        let mods_list: Vec<&str> = {
-            let mut m = Vec::new();
-            if combo.mods.contains(Mods::META) {
-                m.push("meta");
+        let entry = match combo {
+            None => serde_json::Value::Null,
+            Some(combo) => {
+                let mods_list: Vec<&str> = {
+                    let mut m = Vec::new();
+                    if combo.mods.contains(Mods::META) {
+                        m.push("meta");
+                    }
+                    if combo.mods.contains(Mods::SHIFT) {
+                        m.push("shift");
+                    }
+                    if combo.mods.contains(Mods::ALT) {
+                        m.push("alt");
+                    }
+                    if combo.mods.contains(Mods::CTRL) {
+                        m.push("ctrl");
+                    }
+                    m
+                };
+                let key_value = match &combo.key {
+                    CharKind::Char(c) => {
+                        serde_json::Value::String(c.to_ascii_lowercase().to_string())
+                    }
+                    CharKind::Enter => serde_json::Value::String("enter".to_string()),
+                    CharKind::Escape => serde_json::Value::String("escape".to_string()),
+                    CharKind::ArrowUp => serde_json::Value::String("arrow_up".to_string()),
+                    CharKind::ArrowDown => serde_json::Value::String("arrow_down".to_string()),
+                    CharKind::Comma => serde_json::Value::String("comma".to_string()),
+                    CharKind::Backspace => serde_json::Value::String("backspace".to_string()),
+                };
+                serde_json::json!({ "mods": mods_list, "key": key_value })
             }
-            if combo.mods.contains(Mods::SHIFT) {
-                m.push("shift");
-            }
-            if combo.mods.contains(Mods::ALT) {
-                m.push("alt");
-            }
-            if combo.mods.contains(Mods::CTRL) {
-                m.push("ctrl");
-            }
-            m
         };
-        let key_value = match &combo.key {
-            CharKind::Char(c) => serde_json::Value::String(c.to_ascii_lowercase().to_string()),
-            CharKind::Enter => serde_json::Value::String("enter".to_string()),
-            CharKind::Escape => serde_json::Value::String("escape".to_string()),
-            CharKind::ArrowUp => serde_json::Value::String("arrow_up".to_string()),
-            CharKind::ArrowDown => serde_json::Value::String("arrow_down".to_string()),
-            CharKind::Comma => serde_json::Value::String("comma".to_string()),
-            CharKind::Backspace => serde_json::Value::String("backspace".to_string()),
-        };
-        entries.insert(
-            action.json_key().to_string(),
-            serde_json::json!({ "mods": mods_list, "key": key_value }),
-        );
+        entries.insert(action.json_key().to_string(), entry);
     }
     serde_json::json!({ "version": 1, "actions": entries }).to_string()
 }
@@ -386,6 +445,7 @@ pub fn serialize(map: &HotkeyMap) -> String {
 /// Parse a JSON string into a HotkeyMap.
 /// Returns Err with message on invalid JSON, missing/wrong-type fields, unknown version,
 /// modifier-only combos (key is null), or unknown actions (unknown actions are dropped silently).
+/// 某条 action 的值是 `null` → 该 action 未绑定（`None`），不是错误。
 pub fn parse(json: &str) -> Result<HotkeyMap, String> {
     let value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| format!("JSON parse error: {e}"))?;
@@ -411,6 +471,13 @@ pub fn parse(json: &str) -> Result<HotkeyMap, String> {
             // Unknown action — drop silently (forward compatibility)
             continue;
         };
+
+        // null → 未绑定（这条 action 没有快捷键）。注意与下面「entry 里的 key 为 null」
+        // 区分：那种形状是非法 entry，仍然报错。
+        if entry.is_null() {
+            map.actions.insert(action, None);
+            continue;
+        }
 
         let entry_obj = entry
             .as_object()
@@ -455,10 +522,10 @@ pub fn parse(json: &str) -> Result<HotkeyMap, String> {
 
         map.actions.insert(
             action,
-            KeyCombo {
+            Some(KeyCombo {
                 mods,
                 key: char_kind,
-            },
+            }),
         );
     }
 
@@ -550,10 +617,10 @@ mod tests {
         let map = HotkeyMap::default_map();
         assert_eq!(
             map.actions.get(&HotkeyAction::DeleteEntry),
-            Some(&KeyCombo {
+            Some(&Some(KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Backspace,
-            }),
+            })),
             "DeleteEntry 必须是 Meta+Backspace"
         );
     }
@@ -659,5 +726,167 @@ mod tests {
 
         assert!(Mods::empty().is_empty());
         assert!(!Mods::META.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // conflict_for：表内组合键唯一性（写入口的冲突校验）
+    // ----------------------------------------------------------------
+
+    fn combo(mods: Mods, ch: char) -> KeyCombo {
+        KeyCombo {
+            mods,
+            key: CharKind::Char(ch),
+        }
+    }
+
+    /// 表里已经有人占着这个组合 → 返回占用者；占用的不是自己那份时也一样。
+    #[test]
+    fn conflict_for_finds_owner() {
+        let map = HotkeyMap::default_map();
+        // ⌘E 是 EditNote 的，Paste 想拿 → 报 EditNote。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META, 'e')),
+            Some(HotkeyAction::EditNote)
+        );
+        // 全局热键也在同一张表里：面板动作想拿 ⌥⌘V 一样会被查出。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META | Mods::ALT, 'v')),
+            Some(HotkeyAction::OpenPanel)
+        );
+    }
+
+    /// 正在改绑的那条自己不算冲突，空闲组合也不算。
+    #[test]
+    fn conflict_for_excludes_self_and_free_combos() {
+        let map = HotkeyMap::default_map();
+        // EditNote 保留自己当前的 ⌘E → 放行。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::EditNote, combo(Mods::META, 'e')),
+            None
+        );
+        // 没人占的组合 → 放行（mods 或键只差一项都不算撞）。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META, 'z')),
+            None
+        );
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::SHIFT, 'e')),
+            None
+        );
+    }
+
+    /// 默认表本身必须无冲突：默认绑定里没有任何两条共用同一个组合，且条条都有键。
+    #[test]
+    fn default_map_has_no_duplicate_combo() {
+        let map = HotkeyMap::default_map();
+        assert_eq!(map.actions.len(), all_actions().len());
+        for (action, bound) in &map.actions {
+            let bound = bound.expect("默认映射里没有「未绑定」条目");
+            assert_eq!(
+                map.conflict_for(*action, bound),
+                None,
+                "{action:?} 的默认组合被别的 action 占了"
+            );
+        }
+    }
+
+    /// 多条同时占用时返回**排序靠前**的那条 —— 前端 `matches()` 派发的正是它
+    /// （`HashMap` 迭代顺序不承诺稳定，直接 `find` 会让错误信息飘）。
+    #[test]
+    fn conflict_for_is_deterministic_among_multiple_owners() {
+        let mut map = HotkeyMap::default_map();
+        let shared = combo(Mods::META, 'x');
+        map.actions.insert(HotkeyAction::MoveDown, Some(shared));
+        map.actions.insert(HotkeyAction::EditNote, Some(shared));
+        // "edit_note" < "move_down" → 前者才是真会拿到派发的那条。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, shared),
+            Some(HotkeyAction::EditNote)
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // 未绑定（None）：线格式 + claim（强行换绑）
+    // ----------------------------------------------------------------
+
+    /// `null` 条目 = 未绑定，且能原样往返（serialize → parse 不丢状态）。
+    #[test]
+    fn unbound_action_roundtrips_as_json_null() {
+        let mut map = HotkeyMap::default_map();
+        map.actions.insert(HotkeyAction::Paste, None);
+
+        let json = serialize(&map);
+        // 形状：整条写成 null，而不是 {"mods":[],"key":null}。
+        assert!(
+            json.contains("\"paste\":null"),
+            "未绑定必须序列化成 null，实际：{json}"
+        );
+
+        let parsed = parse(&json).expect("serialize → parse 必须成功");
+        assert_eq!(parsed.actions.get(&HotkeyAction::Paste), Some(&None));
+        assert_eq!(parsed, map);
+    }
+
+    /// 未绑定的条目不算占用：别人可以自由拿走那个组合。
+    #[test]
+    fn unbound_action_does_not_own_its_old_combo() {
+        let mut map = HotkeyMap::default_map();
+        map.actions.insert(HotkeyAction::EditNote, None);
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META, 'e')),
+            None,
+            "未绑定的 action 不该再占着 ⌘E"
+        );
+    }
+
+    /// `{"key": null}` 仍是非法 entry（modifier-only），与整条 `null`（未绑定）不同。
+    #[test]
+    fn entry_with_null_key_is_still_rejected() {
+        let json = r#"{"version":1,"actions":{"paste":{"mods":[],"key":null}}}"#;
+        let err = parse(json).expect_err("key: null 必须仍然报错");
+        assert!(err.contains("modifier-only"), "实际错误：{err}");
+    }
+
+    /// 强行换绑：抢到组合的那条拿到键，原来占着它的那条变成未绑定。
+    #[test]
+    fn claim_takes_combo_and_unbinds_owner() {
+        let mut map = HotkeyMap::default_map();
+        let stolen = combo(Mods::META, 'e'); // EditNote 的默认键
+        map.claim(HotkeyAction::Paste, stolen);
+
+        assert_eq!(map.actions.get(&HotkeyAction::Paste), Some(&Some(stolen)));
+        assert_eq!(map.actions.get(&HotkeyAction::EditNote), Some(&None));
+        // 表内仍然唯一：抢完不该再有冲突。
+        assert_eq!(map.conflict_for(HotkeyAction::Paste, stolen), None);
+    }
+
+    /// 解绑**所有**占用者（库里可能留着历史重复），其余条目不受影响。
+    #[test]
+    fn claim_unbinds_every_other_holder_only() {
+        let mut map = HotkeyMap::default_map();
+        let shared = combo(Mods::META, 'x');
+        map.actions.insert(HotkeyAction::MoveDown, Some(shared));
+        map.actions.insert(HotkeyAction::EditNote, Some(shared));
+        let untouched = map.actions.get(&HotkeyAction::TogglePin).copied();
+
+        map.claim(HotkeyAction::Paste, shared);
+
+        assert_eq!(map.actions.get(&HotkeyAction::Paste), Some(&Some(shared)));
+        assert_eq!(map.actions.get(&HotkeyAction::MoveDown), Some(&None));
+        assert_eq!(map.actions.get(&HotkeyAction::EditNote), Some(&None));
+        assert_eq!(
+            map.actions.get(&HotkeyAction::TogglePin),
+            untouched.as_ref()
+        );
+    }
+
+    /// 抢自己当前的键：不算换绑，自己的键不变。
+    #[test]
+    fn claim_on_own_combo_is_noop() {
+        let mut map = HotkeyMap::default_map();
+        let own = combo(Mods::META, 'p'); // TogglePin 的默认键
+        map.claim(HotkeyAction::TogglePin, own);
+        assert_eq!(map.actions.get(&HotkeyAction::TogglePin), Some(&Some(own)));
+        assert_eq!(map, HotkeyMap::default_map());
     }
 }
