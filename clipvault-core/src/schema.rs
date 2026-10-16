@@ -6,6 +6,10 @@
 //! - V3 (multi-type plan): adds `content_kind` / `mime_type` / `payload` /
 //!   `payload_nonce` / `metadata_json` for non-text clipboard entries
 //!   (image/file/rtf/color).
+//! - V4 (删除单条记录): indexes `tags.entry_id`. Every delete path looks tags up
+//!   by `entry_id` (`WHERE entry_id = ?` / `IN (SELECT id …)`) and the
+//!   `tags_fts_*` triggers read tags the same way, so without this index each
+//!   deleted entry full-scans `tags`.
 
 use rusqlite::{Connection, Result};
 
@@ -156,11 +160,25 @@ ALTER TABLE entries ADD COLUMN payload_nonce BLOB;
 ALTER TABLE entries ADD COLUMN metadata_json TEXT;
 "#;
 
+/// DDL for schema version 4 (删除单条记录 / 清空不可解密条目).
+///
+/// Adds `idx_tags_entry_id` on `tags(entry_id)`. Both delete paths
+/// (`Storage::delete_entry` and `clear_undecryptable`) resolve the tags of the
+/// doomed entries by `entry_id`, and the `tags_fts_insert` / `tags_fts_delete`
+/// triggers do the same lookup on every tag write — without the index each of
+/// those is a full scan of `tags`.
+///
+/// Additive: no data rewrite, and `IF NOT EXISTS` keeps it re-runnable.
+pub const MIGRATION_V4: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_tags_entry_id ON tags(entry_id);
+"#;
+
 /// Run all schema migrations, bringing the database from whatever
 /// `user_version` it currently has up to date.
 ///
-/// Handles 0 → 1 (V1 base schema), 1 → 2 (add `nonce`), and 2 → 3 (add
-/// content_kind / mime_type / payload / payload_nonce / metadata_json).
+/// Handles 0 → 1 (V1 base schema), 1 → 2 (add `nonce`), 2 → 3 (add
+/// content_kind / mime_type / payload / payload_nonce / metadata_json), and
+/// 3 → 4 (index `tags.entry_id`).
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     let mut user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -185,6 +203,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tx.execute_batch(MIGRATION_V3)?;
         tx.execute("PRAGMA user_version = 3", [])?;
         tx.commit()?;
+        user_version = 3;
+    }
+
+    if user_version == 3 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_V4)?;
+        tx.execute("PRAGMA user_version = 4", [])?;
+        tx.commit()?;
     }
 
     Ok(())
@@ -204,6 +230,9 @@ mod tests {
     use super::*;
     use rusqlite::OpenFlags;
 
+    /// 当前最新 schema 版本。加迁移时改这里一处，其余断言跟着走。
+    const LATEST_VERSION: i32 = 4;
+
     fn in_memory_rw() -> Connection {
         Connection::open_in_memory_with_flags(
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
@@ -218,7 +247,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 3);
+        assert_eq!(uv, LATEST_VERSION);
     }
 
     #[test]
@@ -257,7 +286,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 3);
+        assert_eq!(uv, LATEST_VERSION);
     }
 
     #[test]
@@ -271,7 +300,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 3);
+        assert_eq!(uv, LATEST_VERSION);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn
@@ -303,7 +332,10 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 3, "should be at V3 after migration");
+        assert_eq!(
+            uv, LATEST_VERSION,
+            "should be at the latest version after migration"
+        );
         assert!(
             column_exists(&conn, "entries", "nonce"),
             "V3 must retain the nonce column from V2"
@@ -328,6 +360,44 @@ mod tests {
             column_exists(&conn, "entries", "metadata_json"),
             "V3 must add metadata_json column"
         );
+    }
+
+    /// V4 的索引必须真的建出来：两条删除路径与 `tags_fts_*` 触发器都按
+    /// `entry_id` 查 `tags`，没有索引每一次都是全表扫。
+    #[test]
+    fn migration_v4_creates_tags_entry_id_index() {
+        let index_count = |conn: &Connection| -> i32 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_tags_entry_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        // 全新库：一次迁移到底就带上索引。
+        let fresh = in_memory_rw();
+        run_migrations(&fresh).unwrap();
+        assert_eq!(index_count(&fresh), 1, "全新库应建出 idx_tags_entry_id");
+
+        // 老库升级（V3 → V4 这一段单独跑）：不是只有全新库才建索引。
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(SCHEMA_V1).unwrap();
+        old.execute_batch(MIGRATION_V2).unwrap();
+        old.execute_batch(MIGRATION_V3).unwrap();
+        old.execute("PRAGMA user_version = 3", []).unwrap();
+        assert_eq!(index_count(&old), 0, "V3 库在建索引前不该有它");
+
+        run_migrations(&old).unwrap();
+        let uv: i32 = old
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, LATEST_VERSION);
+        assert_eq!(index_count(&old), 1, "V3 库升级到 V4 也要补上索引");
+
+        // 幂等：再跑一次不报错（`IF NOT EXISTS`）。
+        run_migrations(&old).unwrap();
+        assert_eq!(index_count(&old), 1);
     }
 
     /// Helper: does `table` have a column named `col`?

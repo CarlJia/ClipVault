@@ -177,6 +177,7 @@ fn main() {
             commands::paste_entry,
             commands::toggle_pin,
             commands::update_entry,
+            commands::delete_entry,
             commands::set_guest_mode,
             commands::get_guest_mode,
             commands::set_skip_next,

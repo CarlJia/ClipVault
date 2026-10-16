@@ -164,6 +164,7 @@ fn charkind_to_vkey(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
         CharKind::ArrowUp => Some(0x7E),   // kVK_UpArrow
         CharKind::ArrowDown => Some(0x7D), // kVK_DownArrow
         CharKind::Comma => Some(0x2B),     // kVK_ANSI_Comma
+        CharKind::Backspace => Some(0x33), // kVK_Delete（Mac 上这个键就是退格 ⌫）
     }
 }
 
@@ -553,6 +554,7 @@ fn charkind_to_vk(kind: clipvault_core::keymap::CharKind) -> Option<u32> {
         CharKind::ArrowUp => Some(0x26),   // VK_UP
         CharKind::ArrowDown => Some(0x28), // VK_DOWN
         CharKind::Comma => Some(0xBC),     // VK_OEM_COMMA
+        CharKind::Backspace => Some(0x08), // VK_BACK
     }
 }
 
@@ -1014,6 +1016,7 @@ mod tests {
         assert_eq!(charkind_to_vkey(CharKind::ArrowUp), Some(0x7E)); // kVK_UpArrow
         assert_eq!(charkind_to_vkey(CharKind::ArrowDown), Some(0x7D)); // kVK_DownArrow
         assert_eq!(charkind_to_vkey(CharKind::Comma), Some(0x2B)); // kVK_ANSI_Comma
+        assert_eq!(charkind_to_vkey(CharKind::Backspace), Some(0x33)); // kVK_Delete
     }
 
     #[cfg(target_os = "macos")]
@@ -1081,6 +1084,7 @@ mod tests {
         assert_eq!(charkind_to_vk(CharKind::ArrowUp), Some(0x26)); // VK_UP
         assert_eq!(charkind_to_vk(CharKind::ArrowDown), Some(0x28)); // VK_DOWN
         assert_eq!(charkind_to_vk(CharKind::Comma), Some(0xBC)); // VK_OEM_COMMA
+        assert_eq!(charkind_to_vk(CharKind::Backspace), Some(0x08)); // VK_BACK
     }
 
     #[cfg(target_os = "windows")]

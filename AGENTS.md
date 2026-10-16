@@ -116,12 +116,38 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 219 passed + core 27 passed（合计 246），1 个 trigram 测试 ignored；
-  增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
+- **启动不再重捕既有剪贴板**（`Watcher::new`）：`last_change_count` 改为用构造时的剪贴板
+  序列号播种（原来硬编码 `-1`，导致启动首轮必定捕获一次既有剪贴板）。这是「删除能扛过重启」
+  的前提 —— 否则删掉的内容只要还在剪贴板里，就会在重启后原样回到历史；加密区条目更糟，
+  它的 `content_hash` 是 salted 变体、永远不匹配明文指纹，回来的是一条**明文**普通条目。
+  代价：ClipVault 未运行时复制的内容不再于启动后补录。纯规则抽在 `watcher::initial_change_count`
+  里（吃 `Option`），跨平台可单测。
+- **测试基线**：app 223 passed + core 33 passed（合计 256），1 个 trigram 测试 ignored；
+  本轮增量（「删除单条记录」的评审收尾，10 条 finding 全部处理）：app +2
+  （`app/src/storage.rs` 的 `delete_entry_handles_vault_row_without_touching_others_fts`、
+  `clear_undecryptable_also_removes_tags`）、core +4（`clipvault-core/src/keymap.rs` 的
+  `serialize_default_schema_shape` / `parse_rejects_malformed_input` /
+  `parse_unknown_action_is_dropped` —— 三条从**从不编译的孤儿文件**
+  `clipvault-core/src/keymap_test.rs` 搬进来后删掉那个文件；以及
+  `clipvault-core/src/schema.rs` 的 `migration_v4_creates_tags_entry_id_index`）。
+  **schema 已到 V4**：`MIGRATION_V4` 为 `tags.entry_id` 建索引 `idx_tags_entry_id`
+  （删除单条记录与清空不可解密条目都按 `entry_id` 删标签）。
+  更早的增量是「删除选中条目」本身：`app/src/storage.rs` 的
+  `delete_entry_removes_row_tags_and_search_index`、`app/src/watcher_test.rs` 的
+  `last_change_count_is_seeded_with_current_sequence_number`（app +2）与
+  `clipvault-core/src/keymap.rs` 的 `default_delete_entry_is_meta_backspace`、
+  `default_map_covers_every_action`（core +2）。
+  前端 3 个文件共 39 例 + 1 todo（`npm --prefix frontend test` 覆盖）：
+  `frontend/src/keymap.test.ts` 26 例 + 1 todo（含加密区模态的重绑传导与 `Esc` 逃生口、
+  命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs` 源码，
+  经 Vite 的 `?raw`，不给前端引 `@types/node`）、
+  `frontend/src/settings.test.ts` 6 例（重绑取消后的键帽还原、重建行时不重复绑 /
+  不留隐形监听器、**动作基数与分组**：1 全局 + 13 面板 = 14，与 keymap 的动作集合
+  逐项一致）、`frontend/src/logview.test.ts` 7 例。
+  更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  `frontend/src/logview.test.ts` 6 例由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
