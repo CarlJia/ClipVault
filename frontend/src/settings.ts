@@ -337,9 +337,10 @@ const ACTION_LABELS: Record<HotkeyAction, string> = {
   move_down: "下移选中",
 };
 
-// 分组定义
-const GLOBAL_ACTIONS: HotkeyAction[] = ["open_panel"];
-const PANEL_ACTIONS: HotkeyAction[] = [
+// 分组定义。**导出**是为了让 `settings.test.ts` 钉住「设置面板列出的动作 = keymap 里的
+// 动作」：这张表是手写的，加动作时漏掉一行，用户就再也重绑不到它。
+export const GLOBAL_ACTIONS: HotkeyAction[] = ["open_panel"];
+export const PANEL_ACTIONS: HotkeyAction[] = [
   "paste",
   "edit_note",
   "toggle_pin",
