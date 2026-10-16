@@ -8,11 +8,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { WARN_SVG, type EntryDto } from "./panel";
 import { isWindows, isLinux, keys, whenPlatformReady } from "./platform";
 import {
+  currentKeyMap,
   localizedCombo,
   parseKeyCombo,
   reloadKeymap,
   setHotkey,
   type HotkeyAction,
+  type KeyCombo,
 } from "./keymap";
 
 /** `paste_entry` 的返回体：区分回贴成功分支与对应固定 toast 文案。 */
@@ -363,8 +365,11 @@ let recordingCleanup: (() => void) | null = null;
  * - 全局 keydown 监听持续有效直到 capture 或 cancel。
  * - Escape 或再次点击「取消」退出录制。
  * - 有效按键 parseKeyCombo 后调用 setHotkey IPC。
+ *
+ * 导出是为了让 `settings.test.ts` 能直接驱动录制态；生产代码只在行内按钮的
+ * click handler 里调用它。
  */
-function startRecording(action: HotkeyAction): void {
+export function startRecording(action: HotkeyAction): void {
   cancelRecording(); // 确保没有残留监听
 
   recordingAction = action;
@@ -406,15 +411,13 @@ function startRecording(action: HotkeyAction): void {
 
     void (async () => {
       const result = await setHotkey(action, combo);
+      // 顺序：成功路径必须 reloadKeymap() 在前、cancelRecording() 在后 —— 后者里的
+      // refreshRow 写回当前绑定，颠倒顺序会让键帽先回旧值再切到新值，闪一下。
+      if (result.ok) await reloadKeymap();
       cancelRecording();
       if (!result.ok) {
         showToast(`重绑失败：${result.err}，已回退到原绑定`);
-        return;
       }
-      // 刷新前端 in-memory keymap
-      await reloadKeymap();
-      // 刷新本行显示
-      refreshRow(action);
     })();
   };
 
@@ -422,8 +425,8 @@ function startRecording(action: HotkeyAction): void {
   recordingCleanup = () => document.removeEventListener("keydown", onKeyDown, { capture: true });
 }
 
-/** 取消当前录制态，清理监听器，恢复 UI。 */
-function cancelRecording(): void {
+/** 取消当前录制态，清理监听器，恢复 UI（导出以便单测直接驱动，见 startRecording）。 */
+export function cancelRecording(): void {
   if (recordingCleanup) {
     recordingCleanup();
     recordingCleanup = null;
@@ -433,19 +436,29 @@ function cancelRecording(): void {
     if (row) row.classList.remove("recording");
     const btn = row?.querySelector<HTMLButtonElement>(".hotkey-rebind");
     if (btn) btn.textContent = "重绑";
+    // 取消的语义是「绑定不变」，所以键帽必须回到当前绑定，否则行会永久停在「请按新键…」占位符上。
+    refreshRow(recordingAction);
     recordingAction = null;
   }
 }
 
-/** 刷新单行 combo 显示（从 keymap 最新状态）。 */
-async function refreshRow(action: HotkeyAction): Promise<void> {
-  const mod = await import("./keymap");
-  const combo = mod.currentKeyMap?.actions[action];
-  if (!combo) return;
+/** 键帽文本。绑定取不到（keymap 尚未加载）时用与 `renderRow` 同一个占位符。 */
+function comboLabel(combo: KeyCombo | undefined): string {
+  return combo ? localizedCombo(combo) : "—";
+}
+
+/**
+ * 把一行重画成「当前绑定」：键帽写回 `currentKeyMap` 里的值。
+ *
+ * 录制成功与取消录制都走这里 —— 行的显示只能有一个来源（keymap），各写一份
+ * 就会再次出现「一边改了另一边没跟」的失效。
+ */
+function refreshRow(action: HotkeyAction): void {
   const row = document.querySelector<HTMLElement>(`[data-action="${action}"]`);
   if (!row) return;
   const kbd = row.querySelector<HTMLElement>(".hotkey-row-combo kbd");
-  if (kbd) kbd.textContent = mod.localizedCombo(combo);
+  if (!kbd) return;
+  kbd.textContent = comboLabel(currentKeyMap?.actions[action]);
 }
 
 /**
@@ -461,20 +474,20 @@ export async function renderHotkeysSection(): Promise<void> {
 
   if (!globalList || !panelList) return;
 
+  // 重建行前先收掉录制态：它指向的 DOM 马上被替换，留下的 keydown 监听器会变成
+  // 「按任意键悄悄改绑」的隐形状态。
+  cancelRecording();
+
   // Linux 隐藏全局热键组
   if (globalGroup) {
     globalGroup.classList.toggle("hidden", isLinux());
   }
 
   // 等待 keymap 就绪（最多轮询 1s）
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let km: any = null;
   await new Promise<void>((resolve) => {
     let attempts = 0;
-    const iv = setInterval(async () => {
-      const mod = await import("./keymap");
-      km = mod;
-      if (mod.currentKeyMap || attempts >= 20) {
+    const iv = setInterval(() => {
+      if (currentKeyMap || attempts >= 20) {
         clearInterval(iv);
         resolve();
       }
@@ -482,11 +495,8 @@ export async function renderHotkeysSection(): Promise<void> {
     }, 50);
   });
 
-  const comboMap = km?.currentKeyMap?.actions;
-
   function renderRow(action: HotkeyAction): string {
-    const combo = comboMap?.[action];
-    const comboText = combo ? localizedCombo(combo) : "—";
+    const comboText = comboLabel(currentKeyMap?.actions[action]);
     return `<li class="hotkey-row" data-action="${action}">
   <span class="hotkey-row-label">${ACTION_LABELS[action]}</span>
   <span class="hotkey-row-combo"><kbd>${comboText}</kbd></span>
@@ -496,24 +506,6 @@ export async function renderHotkeysSection(): Promise<void> {
 
   globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
   panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");
-
-  // 绑定「重置默认」按钮:IPC 把全部 14 条热键还原 + 全局热键 OS 侧重注册,
-  // 成功后再 reloadKeymap() + 重渲染本区(沿用 record 流程的 reload 模式)。
-  const resetBtn = document.getElementById("hotkey-reset");
-  if (resetBtn) {
-    resetBtn.addEventListener("click", () => {
-      void (async () => {
-        try {
-          await resetHotkeys();
-          await reloadKeymap();
-          await renderHotkeysSection();
-          showToast("已重置为默认快捷键");
-        } catch (e) {
-          showToast(`重置失败：${String(e)}`);
-        }
-      })();
-    });
-  }
 
   // 绑定重绑按钮
   for (const list of [globalList, panelList]) {
@@ -532,3 +524,21 @@ export async function renderHotkeysSection(): Promise<void> {
   }
 }
 
+// 「重置默认」按钮：IPC 把全部 14 条热键还原 + 全局热键 OS 侧重注册，成功后再
+// reloadKeymap() + 重渲染本区（沿用 record 流程的 reload 模式）。
+//
+// 绑在模块作用域：#hotkey-reset 常驻在 index.html 里，不像每行「重绑」按钮那样
+// 随 innerHTML 重建；放在 renderHotkeysSection() 里每开一次设置就会多绑一个监听器。
+// main.ts 对 #settings-close / #log-clear 等常驻控件同样是模块作用域绑一次。
+document.getElementById("hotkey-reset")?.addEventListener("click", () => {
+  void (async () => {
+    try {
+      await resetHotkeys();
+      await reloadKeymap();
+      await renderHotkeysSection();
+      showToast("已重置为默认快捷键");
+    } catch (e) {
+      showToast(`重置失败：${String(e)}`);
+    }
+  })();
+});
