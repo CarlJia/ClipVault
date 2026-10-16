@@ -137,12 +137,13 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `last_change_count_is_seeded_with_current_sequence_number`（app +2）与
   `clipvault-core/src/keymap.rs` 的 `default_delete_entry_is_meta_backspace`、
   `default_map_covers_every_action`（core +2）。
-  前端 3 个文件共 39 例 + 1 todo（`npm --prefix frontend test` 覆盖）：
+  前端 3 个文件共 43 例 + 1 todo（`npm --prefix frontend test` 覆盖）：
   `frontend/src/keymap.test.ts` 26 例 + 1 todo（含加密区模态的重绑传导与 `Esc` 逃生口、
   命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs` 源码，
   经 Vite 的 `?raw`，不给前端引 `@types/node`）、
-  `frontend/src/settings.test.ts` 6 例（重绑取消后的键帽还原、重建行时不重复绑 /
-  不留隐形监听器、**动作基数与分组**：1 全局 + 13 面板 = 14，与 keymap 的动作集合
+  `frontend/src/settings.test.ts` 10 例（重绑取消后的键帽还原、重建行时不重复绑 /
+  不留隐形监听器、关掉设置面板与等 keymap 的轮询窗口内重绑这两条也不留隐形录制监听器、
+  录制成功 / 失败两条路径、**动作基数与分组**：1 全局 + 13 面板 = 14，与 keymap 的动作集合
   逐项一致）、`frontend/src/logview.test.ts` 7 例。
   更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
