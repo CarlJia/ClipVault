@@ -199,11 +199,22 @@ U1 → U2 → U3 → U4 → U5 → U6。U1 是数据基础(必须先),U2 必须�
 - `app/src/AppState`(修改):加 `keymap: Arc<RwLock<HotkeyMap>>`
 - `clipvault-core/src/keymap_test.rs`(新):单测
 
+> **后续变更（2026-10-16，「删除选中条目」）.**
+> 变体数已经**不是 13 而是 14**：`HotkeyAction` 新增 `DeleteEntry`（默认绑定 `⌘⌫` /
+> `Ctrl+Backspace`），`CharKind` 新增 `Backspace`；因此默认条目数也是 14。下面
+> §Approach 的两条清单已就地更正；§Test scenarios / §Verification 里仍写「13」的
+> 是**当时（2026-10-14）的事实**（那时 `main.ts` 的硬编码链就是 13 条），未改。
+> 另外两点与实现对齐：默认映射的构造函数在代码里叫 `HotkeyMap::default_map()`
+> （不是 `default()`）；本行列出的 `keymap_test.rs` 从未挂上 `mod`（29 个用例从来没
+> 被编译过），已于 2026-10-16 删除，其中的独有覆盖搬进了 `keymap.rs` 的
+> `#[cfg(test)] mod tests`。基数现在由 `default_map_covers_every_action`（core）与
+> `frontend/src/settings.test.ts` 的分组断言钉住。
+
 **Approach.**
-1. `HotkeyAction` enum 完整 13 个变体:`OpenPanel` / `Paste` / `EditNote` / `TogglePin` / `MoveToVault` / `OpenUrl` / `OpenVault` / `ToggleGuestMode` / `SkipOnce` / `OpenSettings` / `Close` / `MoveUp` / `MoveDown`
-2. `KeyCombo { mods: Mods, key: CharKind }`,`Mods` 是 bitflags(`Meta/Ctrl/Alt/Shift`),`CharKind` 是 `Enter / Escape / ArrowUp / ArrowDown / Comma / Char(char)`(letter / digit / symbol 都走 `Char`)
+1. `HotkeyAction` enum 完整 14 个变体:`OpenPanel` / `Paste` / `EditNote` / `TogglePin` / `MoveToVault` / `DeleteEntry` / `OpenUrl` / `OpenVault` / `ToggleGuestMode` / `SkipOnce` / `OpenSettings` / `Close` / `MoveUp` / `MoveDown`
+2. `KeyCombo { mods: Mods, key: CharKind }`,`Mods` 是 bitflags(`Meta/Ctrl/Alt/Shift`),`CharKind` 是 `Enter / Escape / ArrowUp / ArrowDown / Comma / Backspace / Char(char)`(letter / digit / symbol 都走 `Char`)
 3. `Mods` bit 编号:Meta=0x01 / Shift=0x02 / Alt=0x04 / Ctrl=0x08(与 Carbon 位不对齐,由 `hotkey.rs` 在 register 时翻译)
-4. `HotkeyMap::default()` 13 条硬编码条目,字面与现行 keydown 列表 1:1
+4. `HotkeyMap::default_map()` 14 条硬编码条目,字面与现行 keydown 列表 1:1
 5. JSON 格式:`{ "version": 1, "actions": { "open_panel": {"mods":["meta","alt"], "key":"v"}, ... } }`;`version` 字段为未来 schema 演进预留。某条 action 的值写成 `null` 表示**未绑定**(见 R15)—— 与 `{"mods":[],"key":null}` 是两种形状,后者仍是非法 entry(modifier-only)
 6. `parse` 失败 → 返回 `Err`,具体值为哪个字段错;`load_hotkeys` 对 `Err` 时返回 `Ok(default())`,**不**修改库(R3 守得住)
 7. `boot_load_hotkeys(storage, slot)`:读 `hotkeys` 行,parse 失败则保持 slot 默认为 `HotkeyMap::default()`,返回 `bool`(true = 用了库,false = 用了默认)

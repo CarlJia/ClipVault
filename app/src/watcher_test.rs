@@ -10,11 +10,11 @@ use std::time::{Duration, Instant};
 
 use clipvault_core::ContentKind;
 
-use crate::capture::Captured;
+use crate::capture::{Captured, poll_first_non_empty};
 use crate::classify::{AutoCategory, classify};
 use crate::storage::Storage;
 use crate::storage::test_helpers::open_test_db;
-use crate::watcher::{Watcher, duplicate_fingerprint_log, should_dedup};
+use crate::watcher::{Watcher, duplicate_fingerprint_log, initial_change_count, should_dedup};
 
 /// 组装一个由内存数据库支撑的 Watcher。
 ///
@@ -88,6 +88,27 @@ fn should_dedup_outside_window() {
     ));
     // 无历史 → 不去重。
     assert!(!should_dedup(None, "abcd", now, Duration::from_secs(5)));
+}
+
+/// 「启动不重捕既有剪贴板」这条行为的两个前提,各钉一半。
+///
+/// 前半:`Watcher::new` 把 `last_change_count` 播种成**当前**序列号(而不是 `-1`)。
+/// 后半:`poll_first_non_empty` 在 `change_count <= prev` 时直接返回 `None` —— 那句
+/// `return` 在 `NSPasteboard` 读取**之前**,所以本用例不碰用户的剪贴板(与文件顶上那条
+/// 约定一致)。两半合起来才是完整结论:重启后,库里没有的那份内容不会随既有剪贴板复活
+/// —— 这正是「删除能扛过重启」与「加密区条目的明文不会因重启回到普通历史」的机制。
+#[test]
+fn last_change_count_is_seeded_with_current_sequence_number() {
+    assert_eq!(initial_change_count(Some(42)), 42, "拿得到序列号就播种它");
+    assert_eq!(initial_change_count(None), -1, "拿不到才退回 -1");
+    assert!(
+        poll_first_non_empty(42, 42).is_none(),
+        "播种后首轮判据必须是不捕获"
+    );
+    assert!(
+        poll_first_non_empty(41, 42).is_none(),
+        "序列号没增长(理论上不该发生)同样不捕获"
+    );
 }
 
 #[tokio::test]
