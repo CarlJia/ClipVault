@@ -520,13 +520,15 @@ pub async fn update_entry(
 ///
 /// 只按 `id` 删，不区分是否加密区条目 —— 加密区条目的密文行同样直接删掉，
 /// 不需要先解密（密文与 nonce 随行一起消失）。
+///
+/// 返回实际删掉的行数：`0` 表示这个 id 已经不存在（例如同一条被删了两次）。
+/// 前端据此区分「已删除」与「早就不在了」，不要把它当成恒真的成功信号。
 #[tauri::command]
-pub async fn delete_entry(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+pub async fn delete_entry(id: i64, state: State<'_, AppState>) -> Result<usize, String> {
     state
         .storage
         .delete_entry(id)
         .await
-        .map(|_| ())
         .map_err(|e| e.to_string())
 }
 

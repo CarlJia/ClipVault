@@ -437,8 +437,10 @@ async function deleteCurrentEntry(): Promise<void> {
   const e = currentEntry();
   if (!e) return;
   try {
-    await deleteEntry(e.id);
-    toast("已删除该条目");
+    const removed = await deleteEntry(e.id);
+    // 后端回传实际删掉的行数：0 说明这个 id 已经不存在（同一条被删过两次、
+    // 或列表里是陈旧的一条）。报「已删除」会是假成功信号。
+    toast(removed > 0 ? "已删除该条目" : "该条目已不存在");
     await load();
   } catch (err) {
     toast(`删除失败：${String(err)}`);
@@ -567,8 +569,10 @@ async function deleteVaultEntry(): Promise<void> {
   const e = currentVaultEntry();
   if (!e) return;
   try {
-    await deleteEntry(e.id);
-    toast("已删除该条目");
+    const removed = await deleteEntry(e.id);
+    // 与主列表同一判据：0 行 = 这条早就不在了，别报「已删除」。下面仍按 id 摘行，
+    // 因为无论哪一种情况它都不该继续留在模态列表里。
+    toast(removed > 0 ? "已删除该条目" : "该条目已不存在");
     // 按 id 摘行，不用 `splice(vaultSelected)`：`await` 期间选中可能已经移动，
     // 连按两次 ⌘⌫ 也会走到这里 —— 按 id 找才不会摘错行（摘不到说明已摘过）。
     const idx = vaultEntries.findIndex((x) => x.id === e.id);
