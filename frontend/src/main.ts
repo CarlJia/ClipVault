@@ -35,6 +35,7 @@ import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
   type LogInfoDto,
   type PasteResult,
+  cancelRecording,
   clearLog,
   clearUndecryptable,
   getGuestMode,
@@ -617,6 +618,10 @@ async function refreshLogSection(): Promise<void> {
 }
 
 function closeSettings(): void {
+  // 关掉设置前收掉进行中的录制态：它的 keydown 监听器挂在 `document` 上，模态藏起来
+  // 之后照样会吞掉用户在主列表里敲下的第一个字符，并把它静默写成那个 action 的新绑定。
+  // （`settings.ts` 的录制监听器里另有一道同义兜底，防别的路径隐藏模态。）
+  cancelRecording();
   settingsEl.classList.add("hidden");
   searchEl.focus();
 }

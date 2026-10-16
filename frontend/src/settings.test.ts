@@ -9,6 +9,10 @@
 // 再绑一个监听器；进行中的录制态在重建行时不清理，会留下「按任意键就悄悄改绑」的
 // 隐形 keydown 监听器。
 //
+// 最后两条收的是同一个根因（录制态监听器挂在 `document` 上）漏掉的两条路径：关掉设置
+// 面板没有收掉录制态，用户回到列表敲的第一个字符被吞掉并静默改绑；重建行与取消录制
+// 之间还隔着等 keymap 的轮询窗口，窗口里点「重绑」照样留下一份隐形监听器。
+//
 // settings.ts 是重 DOM 的模块，但这里只覆盖这几段：用最小 DOM 替身驱动，不引 jsdom
 // （与 keymap.test.ts 里手写 `ev()` 替身同一思路）。
 
@@ -115,6 +119,8 @@ const ALL_ACTIONS: HotkeyAction[] = ["open_panel", ...PANEL_ACTIONS];
 interface FakeDom {
   rows: Map<string, FakeRow>;
   resetBtn: FakeButton;
+  /** `#settings` 模态替身：`classList.add("hidden")` = 用户关掉了设置。 */
+  settingsModal: FakeEl;
   document: {
     querySelector: (sel: string) => FakeEl | null;
     getElementById: (id: string) => FakeEl | null;
@@ -128,7 +134,9 @@ interface FakeDom {
 function makeDom(): FakeDom {
   const rows = new Map<string, FakeRow>(ALL_ACTIONS.map((a) => [a, new FakeRow(a)]));
   const resetBtn = new FakeButton("重置默认");
+  const settingsModal = new FakeEl();
   const byId = new Map<string, FakeEl>([
+    ["settings", settingsModal],
     ["hotkey-group-global", new FakeEl()],
     ["hotkey-list-global", new FakeList(["open_panel"], rows)],
     ["hotkey-list-panel", new FakeList(PANEL_ACTIONS, rows)],
@@ -148,7 +156,7 @@ function makeDom(): FakeDom {
       if (type === "keydown") keydown = keydown.filter((f) => f !== fn);
     },
   };
-  return { rows, resetBtn, document, keydownListeners: () => keydown };
+  return { rows, resetBtn, settingsModal, document, keydownListeners: () => keydown };
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +183,9 @@ const DEFAULT_WIRE = {
   },
 };
 
+/** 最近一次 `freshSettings()` 装上的 IPC 替身：用来断言「没有发生静默改绑」。 */
+let invokeMock: ReturnType<typeof vi.fn>;
+
 /** 取一份全新的 settings 模块（模块级录制态不能跨用例复用）。 */
 async function freshSettings(): Promise<typeof import("./settings")> {
   vi.resetModules();
@@ -188,6 +199,7 @@ async function freshSettings(): Promise<typeof import("./settings")> {
         return undefined;
     }
   });
+  invokeMock = invoke;
   vi.doMock("@tauri-apps/api/core", () => ({ invoke }));
   vi.stubGlobal("window", {
     setTimeout: globalThis.setTimeout,
@@ -290,5 +302,61 @@ describe("重复渲染设置区", () => {
     await renderHotkeysSection(); // 重建行 → 必须先把录制态收掉
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.rows.get("paste")!.btn.textContent).toBe("重绑");
+  });
+
+  it("等 keymap 的轮询窗口里点「重绑」，也留不下隐形监听器", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { renderHotkeysSection, startRecording } = await freshSettings();
+
+    const rendering = renderHotkeysSection(); // 不 await：停在等 keymap 的轮询里
+    await new Promise((resolve) => setTimeout(resolve, 0)); // 让渲染跑到轮询处
+    startRecording("paste"); // 窗口内用户点了「重绑」
+    expect(dom.keydownListeners()).toHaveLength(1);
+
+    await rendering; // 轮询结束 → 重建行
+    expect(dom.keydownListeners()).toHaveLength(0);
+  });
+});
+
+describe("设置面板关掉后录制态必须失效", () => {
+  it("放行按键：不吞键、不静默改绑，键帽回到当前绑定", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    expect(row.kbd.textContent).toBe("请按新键…");
+
+    dom.settingsModal.classList.add("hidden"); // 用户点了「关闭」
+
+    const listeners = dom.keydownListeners();
+    const onKeyDown = listeners[listeners.length - 1];
+    let prevented = false;
+    let stopped = false;
+    onKeyDown({
+      key: "a",
+      code: "KeyA",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      preventDefault: () => {
+        prevented = true;
+      },
+      stopPropagation: () => {
+        stopped = true;
+      },
+    } as unknown as KeyboardEvent);
+
+    // 录制态自我了断：这一下按键不属于它，要留给下面的面板快捷键。
+    // 修复前 `a` 会被吞掉（preventDefault）并写成 paste 的新绑定。
+    expect(prevented).toBe(false);
+    expect(stopped).toBe(false);
+    expect(invokeMock.mock.calls.filter(([cmd]) => cmd === "set_hotkey")).toHaveLength(0);
+    expect(dom.keydownListeners()).toHaveLength(0);
+    expect(row.kbd.textContent).toBe("↩");
+    expect(row.btn.textContent).toBe("重绑");
   });
 });
