@@ -116,8 +116,21 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 219 passed + core 27 passed（合计 246），1 个 trigram 测试 ignored；
-  增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
+- **启动不再重捕既有剪贴板**（`Watcher::new`）：`last_change_count` 改为用构造时的剪贴板
+  序列号播种（原来硬编码 `-1`，导致启动首轮必定捕获一次既有剪贴板）。这是「删除能扛过重启」
+  的前提 —— 否则删掉的内容只要还在剪贴板里，就会在重启后原样回到历史；加密区条目更糟，
+  它的 `content_hash` 是 salted 变体、永远不匹配明文指纹，回来的是一条**明文**普通条目。
+  代价：ClipVault 未运行时复制的内容不再于启动后补录。纯规则抽在 `watcher::initial_change_count`
+  里（吃 `Option`），跨平台可单测。
+- **测试基线**：app 221 passed + core 29 passed（合计 250），1 个 trigram 测试 ignored；
+  最近一次增量是「删除选中条目」：`app/src/storage.rs` 的
+  `delete_entry_removes_row_tags_and_search_index`、`app/src/watcher_test.rs` 的
+  `last_change_count_is_seeded_with_current_sequence_number`（app +2）与
+  `clipvault-core/src/keymap.rs` 的 `default_delete_entry_is_meta_backspace`、
+  `default_map_covers_every_action`（core +2）。
+  `frontend/src/keymap.test.ts` 现为 22 例（含加密区删除、焦点门与录制规则），
+  与 `frontend/src/logview.test.ts` 的 6 例一起由 `npm --prefix frontend test` 覆盖。
+  更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。

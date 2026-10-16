@@ -93,11 +93,49 @@ pub struct Watcher {
     last_change_count: AtomicI64,
 }
 
+/// 当前剪贴板序列号;读不到时返回 `None`。
+///
+/// 平台差异只在此处:`GetClipboardSequenceNumber` 在非交互式窗口站返回 `0`(「没有
+/// 序列号」),当作 `None` 处理 —— 否则会把「序列号不可用」误判成「剪贴板永远没变」。
+#[cfg(target_os = "macos")]
+fn current_change_count() -> Option<i64> {
+    use objc2_app_kit::NSPasteboard;
+    Some(NSPasteboard::generalPasteboard().changeCount() as i64)
+}
+
+#[cfg(target_os = "windows")]
+fn current_change_count() -> Option<i64> {
+    match unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() } {
+        0 => None,
+        n => Some(n as i64),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn current_change_count() -> Option<i64> {
+    None
+}
+
+/// `last_change_count` 的初值:拿到当前序列号就播种它,拿不到才退回 `-1`
+/// (那环境下首轮试一次、什么都没有,与播种之前的行为一致)。
+///
+/// 吃 `Option` 而不是直接调 [`current_change_count`] 是为了让这条**跨平台**规则能在
+/// macOS 上单测 —— 两个平台分支各自只能在真机上跑到(AGENTS.md 的平台绑定约定)。
+pub fn initial_change_count(current: Option<i64>) -> i64 {
+    current.unwrap_or(-1)
+}
+
 impl Watcher {
     /// 构造监听器。
     ///
-    /// `last_change_count` 初始化为 `-1`（不可能的真实值),保证首次轮询若剪贴板
-    /// 非空会捕获一次。
+    /// `last_change_count` 用**构造时的剪贴板序列号**播种(不是 `-1`),于是启动后第一轮
+    /// 会判定「序列号没变」而不捕获既有剪贴板 —— 这正是「删除能扛过重启」所依赖的机制:
+    /// 删除只抹掉库里的行,而库是跨重启唯一的「这份内容我已经见过」的记忆(进程内的
+    /// `last_hash` 与 `changeCount` 都活不过重启)。若首轮照旧捕获,用户刚删掉的密码只要
+    /// 还在剪贴板里就会原样回来;加密区条目更糟 —— 它的 `content_hash` 是 salted 变体,
+    /// 永远不匹配明文指纹,重新入库的会是一条**明文**普通条目(与 `move_to_vault` 同因)。
+    ///
+    /// 代价是 ClipVault 未运行时复制的内容不再于启动后被补录(首轮只认「此后发生的粘贴」)。
     pub fn new(
         storage: Arc<Storage>,
         guest_mode: Arc<AtomicBool>,
@@ -108,7 +146,7 @@ impl Watcher {
             guest_mode,
             skip_next,
             last_hash: Mutex::new(None),
-            last_change_count: AtomicI64::new(-1),
+            last_change_count: AtomicI64::new(initial_change_count(current_change_count())),
         }
     }
 
@@ -152,9 +190,11 @@ impl Watcher {
     ///
     /// 两点差异值得写下来:
     /// - 返回值是 `u32`,这里提升为 `i64` 以复用同一个 `last_change_count` 字段。
-    /// - 序列号拿不到时返回 `0`(如调用方不在交互式窗口站)。此时会因为初值 `-1` 而
-    ///   被判为「增长了」从而空跑一次 `poll_first_non_empty` —— 与 macOS 侧同样情形
-    ///   的行为一致(读一次、什么都没有、返回 `None`),没有额外代价。
+    /// - 序列号拿不到时返回 `0`(如调用方不在交互式窗口站)。此时 [`current_change_count`]
+    ///   把它当作「读不到」,初值退回 `-1`,于是首轮被判为「增长了」并空跑一次
+    ///   `poll_first_non_empty`(读一次、什么都没有、返回 `None`),与 macOS 侧同样情形
+    ///   的行为一致,没有额外代价 —— 反过来若照抄成 `0`,「序列号不可用」就会被误读成
+    ///   「剪贴板永远没变」,整条采集链静默停摆。
     #[cfg(target_os = "windows")]
     fn poll_change(&self) -> Option<Captured> {
         let change_count =
@@ -258,10 +298,10 @@ impl Watcher {
             {
                 // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,不入库
                 // (MVP plan「重复指纹去重(content_hash UNIQUE 触发冲突 → 视为同条)」)。
-                // 级别取 verbose(debug!)而非 WARN:这是**设计内的常见路径** —— `new` 把
-                // 序列号初值设成 -1,启动后第一次轮询就会捕获既有剪贴板,只要那份内容此前
-                // 已入库就必然命中一次;日志在设置面板里给用户看,每次启动一条 WARN 会被
-                // 读成故障(实测就是这样被报回来的)。
+                // 级别取 verbose(debug!)而非 WARN:这是**设计内的常见路径** —— 同一份内容
+                // 隔一会儿再复制一次很常见,in-process 的 5 秒去重窗口拦不住,库里那行还在,
+                // 于是由 `content_hash` UNIQUE 拦下。日志在设置面板里给用户看,每次都留一条
+                // WARN 会被读成故障(实测就是这样被报回来的)。
                 // 仍要留痕的理由:指纹算法一旦退化(如 binary 分支曾漏掉 payload,让同 kind
                 // 的所有内容共用一个指纹),真正的「重复」与「被误判为重复而丢弃的新内容」
                 // 在代码里完全无法区分,只有 verbose 日志能事后分辨。
