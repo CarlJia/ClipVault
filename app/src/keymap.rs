@@ -152,6 +152,24 @@ pub fn parse_set_hotkey_args(
     Ok((action, KeyCombo { mods, key }))
 }
 
+/// 写入口的表内冲突校验：`action` 想拿 `combo`，但表里另一条已经占着它 → `Some(消息)`。
+///
+/// 消息是给前端 toast 用的（落到 `重绑失败：{消息}，已回退到原绑定` 里）。抽成纯函数是
+/// 为了可单测 —— 命令体需要 `State<'_, AppState>`，单测里构造不出来（与
+/// [`parse_set_hotkey_args`] 同理）。
+///
+/// 前端录制路径已经先拦过一遍（那里能说出中文标签），这里是写入口的兜底：前端拦不到
+/// 的路径（`currentKeyMap` 还没加载、手工改过的 `settings` 行、日后的导入）都要在这里
+/// 被挡住，否则两条 action 共用同一组合后会有一条永远不触发。
+pub fn combo_conflict_error(
+    map: &HotkeyMap,
+    action: clipvault_core::keymap::HotkeyAction,
+    combo: clipvault_core::keymap::KeyCombo,
+) -> Option<String> {
+    map.conflict_for(action, combo)
+        .map(|owner| format!("已被「{}」占用", owner.json_key()))
+}
+
 /// 启动路径：从 `settings` 表加载 HotkeyMap → 写入共享 slot → 返回该 map。
 ///
 /// 在 spawn watcher 前调用，与 `boot_load_panel_opacity` 并列。
@@ -168,6 +186,7 @@ pub async fn boot_load_hotkeys(
 mod tests {
     use super::*;
     use crate::storage::test_helpers::open_test_db;
+    use clipvault_core::keymap::{CharKind, HotkeyAction, KeyCombo, Mods};
 
     /// 1. DB 中无 hotkeys 行 → 返回 default()，DB 保持无该行
     #[tokio::test]
@@ -323,5 +342,40 @@ mod tests {
         let err = parse_set_hotkey_args("open_panel", &combo_json(&[], 42.into()))
             .expect_err("non-string key must fail");
         assert!(err.contains("must be a string"), "got: {err}");
+    }
+
+    // ----------------------------------------------------------------
+    // combo_conflict_error：写入口的表内冲突兜底
+    // ----------------------------------------------------------------
+
+    fn combo(mods: Mods, ch: char) -> KeyCombo {
+        KeyCombo {
+            mods,
+            key: CharKind::Char(ch),
+        }
+    }
+
+    /// 组合已被别的 action 占着 → 消息里指名道姓（前端 toast 直接用它）。
+    #[test]
+    fn conflict_error_names_the_owner() {
+        let map = HotkeyMap::default_map();
+        let err = combo_conflict_error(&map, HotkeyAction::Paste, combo(Mods::META, 'e'))
+            .expect("⌘E 是 edit_note 的，必须报冲突");
+        assert_eq!(err, "已被「edit_note」占用");
+    }
+
+    /// 空闲组合、以及「改绑成自己当前那份」都不该报冲突。
+    #[test]
+    fn conflict_error_none_when_free_or_self() {
+        let map = HotkeyMap::default_map();
+        assert_eq!(
+            combo_conflict_error(&map, HotkeyAction::Paste, combo(Mods::META, 'z')),
+            None
+        );
+        assert_eq!(
+            combo_conflict_error(&map, HotkeyAction::EditNote, combo(Mods::META, 'e')),
+            None,
+            "改绑成自己当前那份不该被自己的旧值挡住"
+        );
     }
 }

@@ -200,7 +200,11 @@ impl HotkeyAction {
         }
     }
 
-    fn json_key(&self) -> &'static str {
+    /// action → 线格式键名（[`HotkeyAction::from_json_str`] 的逆）。
+    ///
+    /// 公开是为了让写入口的错误信息能指名道姓（`app/src/keymap.rs` 的
+    /// `combo_conflict_error`）—— core 里没有中文标签表，也不该为一条兜底提示复制一份。
+    pub fn json_key(&self) -> &'static str {
         match self {
             HotkeyAction::OpenPanel => "open_panel",
             HotkeyAction::Paste => "paste",
@@ -326,6 +330,28 @@ impl HotkeyMap {
             },
         );
         HotkeyMap { actions }
+    }
+
+    /// 除 `action` 之外，表里有没有别的 action 已经占着 `combo`。
+    ///
+    /// 组合键在表里必须唯一：两条 action 共用同一个组合时，前端 `matches()` 只会派发给
+    /// [`serialize`] 排序（`BTreeMap`，按 action 名）靠前的那条，另一条从此永远不触发
+    /// —— 而设置里那一行仍然显示着这个组合。写入口（`set_hotkey`）据此拒绝重绑。
+    ///
+    /// 返回**排序靠前**的那一条，也就是前端真正会拿到派发的那条；多条同时占用时结果
+    /// 因此是确定的（`HashMap` 的迭代顺序不承诺稳定，不能直接 `find`）。
+    ///
+    /// 注意：只排除 `action` 自己，不做「全表查重」—— 库里可能已经存在历史重复（这个
+    /// 校验出现之前写进去的），全表查重会让用户连改别的快捷键都做不了。
+    pub fn conflict_for(&self, action: HotkeyAction, combo: KeyCombo) -> Option<HotkeyAction> {
+        let mut owners: Vec<HotkeyAction> = self
+            .actions
+            .iter()
+            .filter(|(a, c)| **a != action && **c == combo)
+            .map(|(a, _)| *a)
+            .collect();
+        owners.sort_by_key(|a| a.json_key());
+        owners.first().copied()
     }
 }
 
@@ -528,5 +554,80 @@ mod tests {
 
         assert!(Mods::empty().is_empty());
         assert!(!Mods::META.is_empty());
+    }
+
+    // ----------------------------------------------------------------
+    // conflict_for：表内组合键唯一性（写入口的冲突校验）
+    // ----------------------------------------------------------------
+
+    fn combo(mods: Mods, ch: char) -> KeyCombo {
+        KeyCombo {
+            mods,
+            key: CharKind::Char(ch),
+        }
+    }
+
+    /// 表里已经有人占着这个组合 → 返回占用者；占用的不是自己那份时也一样。
+    #[test]
+    fn conflict_for_finds_owner() {
+        let map = HotkeyMap::default_map();
+        // ⌘E 是 EditNote 的，Paste 想拿 → 报 EditNote。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META, 'e')),
+            Some(HotkeyAction::EditNote)
+        );
+        // 全局热键也在同一张表里：面板动作想拿 ⌥⌘V 一样会被查出。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META | Mods::ALT, 'v')),
+            Some(HotkeyAction::OpenPanel)
+        );
+    }
+
+    /// 正在改绑的那条自己不算冲突，空闲组合也不算。
+    #[test]
+    fn conflict_for_excludes_self_and_free_combos() {
+        let map = HotkeyMap::default_map();
+        // EditNote 保留自己当前的 ⌘E → 放行。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::EditNote, combo(Mods::META, 'e')),
+            None
+        );
+        // 没人占的组合 → 放行（mods 或键只差一项都不算撞）。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::META, 'z')),
+            None
+        );
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, combo(Mods::SHIFT, 'e')),
+            None
+        );
+    }
+
+    /// 默认表本身必须无冲突：13 条默认绑定里没有任何两条共用同一个组合。
+    #[test]
+    fn default_map_has_no_duplicate_combo() {
+        let map = HotkeyMap::default_map();
+        for (action, bound) in &map.actions {
+            assert_eq!(
+                map.conflict_for(*action, *bound),
+                None,
+                "{action:?} 的默认组合被别的 action 占了"
+            );
+        }
+    }
+
+    /// 多条同时占用时返回**排序靠前**的那条 —— 前端 `matches()` 派发的正是它
+    /// （`HashMap` 迭代顺序不承诺稳定，直接 `find` 会让错误信息飘）。
+    #[test]
+    fn conflict_for_is_deterministic_among_multiple_owners() {
+        let mut map = HotkeyMap::default_map();
+        let shared = combo(Mods::META, 'x');
+        map.actions.insert(HotkeyAction::MoveDown, shared);
+        map.actions.insert(HotkeyAction::EditNote, shared);
+        // "edit_note" < "move_down" → 前者才是真会拿到派发的那条。
+        assert_eq!(
+            map.conflict_for(HotkeyAction::Paste, shared),
+            Some(HotkeyAction::EditNote)
+        );
     }
 }

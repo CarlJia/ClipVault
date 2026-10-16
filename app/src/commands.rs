@@ -660,23 +660,15 @@ pub fn get_hotkeys(state: State<'_, AppState>) -> String {
 
 /// 设置某个 action 的快捷键。
 ///
-/// 写路径：
-/// 1. 把 `serde_json::Value` 解析为 `KeyCombo`
-/// 2. 验证：非空 combo（modifier-only 拒绝）、key 存在
-/// 3. 更新 `HotkeyMap` 中对应 action
-/// 4. `persist_hotkeys` 持久化到 `settings` 表
-/// 5. `apply_hotkeys` 更新 in-memory slot
-///
-/// 设置某个 action 的快捷键。
-///
 /// 写路径（**注册先于落库**，U2 code review P0/P1 修复）：
 /// 1. `parse_set_hotkey_args`：action 字符串 + JSON combo → `(action, combo)`；
 ///    任一非法值在此直接返回 `Err`，不触碰状态。
 /// 2. 构造新 map（仅内存副本，未生效）。
-/// 3. 若改的是全局热键（`OpenPanel`）：先 `apply_global_hotkey` 注册到 OS。
+/// 3. 表内冲突（该 combo 已被另一条 action 占用）→ `Err`，不触碰状态。
+/// 4. 若改的是全局热键（`OpenPanel`）：先 `apply_global_hotkey` 注册到 OS。
 ///    注册失败（冲突 / 不支持的键）→ 直接返回 `Err`，**库与内存 slot 均未改动**，
 ///    用户的旧热键继续可用（这正是 R4 要求的「保持原绑定」）。
-/// 4. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
+/// 5. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
 #[tauri::command]
 pub async fn set_hotkey(
     action: String,
@@ -695,14 +687,23 @@ pub async fn set_hotkey(
         map
     };
 
-    // 3. 全局热键：先注册到 OS，失败即返回，不改任何状态。
+    // 3. 表内冲突：这个组合已经被另一条 action 占着 → 直接返回，不动任何状态。
+    //
+    // 两条 action 共用同一组合时，前端 `matches()` 只会派发给排序靠前的那条，另一条
+    // 永远不触发 —— 而设置里那一行仍然显示着这个组合。前端录制路径已先拦一次（能说出
+    // 中文标签），这里是写入口的兜底。放在 OS 注册之前：被拒的请求连注册都不该碰。
+    if let Some(msg) = crate::keymap::combo_conflict_error(&new_map, action, new_combo) {
+        return Err(msg);
+    }
+
+    // 4. 全局热键：先注册到 OS，失败即返回，不改任何状态。
     if action == HotkeyAction::OpenPanel {
         crate::keymap::apply_global_hotkey(&state.app, &new_map).map_err(|e| e.to_string())?;
     }
 
-    // 4. 持久化 + 更新内存 slot。
+    // 5. 持久化 + 更新内存 slot。
     //
-    // 若持久化失败而全局热键已在 step 3 注册，则尽力把 OS 侧退回旧 combo，
+    // 若持久化失败而全局热键已在 step 4 注册，则尽力把 OS 侧退回旧 combo，
     // 避免「热键生效了但库里还是旧值」的不一致。
     if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &new_map).await {
         if action == HotkeyAction::OpenPanel {
