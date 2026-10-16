@@ -13,6 +13,11 @@
 // 面板没有收掉录制态，用户回到列表敲的第一个字符被吞掉并静默改绑；重建行与取消录制
 // 之间还隔着等 keymap 的轮询窗口，窗口里点「重绑」照样留下一份隐形监听器。
 //
+// 另有录制**成功 / 失败**两条：按下新组合键 → set_hotkey →（成功时 reloadKeymap）→ cancelRecording。
+// 两条此前都只有人工验收 —— 成功那条钉的是顺序（reload 必须在 cancel 之前，否则 refreshRow
+// 先把旧绑定写回键帽、之后再没人纠正）；失败那条钉的是「写库没成功就别 reload」以及
+// 「给出提示 + 键帽回退到库里那一份」。
+//
 // settings.ts 是重 DOM 的模块，但这里只覆盖这几段：用最小 DOM 替身驱动，不引 jsdom
 // （与 keymap.test.ts 里手写 `ev()` 替身同一思路）。
 
@@ -121,6 +126,8 @@ interface FakeDom {
   resetBtn: FakeButton;
   /** `#settings` 模态替身：`classList.add("hidden")` = 用户关掉了设置。 */
   settingsModal: FakeEl;
+  /** `#toast` 替身：失败的录制会往这里写提示。 */
+  toast: FakeEl;
   document: {
     querySelector: (sel: string) => FakeEl | null;
     getElementById: (id: string) => FakeEl | null;
@@ -135,8 +142,10 @@ function makeDom(): FakeDom {
   const rows = new Map<string, FakeRow>(ALL_ACTIONS.map((a) => [a, new FakeRow(a)]));
   const resetBtn = new FakeButton("重置默认");
   const settingsModal = new FakeEl();
+  const toast = new FakeEl();
   const byId = new Map<string, FakeEl>([
     ["settings", settingsModal],
+    ["toast", toast],
     ["hotkey-group-global", new FakeEl()],
     ["hotkey-list-global", new FakeList(["open_panel"], rows)],
     ["hotkey-list-panel", new FakeList(PANEL_ACTIONS, rows)],
@@ -156,7 +165,7 @@ function makeDom(): FakeDom {
       if (type === "keydown") keydown = keydown.filter((f) => f !== fn);
     },
   };
-  return { rows, resetBtn, settingsModal, document, keydownListeners: () => keydown };
+  return { rows, resetBtn, settingsModal, toast, document, keydownListeners: () => keydown };
 }
 
 // ---------------------------------------------------------------------------
@@ -186,7 +195,20 @@ const DEFAULT_WIRE = {
 /** 最近一次 `freshSettings()` 装上的 IPC 替身：用来断言「没有发生静默改绑」。 */
 let invokeMock: ReturnType<typeof vi.fn>;
 
-/** 取一份全新的 settings 模块（模块级录制态不能跨用例复用）。 */
+/** `get_hotkeys` 当下要返回的线格式。改它 = 模拟后端已经写入新绑定。 */
+let wireToReturn: unknown = DEFAULT_WIRE;
+
+/** 非 null 时 `set_hotkey` 抛这个错误 = 模拟后端拒绝这次改绑。 */
+let setHotkeyError: string | null = null;
+
+/** 后端写入新绑定之后的线格式：`paste` 由 Enter 改成 ⇧⌘K。 */
+const NEW_WIRE = {
+  version: 1,
+  actions: {
+    ...DEFAULT_WIRE.actions,
+    paste: { mods: ["meta", "shift"], key: "k" },
+  },
+};
 async function freshSettings(): Promise<typeof import("./settings")> {
   vi.resetModules();
   const invoke = vi.fn(async (cmd: string) => {
@@ -194,7 +216,10 @@ async function freshSettings(): Promise<typeof import("./settings")> {
       case "platform_info":
         return { os: "macos" };
       case "get_hotkeys":
-        return JSON.stringify(DEFAULT_WIRE);
+        return JSON.stringify(wireToReturn);
+      case "set_hotkey":
+        if (setHotkeyError !== null) throw setHotkeyError;
+        return undefined;
       default:
         return undefined;
     }
@@ -223,6 +248,8 @@ function seedRow(dom: FakeDom, action: string, comboText: string): FakeRow {
 beforeEach(() => {
   vi.resetModules();
   vi.unstubAllGlobals();
+  wireToReturn = DEFAULT_WIRE;
+  setHotkeyError = null;
 });
 
 describe("录制态取消：键帽必须回到当前绑定", () => {
@@ -358,5 +385,81 @@ describe("设置面板关掉后录制态必须失效", () => {
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(row.kbd.textContent).toBe("↩");
     expect(row.btn.textContent).toBe("重绑");
+  });
+});
+
+/** 把一次 ⇧⌘K 派发给当前录制监听器；返回它有没有吞掉这一下。 */
+function pressRecordedKey(dom: FakeDom): { prevented: boolean; stopped: boolean } {
+  const listeners = dom.keydownListeners();
+  const onKeyDown = listeners[listeners.length - 1];
+  let prevented = false;
+  let stopped = false;
+  onKeyDown({
+    key: "k",
+    code: "KeyK",
+    metaKey: true,
+    shiftKey: true,
+    altKey: false,
+    ctrlKey: false,
+    preventDefault: () => {
+      prevented = true;
+    },
+    stopPropagation: () => {
+      stopped = true;
+    },
+  } as unknown as KeyboardEvent);
+  return { prevented, stopped };
+}
+
+describe("录制成功：按下新组合键", () => {
+  it("一次画对新绑定：键帽是新值、录制态收干净、IPC 拿到新组合", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
+    wireToReturn = NEW_WIRE; // set_hotkey 之后 get_hotkeys 会读到的新绑定
+
+    startRecording("paste");
+    const { prevented } = pressRecordedKey(dom);
+
+    // 录制态先吞掉这一下（它就是被录进去的那一下），再把组合键交给 IPC。
+    expect(prevented).toBe(true);
+    // 等 set_hotkey → reloadKeymap → cancelRecording 这条链跑完。
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(invokeMock).toHaveBeenCalledWith("set_hotkey", {
+      action: "paste",
+      combo: { mods: ["meta", "shift"], key: "k" },
+    });
+    // 顺序护栏：refreshRow 必须读到 reload 之后的新 keymap —— 反过来（先 cancel 再
+    // reload）会把旧值「↩」写回键帽，再也没人纠正它。
+    expect(row.kbd.textContent).toBe("⌘+⇧+K");
+    expect(row.classList.contains("recording")).toBe(false);
+    expect(row.btn.textContent).toBe("重绑");
+    expect(dom.keydownListeners()).toHaveLength(0);
+    // 成功路径不该弹失败提示。
+    expect(dom.toast.textContent).toBe("");
+  });
+});
+
+describe("录制失败：后端拒绝这次改绑", () => {
+  it("键帽回退到原绑定并给出提示，录制态一样收干净", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
+    setHotkeyError = "unrecognised key '≈'"; // 后端拒绝（wireToReturn 不变 = 库里没改）
+
+    startRecording("paste");
+    const { prevented } = pressRecordedKey(dom);
+    expect(prevented).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // 写库失败 → 不 reload → 键帽回到库里那一份（旧绑定），而不是刚按下的组合。
+    expect(row.kbd.textContent).toBe("↩");
+    expect(row.classList.contains("recording")).toBe(false);
+    expect(row.btn.textContent).toBe("重绑");
+    expect(dom.keydownListeners()).toHaveLength(0);
+    expect(dom.toast.textContent).toBe("重绑失败：unrecognised key '≈'，已回退到原绑定");
   });
 });

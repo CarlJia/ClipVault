@@ -121,7 +121,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  `frontend/src/logview.test.ts` 6 例由 `npm --prefix frontend test` 覆盖。
+  前端由 `npm --prefix frontend test` 覆盖：`keymap.test.ts` 11 例（+1 todo）、
+  `logview.test.ts` 7 例、`settings.test.ts` 9 例（快捷键录制的成功 / 失败 / 取消 / 收口回归），
+  共 27 例。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
