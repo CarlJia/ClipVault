@@ -565,6 +565,81 @@ mod tests {
         assert_eq!(parsed, HotkeyMap::default_map());
     }
 
+    /// `serialize` 的 schema 形状：`version: 1` + 一条不缺 + 命名键的写法。
+    /// 前端的 `DEFAULT_WIRE` / `keyMapFromWire` 直接吃这个格式 —— 形状漂了就是
+    /// 「面板里所有快捷键静默失效」（见 `frontend/src/keymap.test.ts` 顶部）。
+    #[test]
+    fn serialize_default_schema_shape() {
+        let json = serialize(&HotkeyMap::default_map());
+        let value: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
+
+        assert_eq!(value["version"], serde_json::json!(1));
+        let actions = value["actions"].as_object().expect("actions 必须是 object");
+        assert_eq!(actions.len(), all_actions().len(), "每个动作都必须被序列化");
+        assert_eq!(
+            value["actions"]["open_panel"]["mods"],
+            serde_json::json!(["meta", "alt"])
+        );
+        assert_eq!(
+            value["actions"]["open_panel"]["key"],
+            serde_json::json!("v")
+        );
+        // 命名键在线格式里是 token（不是字符），前端靠这张 token 表还原 kind。
+        assert_eq!(
+            value["actions"]["delete_entry"]["key"],
+            serde_json::json!("backspace")
+        );
+    }
+
+    /// `parse` 的拒绝路径：坏 JSON / 截断 / 缺 actions / 未知 version / 只剩修饰键
+    /// （`key` 为 null）/ 不认识的键 token / 不认识的修饰键。每一条都必须 `Err` ——
+    /// 调用方拿到 `Err` 才敢回落产品默认（R3：不得写库），悄悄接受就会把一个
+    /// 永远匹配不上的绑定当成功存下来。
+    #[test]
+    fn parse_rejects_malformed_input() {
+        let cases: &[(&str, &str)] = &[
+            ("非法 JSON", "not json at all"),
+            ("截断的 JSON", r#"{"version":1,"actions":{"open_panel":{"#),
+            ("缺 actions 字段", r#"{"version":1}"#),
+            ("未知 version", r#"{"version":999,"actions":{}}"#),
+            (
+                "key 为 null（只剩修饰键）",
+                r#"{"version":1,"actions":{"open_panel":{"mods":["meta","alt"],"key":null}}}"#,
+            ),
+            (
+                "不认识的键 token",
+                r#"{"version":1,"actions":{"open_panel":{"mods":["meta"],"key":"nope"}}}"#,
+            ),
+            (
+                "不认识的修饰键",
+                r#"{"version":1,"actions":{"open_panel":{"mods":["hyper"],"key":"v"}}}"#,
+            ),
+        ];
+        for (name, json) in cases {
+            assert!(parse(json).is_err(), "{name} 必须被拒绝");
+        }
+    }
+
+    /// 未知 action 静默丢弃（前向兼容），且丢弃不影响其余动作 —— `parse` 从
+    /// `default_map()` 出发，未知项只是被跳过。
+    #[test]
+    fn parse_unknown_action_is_dropped() {
+        let json = r#"{
+            "version": 1,
+            "actions": {
+                "open_panel": {"mods": ["meta", "alt"], "key": "v"},
+                "future_action": {"mods": ["ctrl"], "key": "x"}
+            }
+        }"#;
+        let parsed = parse(json).expect("未知 action 不应导致 parse 失败");
+        assert_eq!(
+            parsed.actions.len(),
+            all_actions().len(),
+            "未知动作被丢弃，其余动作保留默认"
+        );
+        assert_eq!(parsed, HotkeyMap::default_map());
+    }
+
     #[test]
     fn mods_bit_operations() {
         let m = Mods::META | Mods::ALT;
