@@ -663,51 +663,60 @@ pub fn get_hotkeys(state: State<'_, AppState>) -> String {
 /// 写路径（**注册先于落库**，U2 code review P0/P1 修复）：
 /// 1. `parse_set_hotkey_args`：action 字符串 + JSON combo → `(action, combo)`；
 ///    任一非法值在此直接返回 `Err`，不触碰状态。
-/// 2. 构造新 map（仅内存副本，未生效）。
-/// 3. 表内冲突（该 combo 已被另一条 action 占用）→ `Err`，不触碰状态。
-/// 4. 若改的是全局热键（`OpenPanel`）：先 `apply_global_hotkey` 注册到 OS。
-///    注册失败（冲突 / 不支持的键）→ 直接返回 `Err`，**库与内存 slot 均未改动**，
-///    用户的旧热键继续可用（这正是 R4 要求的「保持原绑定」）。
-/// 5. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
+/// 2. 构造新 map（仅内存副本，未生效）：
+///    - `force = false`：该 combo 已被另一条 action 占用 → `Err`，不触碰状态。
+///    - `force = true`（前端「强行换绑」确认后的路径）：`HotkeyMap::claim` 把 combo
+///      归给本 action，并把原来占着它的 action 解绑（写成「未绑定」）。
+/// 3. 若这次改动动了全局热键（`OpenPanel` 的组合变了，或它被解绑）：先
+///    `apply_global_hotkey` 落到 OS。注册失败（冲突 / 不支持的键）→ 直接返回 `Err`，
+///    **库与内存 slot 均未改动**，用户的旧热键继续可用（这正是 R4 要求的「保持原绑定」）。
+/// 4. 注册成功（或改的是面板内快捷键）→ 持久化 + 更新内存 slot。
+///
+/// `force` 是用户意图的传声筒，不是安全边界：前端已经用弹框让用户确认过「另一条会
+/// 变成未绑定」。它只影响「被占用时要拒绝还是抢」，不改变其余校验。
 #[tauri::command]
 pub async fn set_hotkey(
     action: String,
     combo: serde_json::Value,
+    force: bool,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    use clipvault_core::keymap::HotkeyAction;
-
     // 1. 解析入参（纯函数，可单测）。
     let (action, new_combo) = crate::keymap::parse_set_hotkey_args(&action, &combo)?;
 
     // 2. 构造新 map（内存副本）。
+    let old_map = state.keymap.read().unwrap().clone();
     let new_map = {
-        let mut map = state.keymap.read().unwrap().clone();
-        map.actions.insert(action, new_combo);
+        let mut map = old_map.clone();
+        if force {
+            // 强行换绑：占用者变成未绑定，组合键在表里仍然唯一。
+            map.claim(action, new_combo);
+        } else {
+            // 表内冲突：这个组合已经被另一条 action 占着 → 直接返回，不动任何状态。
+            //
+            // 两条 action 共用同一组合时，前端 `matches()` 只会派发给排序靠前的那条，另一条
+            // 永远不触发 —— 而设置里那一行仍然显示着这个组合。前端录制路径已先拦一次（能说出
+            // 中文标签），这里是写入口的兜底。放在 OS 注册之前：被拒的请求连注册都不该碰。
+            if let Some(msg) = crate::keymap::combo_conflict_error(&map, action, new_combo) {
+                return Err(msg);
+            }
+            map.actions.insert(action, Some(new_combo));
+        }
         map
     };
 
-    // 3. 表内冲突：这个组合已经被另一条 action 占着 → 直接返回，不动任何状态。
-    //
-    // 两条 action 共用同一组合时，前端 `matches()` 只会派发给排序靠前的那条，另一条
-    // 永远不触发 —— 而设置里那一行仍然显示着这个组合。前端录制路径已先拦一次（能说出
-    // 中文标签），这里是写入口的兜底。放在 OS 注册之前：被拒的请求连注册都不该碰。
-    if let Some(msg) = crate::keymap::combo_conflict_error(&new_map, action, new_combo) {
-        return Err(msg);
-    }
-
-    // 4. 全局热键：先注册到 OS，失败即返回，不改任何状态。
-    if action == HotkeyAction::OpenPanel {
+    // 3. 全局热键：先注册（或被解绑时摘掉），失败即返回，不改任何状态。
+    let touches_global = crate::keymap::global_hotkey_changed(&old_map, &new_map);
+    if touches_global {
         crate::keymap::apply_global_hotkey(&state.app, &new_map).map_err(|e| e.to_string())?;
     }
 
-    // 5. 持久化 + 更新内存 slot。
+    // 4. 持久化 + 更新内存 slot。
     //
-    // 若持久化失败而全局热键已在 step 4 注册，则尽力把 OS 侧退回旧 combo，
+    // 若持久化失败而全局热键已在 step 3 落过 OS，则尽力把 OS 侧退回旧 map，
     // 避免「热键生效了但库里还是旧值」的不一致。
     if let Err(e) = crate::keymap::set_hotkey(&state.storage, &state.keymap, &new_map).await {
-        if action == HotkeyAction::OpenPanel {
-            let old_map = state.keymap.read().unwrap().clone();
+        if touches_global {
             let _ = crate::keymap::apply_global_hotkey(&state.app, &old_map);
         }
         return Err(e.to_string());

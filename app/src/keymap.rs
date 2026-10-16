@@ -68,6 +68,8 @@ pub fn apply_hotkeys(slot: &RwLock<HotkeyMap>, map: &HotkeyMap) {
 /// - 注册成功：新 combo 生效，旧 combo 已注销，中间不存在「无热键」窗口。
 /// - 注册失败（冲突 / 不支持的键）：旧 combo 原样保留，用户不会掉进
 ///   「一次冲突后永远没有全局热键」的状态，且再次启动时仍从库里的旧值恢复。
+/// - `open_panel` **未绑定**（`None`）：把已注册的摘掉 —— 否则 OS 侧还占着一个组合，
+///   而设置里那行写着「未绑定」（界面与行为对不上）。
 ///
 /// 平台翻译在 `crate::hotkey::register` 内部完成；本函数只串调用链。
 pub fn apply_global_hotkey(
@@ -77,11 +79,26 @@ pub fn apply_global_hotkey(
     use clipvault_core::keymap::HotkeyAction;
 
     // 目前只有 OpenPanel 是全局热键；其余 action 在面板内通过 WebView 处理。
-    if let Some(combo) = map.actions.get(&HotkeyAction::OpenPanel) {
-        crate::hotkey::register(app, HotkeyAction::OpenPanel, combo)?;
+    match map.actions.get(&HotkeyAction::OpenPanel) {
+        Some(Some(combo)) => crate::hotkey::register(app, HotkeyAction::OpenPanel, combo)?,
+        Some(None) => crate::hotkey::unregister(HotkeyAction::OpenPanel),
+        None => {}
     }
 
     Ok(())
+}
+
+/// 这份新 map 是否动了全局热键（`OpenPanel` 的组合变了，或从有键变成未绑定）。
+///
+/// 只有全局热键需要碰 OS：别的 action 走 WebView 派发，注册与否对 OS 无意义。
+/// 写路径据此决定要不要 `apply_global_hotkey`，以及持久化失败时要不要把 OS 侧退回去。
+///
+/// 用「新旧对比」而不是「改的是不是 OpenPanel」：面板动作强行换绑拿走了全局热键的
+/// 组合时，改的**不是** `OpenPanel` 自己，但 `OpenPanel` 确实变成了未绑定 —— 那同样
+/// 必须在 OS 侧摘掉。反之把 `OpenPanel` 改成它当前的值不算动。
+pub fn global_hotkey_changed(old: &HotkeyMap, new: &HotkeyMap) -> bool {
+    use clipvault_core::keymap::HotkeyAction;
+    old.actions.get(&HotkeyAction::OpenPanel) != new.actions.get(&HotkeyAction::OpenPanel)
 }
 
 /// 写路径：持久化 → 更新共享 slot（即时生效）。
@@ -377,5 +394,63 @@ mod tests {
             None,
             "改绑成自己当前那份不该被自己的旧值挡住"
         );
+    }
+
+    /// 未绑定的 action 不再占着它原来的组合 → 写入口不再报冲突。
+    #[test]
+    fn conflict_error_skips_unbound() {
+        let mut map = HotkeyMap::default_map();
+        map.actions.insert(HotkeyAction::EditNote, None);
+        assert_eq!(
+            combo_conflict_error(&map, HotkeyAction::Paste, combo(Mods::META, 'e')),
+            None
+        );
+    }
+
+    // ----------------------------------------------------------------
+    // global_hotkey_changed：这次写要不要碰 OS
+    // ----------------------------------------------------------------
+
+    /// 改面板动作（不动全局热键）→ 不需要碰 OS。
+    #[test]
+    fn global_untouched_for_panel_only_change() {
+        let old = HotkeyMap::default_map();
+        let mut new = old.clone();
+        new.actions
+            .insert(HotkeyAction::Paste, Some(combo(Mods::META, 'z')));
+        assert!(!global_hotkey_changed(&old, &new));
+    }
+
+    /// 改 `open_panel` 自己的组合 → 要重新注册。
+    #[test]
+    fn global_touched_when_open_panel_rebound() {
+        let old = HotkeyMap::default_map();
+        let mut new = old.clone();
+        new.actions.insert(
+            HotkeyAction::OpenPanel,
+            Some(combo(Mods::META | Mods::SHIFT, 'j')),
+        );
+        assert!(global_hotkey_changed(&old, &new));
+    }
+
+    /// 面板动作**强行换绑**抢走了全局热键的组合：改的不是 `open_panel`，但它变成了
+    /// 未绑定 —— OS 侧那一条必须摘掉（这是「A 抢占、B 未绑定」在全局热键上的形态）。
+    #[test]
+    fn global_touched_when_steal_unbinds_open_panel() {
+        let old = HotkeyMap::default_map();
+        let mut new = old.clone();
+        new.claim(HotkeyAction::Paste, combo(Mods::META | Mods::ALT, 'v'));
+        assert_eq!(new.actions.get(&HotkeyAction::OpenPanel), Some(&None));
+        assert!(global_hotkey_changed(&old, &new));
+    }
+
+    /// 把 `open_panel` 写成它当前的值（`force` 抢自己的键）→ 不算动，不碰 OS。
+    #[test]
+    fn global_untouched_when_same_value() {
+        let old = HotkeyMap::default_map();
+        let mut new = old.clone();
+        new.claim(HotkeyAction::OpenPanel, combo(Mods::META | Mods::ALT, 'v'));
+        assert_eq!(new, old);
+        assert!(!global_hotkey_changed(&old, &new));
     }
 }

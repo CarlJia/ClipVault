@@ -517,6 +517,31 @@ body {
 #editor {
   z-index: 30;
 }
+/* 「强行换绑」确认框从设置里唤起，必须盖在 #settings 之上，故再抬一层。 */
+#hotkey-confirm {
+  z-index: 40;
+}
+.confirm-card {
+  max-width: 400px;
+  gap: 10px;
+}
+.confirm-msg {
+  font-size: 13px;
+  line-height: 1.6;
+}
+/* 额外的警告（目前只有「被解绑的是全局热键」这一种）：空文本时不留空档。 */
+.confirm-note {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+}
+.confirm-note:empty {
+  display: none;
+}
+.confirm-actions {
+  display: flex;
+  gap: 8px;
+}
 
 .editor-card {
   width: 100%;

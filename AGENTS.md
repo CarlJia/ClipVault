@@ -116,16 +116,23 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
-- **测试基线**：app 221 passed + core 31 passed（合计 252），1 个 trigram 测试 ignored；
-  最近一次增量是「重绑到已被占用的组合」：`clipvault-core/src/keymap.rs` 的 `conflict_for_*`
-  4 条（找到占用者 / 排除自己与空闲组合 / 默认表本身无重复 / 多条同时占用时取排序靠前那条）
-  与 `app/src/keymap.rs` 的 `conflict_error_*` 2 条（会指名道姓 / 空闲或自己放行）。
+- **测试基线**：app 226 passed + core 37 passed（合计 263），1 个 trigram 测试 ignored；
+  最近一次增量是「未绑定 + 强行换绑」：core +6（`clipvault-core/src/keymap.rs` 的
+  `unbound_action_roundtrips_as_json_null` / `unbound_action_does_not_own_its_old_combo` /
+  `entry_with_null_key_is_still_rejected` / `claim_takes_combo_and_unbinds_owner` /
+  `claim_unbinds_every_other_holder_only` / `claim_on_own_combo_is_noop`）、
+  app +5（`app/src/keymap.rs` 的 `conflict_error_skips_unbound` 与 `global_hotkey_changed`
+  4 条：改面板动作不碰 OS / 改 `open_panel` 自己碰 OS / 被抢占解绑时也要碰 OS / 值没变不碰）。
+  再往前是「重绑到已被占用的组合」：core `conflict_for_*` 4 条（找到占用者 / 排除自己与空闲
+  组合 / 默认表本身无重复 / 多条同时占用时取排序靠前那条）与 app 的 `conflict_error_*` 2 条
+  （会指名道姓 / 空闲或自己放行）。
   更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  前端 3 个文件共 31 例（`keymap.test.ts` 15 + 1 todo、`logview.test.ts` 7、
-  `settings.test.ts` 9）由 `npm --prefix frontend test` 覆盖。
+  前端 3 个文件共 43 例 + 1 todo（`keymap.test.ts` 19 + 1 todo、`settings.test.ts` 17、
+  `logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖；`settings.test.ts` 里 11 例
+  钉住「强行换绑」弹框的三条出口（取消 / `Esc` / 确认）与「未绑定」的显示。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查

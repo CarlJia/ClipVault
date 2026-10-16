@@ -46,13 +46,17 @@ interface WireCombo {
 /**
  * 线格式 HotkeyMap：`actions` 按 action 字符串索引。
  *
+ * 某条 action 的值是 `null` → 该 action **未绑定**（用户「强行换绑」后原来占着这个
+ * 组合的那条会变成这样）。注意与 `{ mods: [], key: null }` 区分：后者是非法 entry
+ * （modifier-only），后端 `parse` 会拒绝整份 JSON。
+ *
  * 未知 action 会被原样保留（`dispatchHotkeyAction` 的 switch 没有对应 case，
  * 派发时静默跳过）—— 「未知 action 丢 silently」是后端 `clipvault_core::keymap::parse`
  * 的行为，前端这一层只做表示转换，不做过滤。
  */
 interface WireHotkeyMap {
   version: number;
-  actions: Record<string, WireCombo>;
+  actions: Record<string, WireCombo | null>;
 }
 
 export type HotkeyAction =
@@ -71,7 +75,8 @@ export type HotkeyAction =
   | "move_down";
 
 export interface HotkeyMap {
-  actions: Record<HotkeyAction, KeyCombo>;
+  /** `null` = 该 action 未绑定（没有快捷键）。 */
+  actions: Record<HotkeyAction, KeyCombo | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -249,15 +254,15 @@ function keyMatches(key: Key, ev: KeyboardEvent): boolean {
 
 /**
  * 用当前 in-memory currentKeyMap 匹配 KeyboardEvent。
- * 返回第一个命中的 HotkeyAction，或 null。
+ * 返回第一个命中的 HotkeyAction，或 null。未绑定的 action（`null`）不参与匹配。
  */
 export function matches(ev: KeyboardEvent): HotkeyAction | null {
   if (!currentKeyMap) return null;
   for (const [action, combo] of Object.entries(currentKeyMap.actions) as [
     HotkeyAction,
-    KeyCombo,
+    KeyCombo | null,
   ][]) {
-    if (comboMatches(combo, ev)) return action;
+    if (combo && comboMatches(combo, ev)) return action;
   }
   return null;
 }
@@ -281,18 +286,19 @@ function comboEquals(a: KeyCombo, b: KeyCombo): boolean {
  * 组合键在表里必须唯一：两条 action 共用同一个组合时，[`matches`] 只会派发给迭代
  * 顺序靠前的那条（线格式由后端 `serialize` 的 `BTreeMap` 按 action 名排序，前端
  * `keyMapFromWire` 原样保留该顺序），另一条从此永远不触发 —— 而设置里那一行仍然
- * 显示着这个组合。录制路径据此把这种重绑拦下来。
+ * 显示着这个组合。录制路径据此把这种重绑拦下来，弹出「强行换绑」确认框。
  *
  * 迭代顺序与 [`matches`] 相同，所以返回的确实是「真会拿到派发的那条」。
+ * 未绑定的 action（`null`）不占用任何组合，跳过。
  */
 export function actionOwningCombo(combo: KeyCombo, except: HotkeyAction): HotkeyAction | null {
   if (!currentKeyMap) return null;
   for (const [action, bound] of Object.entries(currentKeyMap.actions) as [
     HotkeyAction,
-    KeyCombo,
+    KeyCombo | null,
   ][]) {
     if (action === except) continue;
-    if (comboEquals(bound, combo)) return action;
+    if (bound && comboEquals(bound, combo)) return action;
   }
   return null;
 }
@@ -336,14 +342,15 @@ function keyToWire(key: Key): string {
  * **不要**退回 `JSON.parse(json) as HotkeyMap` 的裸断言：线格式的 `key` 是字符串、
  * 内部是带标签的 `Key`，断言只是把差异藏进类型系统，运行时 `key.kind` 恒为
  * undefined —— 所有快捷键静默失效、设置行显示 `⌘+undefined`。
+ *
+ * 线格式的 `null`（未绑定）原样转成内部的 `null`。
  */
 function keyMapFromWire(wire: WireHotkeyMap): HotkeyMap {
-  const actions = {} as Record<HotkeyAction, KeyCombo>;
+  const actions = {} as Record<HotkeyAction, KeyCombo | null>;
   for (const [action, combo] of Object.entries(wire.actions)) {
-    actions[action as HotkeyAction] = {
-      mods: combo.mods,
-      key: keyFromWire(combo.key),
-    };
+    actions[action as HotkeyAction] = combo
+      ? { mods: combo.mods, key: keyFromWire(combo.key) }
+      : null;
   }
   return { actions };
 }
@@ -385,15 +392,21 @@ function serializeComboForBackend(combo: KeyCombo): { mods: string[]; key: strin
 /**
  * 调用 set_hotkey IPC。
  * 返回 { ok: true } | { ok: false, err: string }。
+ *
+ * `force = true`：该组合已被另一条 action 占用时，抢过来并把原来占着它的那条解绑成
+ * 「未绑定」（后端 `HotkeyMap::claim`）。只有用户在「强行换绑」弹框里确认过才传 true
+ * —— 默认 `false`，被占用时后端会拒绝。
  */
 export async function setHotkey(
   action: HotkeyAction,
   combo: KeyCombo,
+  force = false,
 ): Promise<{ ok: true } | { ok: false; err: string }> {
   try {
     await invoke("set_hotkey", {
       action,
       combo: serializeComboForBackend(combo),
+      force,
     });
     return { ok: true };
   } catch (err) {
