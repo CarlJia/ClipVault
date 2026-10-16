@@ -129,7 +129,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `clipvault-core/src/keymap.rs` 的 `default_delete_entry_is_meta_backspace`、
   `default_map_covers_every_action`（core +2）。
   `frontend/src/keymap.test.ts` 现为 22 例（含加密区删除、焦点门与录制规则），
-  与 `frontend/src/logview.test.ts` 的 6 例一起由 `npm --prefix frontend test` 覆盖。
+  与 `frontend/src/logview.test.ts` 的 6 例、`frontend/src/settings.test.ts` 的 5 例
+  （重绑取消后的键帽还原、重建行时不重复绑 / 不留隐形监听器）一起由
+  `npm --prefix frontend test` 覆盖（3 个文件共 33 例）。
   更早的增量来自 `app/src/log.rs`（U1 16 + U2 11 = 27 个新单测）、`app/src/single_instance.rs`
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
