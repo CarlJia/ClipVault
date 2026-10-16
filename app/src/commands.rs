@@ -516,6 +516,22 @@ pub async fn update_entry(
         .ok_or_else(|| "无法构建 EntryDto".to_string())
 }
 
+/// 删除单条记录（主列表与加密区管理共用）。
+///
+/// 只按 `id` 删，不区分是否加密区条目 —— 加密区条目的密文行同样直接删掉，
+/// 不需要先解密（密文与 nonce 随行一起消失）。
+///
+/// 返回实际删掉的行数：`0` 表示这个 id 已经不存在（例如同一条被删了两次）。
+/// 前端据此区分「已删除」与「早就不在了」，不要把它当成恒真的成功信号。
+#[tauri::command]
+pub async fn delete_entry(id: i64, state: State<'_, AppState>) -> Result<usize, String> {
+    state
+        .storage
+        .delete_entry(id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// 设置访客模式开关（U10 / R10）。
 ///
 /// 写路径经 [`crate::privacy::set_guest_mode`]：先更新与 watcher 共享的原子
@@ -715,7 +731,7 @@ pub async fn set_hotkey(
     Ok(())
 }
 
-/// 把全部 13 个热键重置为出厂默认(R4 之外的「恢复原状」入口)。
+/// 把全部 14 个热键重置为出厂默认(R4 之外的「恢复原状」入口)。
 ///
 /// 流程与 `set_hotkey` 同形:
 /// 1. 内存构造一份 default_map()（同 `parse_persist_hotkeys` 的回落路径）。

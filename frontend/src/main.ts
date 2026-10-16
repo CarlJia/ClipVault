@@ -19,6 +19,7 @@ import {
   loadKeymap,
   matches,
   registerKeymapHandlers,
+  textFieldOwnsDeleteKey,
 } from "./keymap";
 import {
   type CategoryInfo,
@@ -38,6 +39,7 @@ import {
   cancelRecording,
   clearLog,
   clearUndecryptable,
+  deleteEntry,
   getGuestMode,
   getPanelOpacity,
   listVault,
@@ -425,6 +427,27 @@ function moveSelection(delta: number): void {
   scrollToSelected();
 }
 
+/**
+ * 删除主列表当前选中的条目（⌘⌫ / `delete_entry`）。
+ *
+ * 删除是破坏性且不可撤销的（剪贴板历史是缓存，不做回收站）。删完整表重拉而不是
+ * 就地摘行：`search_results` 有 `LIMIT` 截断，删除后应把恰好落在线外的那一条补进来，
+ * 标签 / 类别视图的计数也随 `load()` 一起刷新。选中索引保留，后一条顶上原位置。
+ */
+async function deleteCurrentEntry(): Promise<void> {
+  const e = currentEntry();
+  if (!e) return;
+  try {
+    const removed = await deleteEntry(e.id);
+    // 后端回传实际删掉的行数：0 说明这个 id 已经不存在（同一条被删过两次、
+    // 或列表里是陈旧的一条）。报「已删除」会是假成功信号。
+    toast(removed > 0 ? "已删除该条目" : "该条目已不存在");
+    await load();
+  } catch (err) {
+    toast(`删除失败：${String(err)}`);
+  }
+}
+
 // ----------------------------------------------------------------
 // 加密区（U9）：移入加密区 + 加密区管理模态
 // ----------------------------------------------------------------
@@ -448,21 +471,31 @@ async function moveCurrentToVault(): Promise<void> {
   }
 }
 
+/** 按当前 `vaultEntries` 刷新模态头部（条数 / 不可解密数）与「清除不可解密」按钮可见性。 */
+function refreshVaultHeader(): void {
+  const undec = vaultEntries.filter((x) => !x.is_decryptable).length;
+  vaultSubEl.textContent =
+    vaultEntries.length === 0
+      ? `把敏感条目移入加密区（列表中按 ${keys("⌘L")}）后，内容以 AES-256-GCM 加密存储。`
+      : `共 ${vaultEntries.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
+  vaultClearEl.classList.toggle("hidden", undec === 0);
+}
+
+/** 收敛加密区选中索引：列表变短后不要停在越界位置。 */
+function clampVaultSelection(): void {
+  if (vaultSelected >= vaultEntries.length) vaultSelected = vaultEntries.length - 1;
+  if (vaultSelected < 0) vaultSelected = 0;
+}
+
 /** 打开加密区管理模态（⌘⇧V）：列出 vault 条目、按需暴露「清除不可解密」。 */
 async function openVault(): Promise<void> {
   vaultEl.classList.remove("hidden");
   try {
     const items = await listVault();
     vaultEntries = items;
-    if (vaultSelected >= vaultEntries.length) vaultSelected = vaultEntries.length - 1;
-    if (vaultSelected < 0) vaultSelected = 0;
+    clampVaultSelection();
     paintVaultList();
-    const undec = items.filter((x) => !x.is_decryptable).length;
-    vaultSubEl.textContent =
-      items.length === 0
-        ? `把敏感条目移入加密区（列表中按 ${keys("⌘L")}）后，内容以 AES-256-GCM 加密存储。`
-        : `共 ${items.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
-    vaultClearEl.classList.toggle("hidden", undec === 0);
+    refreshVaultHeader();
   } catch (err) {
     vaultEntries = [];
     vaultSelectedEl = null;
@@ -530,6 +563,27 @@ function closeVault(): void {
   vaultEl.classList.add("hidden");
   vaultSelectedEl = null;
   searchEl.focus();
+}
+
+/** ⌘⌫：删除加密区里选中的条目，然后就地重绘（不重拉整表，保持模态与选中位置）。 */
+async function deleteVaultEntry(): Promise<void> {
+  const e = currentVaultEntry();
+  if (!e) return;
+  try {
+    const removed = await deleteEntry(e.id);
+    // 与主列表同一判据：0 行 = 这条早就不在了，别报「已删除」。下面仍按 id 摘行，
+    // 因为无论哪一种情况它都不该继续留在模态列表里。
+    toast(removed > 0 ? "已删除该条目" : "该条目已不存在");
+    // 按 id 摘行，不用 `splice(vaultSelected)`：`await` 期间选中可能已经移动，
+    // 连按两次 ⌘⌫ 也会走到这里 —— 按 id 找才不会摘错行（摘不到说明已摘过）。
+    const idx = vaultEntries.findIndex((x) => x.id === e.id);
+    if (idx >= 0) vaultEntries.splice(idx, 1);
+    clampVaultSelection();
+    paintVaultList();
+    refreshVaultHeader();
+  } catch (err) {
+    toast(`删除失败：${String(err)}`);
+  }
 }
 
 vaultCloseEl.addEventListener("click", closeVault);
@@ -734,6 +788,7 @@ registerKeymapHandlers({
   editNote,
   togglePin,
   moveCurrentToVault,
+  deleteCurrentEntry,
   openUrlAction,
   openVault,
   toggleGuestMode,
@@ -755,6 +810,7 @@ document.addEventListener("keydown", (ev) => {
         moveVaultSelection,
         pasteVaultEntry,
         editVaultNote,
+        deleteVaultEntry,
       })
     )
       return;
@@ -771,7 +827,15 @@ document.addEventListener("keydown", (ev) => {
   // 数据驱动匹配
   const action = matches(ev);
   if (action) {
+    // 焦点门：搜索框常焦，而单行输入里 ⌘⌫ 是「删到行首」。文本框**有内容**时让位给
+    // 原生行为（否则用户在搜索框里按 ⌘⌫ 会删掉一条记录）；空查询时原生无事可做，
+    // 照常删条目 —— 见 textFieldOwnsDeleteKey。
+    if (action === "delete_entry" && textFieldOwnsDeleteKey(ev.target)) return;
     ev.preventDefault();
+    // 键盘自动重复：按住 ⌘⌫ 会源源不断地送 keydown，而删除每次都要重拉整表、
+    // 「顶上来的下一条」在按下期间就换了人 —— 一次长按会把后面的条目连着删掉。
+    // 只吞删除这一类（↑↓ 的自动重复是想要的连读行为）。
+    if (ev.repeat && action === "delete_entry") return;
     dispatchHotkeyAction(action);
     return;
   }

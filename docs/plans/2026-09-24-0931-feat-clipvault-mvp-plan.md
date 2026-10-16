@@ -458,6 +458,8 @@ clipvault/                              (workspace root)
 - **Dependencies.** U1。
 - **Files.** `clipvault-core/src/schema.rs`;`app/src/storage.rs`;`app/src/storage_test.rs`(集成测试)。
 - **Approach.** 单文件 `clipvault.db` 位于 `$HOME/Library/Application Support/ClipVault/clipvault.db`。`user_version` 元组做 schema version。表:`entries(id INTEGER PK, content_hash TEXT UNIQUE, content TEXT, note TEXT, auto_category TEXT, is_pinned INTEGER, pinned_at INTEGER, is_vault INTEGER, is_decryptable INTEGER NOT NULL DEFAULT 1, created_at INTEGER)`( `is_decryptable=1` 表示 Keychain 解密成功;`0` 表示不可解密,如迁移机器后旧条目);`tags(entry_id, tag)`(多对多);`settings(key, value)`。加密区条目写入时立即尝试解密以设置 `is_decryptable`;启动时对所有 `is_vault=1` 条目批量验证 `is_decryptable` 并更新。FTS5 virtual table `entries_fts(content, note, tags_text)` 由 trigger 在 `entries` 与 `tags` 写入时同步;`tags_text` 是用 `, ` 拼接的 tag 列表(便于 `LIKE '%foo%'` 与 FTS 通用)。Connection 用 `Arc<Mutex<Connection>>`,`tokio::sync::Mutex` 包装。测试 helper `storage::test_helpers::open_test_db()` 给出 `:memory:` 数据库。
+
+> **schema 版本补记（2026-10-16）.** 上面写的是 V1；现在最新是 **V4**：V2 加 `entries.nonce`（加密区密文 nonce），V3 加多类型的 `content_kind / mime_type / payload / payload_nonce / metadata_json`（见多类型 plan），**V4 为 `tags.entry_id` 建索引 `idx_tags_entry_id`**（`MIGRATION_V4`）。理由：删除单条记录与「清空不可解密条目」都按 `entry_id` 删 `tags`，`tags_fts_insert` / `tags_fts_delete` 触发器也按 `entry_id` 取值，没有索引每次都是全表扫。纯增量、无数据重写（`IF NOT EXISTS`）。
 - **Test scenarios.**
   - insert + select round-trip.
   - 重复指纹去重(`content_hash` UNIQUE 触发冲突 → 视为同条)。

@@ -110,6 +110,7 @@ const PANEL_ACTIONS: HotkeyAction[] = [
   "edit_note",
   "toggle_pin",
   "move_to_vault",
+  "delete_entry",
   "open_url",
   "open_vault",
   "toggle_guest_mode",
@@ -177,6 +178,7 @@ const DEFAULT_WIRE = {
   version: 1,
   actions: {
     close: { mods: [], key: "escape" },
+    delete_entry: { mods: ["meta"], key: "backspace" },
     edit_note: { mods: ["meta"], key: "e" },
     move_down: { mods: [], key: "arrow_down" },
     move_to_vault: { mods: ["meta"], key: "l" },
@@ -461,5 +463,33 @@ describe("录制失败：后端拒绝这次改绑", () => {
     expect(row.btn.textContent).toBe("重绑");
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.toast.textContent).toBe("重绑失败：unrecognised key '≈'，已回退到原绑定");
+  });
+});
+
+describe("动作基数与分组：设置面板列出的 = keymap 里有的", () => {
+  it("1 全局 + 13 面板 = 14，且与 keymap 的动作集合逐项一致", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { GLOBAL_ACTIONS, PANEL_ACTIONS: panel } = await freshSettings();
+
+    // 这条断言是「基数」类散文（README 的「面板内 13 项」、plan 里的变体数）唯一的
+    // 锚点：动作加了却漏进设置面板 → 用户再也重绑不到它，这里先红。
+    expect(GLOBAL_ACTIONS).toEqual(["open_panel"]);
+    expect(GLOBAL_ACTIONS).toHaveLength(1);
+    expect(panel).toHaveLength(13);
+    expect(Object.keys(DEFAULT_WIRE.actions)).toHaveLength(14);
+    expect([...GLOBAL_ACTIONS, ...panel].sort()).toEqual(
+      Object.keys(DEFAULT_WIRE.actions).sort(),
+    );
+
+    // 分组本身不能有重复项，也不能把全局动作混进面板组（会渲染出两行同一动作）。
+    expect(new Set(panel).size).toBe(panel.length);
+    expect(panel).not.toContain("open_panel");
+
+    // 本文件上方的 DOM 替身按自己的 ALL_ACTIONS 建行，必须覆盖真实分组 ——
+    // 否则 `renderRow` 在真实分组里取不到行（那边的 `!` 会直接抛）。
+    for (const action of [...GLOBAL_ACTIONS, ...panel]) {
+      expect(ALL_ACTIONS, `测试夹具缺少 ${action} 的行`).toContain(action);
+    }
   });
 });

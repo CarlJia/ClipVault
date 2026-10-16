@@ -263,6 +263,26 @@ impl Storage {
         .await
     }
 
+    /// 删除单条记录，连同它的标签行。返回被删除的条目行数（`0` 表示 id 不存在）。
+    ///
+    /// `tags` 必须显式删：连接没有开 `PRAGMA foreign_keys`，schema 里的
+    /// `ON DELETE CASCADE` 不会生效。FTS 索引由 `entries_fts_delete` 触发器同步移除。
+    pub async fn delete_entry(&self, id: i64) -> SqliteResult<usize> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            // 先删 entries 再删 tags：两个触发器都是逐行触发的，反过来写的话
+            // `tags_fts_delete` 会对每个标签行各重写一次 `entries_fts.tags_text`，
+            // 而那一行 FTS 记录紧接着就被 `entries_fts_delete` 整个删掉 —— 纯浪费
+            // （删大文本 + 多标签时可按 10ms 量级实测到）。这个顺序下 tags 触发器的
+            // `WHEN (SELECT is_vault FROM entries …)` 取不到行、求值为 NULL，直接跳过。
+            let removed = tx.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(removed)
+        })
+        .await
+    }
+
     /// Return all distinct tag strings in the database.
     pub async fn get_all_tags(&self) -> SqliteResult<Vec<String>> {
         self.with_conn(|conn| {
@@ -616,10 +636,23 @@ impl Storage {
     /// 返回被删除的行数（plan U9：「清除不可解密条目」入口）。
     pub async fn clear_undecryptable(&self) -> SqliteResult<usize> {
         self.with_conn(|conn| {
-            let n = conn.execute(
+            let tx = conn.transaction()?;
+            // 先删 tags 再删 entries，两条 DELETE 用同一判据。连接没开
+            // `PRAGMA foreign_keys`，`ON DELETE CASCADE` 不生效，所以反过来写的话
+            // 这些 entry_id 随 entries 一起消失，`tags` 里就留下永远指不回条目的
+            // 幽灵标签行（标签云与 tag_counts 会把它们算进去）。
+            // 先删 tags 不会白重写 `entries_fts`：这批判据只命中加密区条目，而
+            // `tags_fts_delete` 的 WHEN 对 `is_vault = 1` 恒为假，直接短路。
+            tx.execute(
+                "DELETE FROM tags WHERE entry_id IN \
+                 (SELECT id FROM entries WHERE is_vault = 1 AND is_decryptable = 0)",
+                [],
+            )?;
+            let n = tx.execute(
                 "DELETE FROM entries WHERE is_vault = 1 AND is_decryptable = 0",
                 [],
             )?;
+            tx.commit()?;
             Ok(n)
         })
         .await
@@ -817,6 +850,192 @@ mod tests {
         assert!(tags.contains(&"tag2".to_string()));
     }
 
+    /// 删除单条：条目行消失、它的标签行同时清掉（连接没开 `PRAGMA foreign_keys`，
+    /// `ON DELETE CASCADE` 不生效，必须显式删）、FTS 索引由触发器同步移除。
+    #[tokio::test]
+    async fn delete_entry_removes_row_tags_and_search_index() {
+        let db = open_test_db();
+        let id = db
+            .insert_entry("del1", "git webhook endpoint", "code")
+            .await
+            .unwrap();
+        db.update_note_and_tags(id, "note", &["doomed".to_string()])
+            .await
+            .unwrap();
+        // 旁观条目：它证明下面「标签清空」的断言是因为删了这一条，而不是库本来就空。
+        let keep = db.insert_entry("del2", "keep me", "plain").await.unwrap();
+        db.update_note_and_tags(keep, "", &["survivor".to_string()])
+            .await
+            .unwrap();
+
+        async fn hits(db: &super::Storage, q: &str) -> Vec<clipvault_core::Entry> {
+            db.search_entries(crate::search::build_search_query(
+                q,
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap()
+        }
+        // 直接探 `entries_fts` 本身。只断言「搜不到」是不够的：`search_entries` 要 join
+        // `entries`，所以条目行删掉后即使 FTS 里留着索引行也照样搜不到 —— 触发器坏掉
+        // 时那条断言仍是绿的。
+        async fn fts_rows(db: &super::Storage, id: i64) -> i64 {
+            db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries_fts WHERE rowid = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+        }
+        assert!(!hits(&db, "webhook").await.is_empty(), "删前必须能搜到");
+        assert_eq!(fts_rows(&db, id).await, 1, "删前 FTS 里应有它的索引行");
+
+        assert_eq!(db.delete_entry(id).await.unwrap(), 1, "应删除 1 行");
+
+        assert!(db.get_by_id(id).await.unwrap().is_none(), "条目应已删除");
+        assert_eq!(
+            db.get_all_tags().await.unwrap(),
+            vec!["survivor".to_string()],
+            "被删条目的标签必须清掉，旁观条目的标签必须留下"
+        );
+
+        assert!(
+            hits(&db, "webhook").await.is_empty(),
+            "删除后全文搜索不应再命中"
+        );
+        assert_eq!(fts_rows(&db, id).await, 0, "FTS 索引行必须由触发器同步移除");
+        assert_eq!(fts_rows(&db, keep).await, 1, "旁观条目的索引行必须留下");
+        assert!(!hits(&db, "keep").await.is_empty(), "旁观条目仍应搜得到");
+
+        // 幂等：再删同一个 id 返回 0，不报错。
+        assert_eq!(db.delete_entry(id).await.unwrap(), 0, "重复删除应返回 0");
+    }
+
+    /// 删除**加密区条目**（`is_vault = 1`）走的是同一条 `delete_entry`，但它有两处
+    /// 与普通条目不同，这里各钉一条：
+    /// - 它本来就没有 `entries_fts` 索引行（INSERT 触发器 `WHEN is_vault = 0`）；
+    /// - `tags_fts_delete` 的 WHEN 对它恒为假（`is_vault = 1`），删它的标签必须**短路**，
+    ///   不能顺手去改别的 FTS 行 —— 若它被当成普通条目处理，下面的 `plaintag` 断言会红。
+    #[tokio::test]
+    async fn delete_entry_handles_vault_row_without_touching_others_fts() {
+        let db = open_test_db();
+        // 直接落一行 `is_vault = 1` 的密文（不经过 Keychain / 真加密）。
+        let vault_id: i64 = db
+            .with_conn(|conn| {
+                conn.execute(
+                    "INSERT INTO entries (content_hash, content, is_vault, is_decryptable)
+                     VALUES ('vaultdel', 'c2VjcmV0', 1, 1)",
+                    [],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+        db.update_note_and_tags(vault_id, "vault note", &["vaulttag".to_string()])
+            .await
+            .unwrap();
+        // 旁观普通条目：证明删加密区条目不会动到别人的 FTS 行。
+        let plain = db
+            .insert_entry("plaindel", "ordinary text", "plain")
+            .await
+            .unwrap();
+        db.update_note_and_tags(plain, "", &["plaintag".to_string()])
+            .await
+            .unwrap();
+
+        async fn fts_tags_text(db: &super::Storage, id: i64) -> String {
+            db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT tags_text FROM entries_fts WHERE rowid = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+        }
+        assert_eq!(fts_tags_text(&db, plain).await, "plaintag");
+
+        assert_eq!(db.delete_entry(vault_id).await.unwrap(), 1, "应删除 1 行");
+
+        assert!(
+            db.get_by_id(vault_id).await.unwrap().is_none(),
+            "加密区条目应已删除"
+        );
+        assert_eq!(
+            db.get_all_tags().await.unwrap(),
+            vec!["plaintag".to_string()],
+            "加密区条目的标签必须清掉，普通条目的标签必须留下"
+        );
+        let vault_fts: i64 = db
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries_fts WHERE rowid = ?1",
+                    [vault_id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(vault_fts, 0, "加密区条目不该出现在 entries_fts 里");
+        assert_eq!(
+            fts_tags_text(&db, plain).await,
+            "plaintag",
+            "旁观条目的 FTS 行不得被改动"
+        );
+    }
+
+    /// `clear_undecryptable` 除了删条目，还必须删掉它们的标签行：`tags` 没有外键级联
+    /// （连接不开 `PRAGMA foreign_keys`），留下就是永远指不回条目的幽灵标签 —— 标签云与
+    /// `tag_counts` 会把它们算进去。
+    ///
+    /// 加密 / 解密标记那条端到端路径由 `crypto_test` 的
+    /// `undecryptable_marked_and_cleared` 覆盖，这里只钉「标签一起删」这一条不变量。
+    #[tokio::test]
+    async fn clear_undecryptable_also_removes_tags() {
+        let db = open_test_db();
+        let doomed = db
+            .insert_entry("ghost1", "unreadable", "plain")
+            .await
+            .unwrap();
+        db.update_note_and_tags(doomed, "", &["ghosttag".to_string()])
+            .await
+            .unwrap();
+        db.set_vault_flag(doomed, 1).await.unwrap();
+        // 判据是 `is_vault = 1 AND is_decryptable = 0`。把可解密位翻成 0 等价于
+        // 「换机器后密钥对不上」的启动校验结果，不必引入 Keychain。
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries SET is_decryptable = 0 WHERE id = ?1",
+                [doomed],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let survivor = db
+            .insert_entry("ghost2", "readable", "plain")
+            .await
+            .unwrap();
+        db.update_note_and_tags(survivor, "", &["survivortag".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(db.clear_undecryptable().await.unwrap(), 1);
+
+        assert!(db.get_by_id(doomed).await.unwrap().is_none());
+        assert_eq!(
+            db.get_all_tags().await.unwrap(),
+            vec!["survivortag".to_string()],
+            "不可解密条目的标签必须一起清掉（否则是幽灵标签），可见条目的标签必须留下"
+        );
+    }
+
     #[tokio::test]
     async fn fts5_hit_on_content() {
         let db = open_test_db();
@@ -957,7 +1176,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn schema_migration_zero_to_three() {
+    async fn schema_migration_zero_to_latest() {
         use rusqlite::Connection;
 
         // Simulate a fresh DB with user_version=0.
@@ -969,7 +1188,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 3);
+        assert_eq!(uv, 4);
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn

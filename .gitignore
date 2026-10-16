@@ -13,3 +13,6 @@ dist/
 .env
 .env.local
 .idea/
+# CodeGraph 的本地代码索引：codegraph.db 是本机生成的二进制（数 MB），换台机器会重建，
+# 不需要进版本库。目录里自带一份 .gitignore 只挡 *.db，整个目录不跟踪更省事。
+.codegraph/
