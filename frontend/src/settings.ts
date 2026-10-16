@@ -457,6 +457,17 @@ document.getElementById("hotkey-confirm-cancel")?.addEventListener("click", () =
 });
 
 /**
+ * 设置模态是否已经关掉（`#settings` 带上 `hidden`）。
+ *
+ * 录制态的监听器挂在 `document` 上，模态关掉之后它照样活着：用户回到主列表敲下的
+ * 第一个字符会被它吞掉，并静默写成那个 action 的新绑定（后端只拦 modifier-only）。
+ * 元素取不到时按「没关」处理 —— 这条只给录制态兜底，不该在非预期环境下改变既有行为。
+ */
+function settingsModalHidden(): boolean {
+  return document.getElementById("settings")?.classList.contains("hidden") ?? false;
+}
+
+/**
  * 开始录制指定 action 的新快捷键。
  * - 全局 keydown 监听持续有效直到 capture 或 cancel。
  * - Escape 或再次点击「取消」退出录制。
@@ -484,6 +495,13 @@ export function startRecording(action: HotkeyAction): void {
   if (btn) btn.textContent = "取消";
 
   const onKeyDown = (ev: KeyboardEvent): void => {
+    // 模态已经关掉（用户点了「关闭」）：这次录制作废。先自我了断再 return —— 不能
+    // preventDefault，否则用户在主列表里敲的这个字符就没了。
+    if (settingsModalHidden()) {
+      cancelRecording();
+      return;
+    }
+
     if (ev.key === "Escape") {
       ev.preventDefault();
       ev.stopPropagation();
@@ -608,11 +626,6 @@ export async function renderHotkeysSection(): Promise<void> {
 
   if (!globalList || !panelList) return;
 
-  // 重建行前先收掉录制态：它指向的 DOM 马上被替换，留下的 keydown 监听器会变成
-  // 「按任意键悄悄改绑」的隐形状态。弹框同理先收掉（它的待答组合来自上一轮的行）。
-  cancelRecording();
-  closeForceRebindDialog(false);
-
   // Linux 隐藏全局热键组
   if (globalGroup) {
     globalGroup.classList.toggle("hidden", isLinux());
@@ -638,6 +651,16 @@ export async function renderHotkeysSection(): Promise<void> {
   <button class="hotkey-rebind">重绑</button>
 </li>`;
   }
+
+  // 重建行前必须收掉录制态：它指向的 DOM 马上被替换，留下的 keydown 监听器会变成
+  // 「按任意键悄悄改绑」的隐形状态。清理要贴着 innerHTML，不能放在上面那段轮询之前 ——
+  // 轮询最长 1s（keymap 拉不到时走满 20 次），这 1s 内点「重绑」照样会留下一份隐形
+  // 监听器：新行没有 `recording` 态，而 recordingAction 还指着它。
+  //
+  // 「强行换绑」弹框同理一起收掉（它的待答组合来自上一轮的行），也贴着 innerHTML：
+  // 弹框的 promise 在轮询窗口里悬着的话，用户看到的是一行已经被替换掉的行。
+  cancelRecording();
+  closeForceRebindDialog(false);
 
   globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
   panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");

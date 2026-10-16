@@ -153,10 +153,11 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  前端 3 个文件共 59 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
+  前端 3 个文件共 63 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
   `Esc` 逃生口、命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs`
-  源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 18（其中 11 例钉住
-  「强行换绑」弹框的三条出口与「未绑定」的显示，1 例钉住「1 全局 + 13 面板 = 14」的动作基数
+  源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 22（其中 11 例钉住
+  「强行换绑」弹框的三条出口与「未绑定」的显示，4 例钉住录制态的收口路径 —— 关掉设置面板、
+  等 keymap 的轮询窗口内重绑、录制成功 / 失败，1 例钉住「1 全局 + 13 面板 = 14」的动作基数
   与分组）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**

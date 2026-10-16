@@ -9,10 +9,20 @@
 // 再绑一个监听器；进行中的录制态在重建行时不清理，会留下「按任意键就悄悄改绑」的
 // 隐形 keydown 监听器。
 //
-// 末尾一组收紧最后一条静默路径：录制到的组合已经被**另一条 action** 占着。写进去不
-// 会报错（后端只查语法与全局热键的 OS 注册），但 `matches()` 只会派发给排序靠前的那
-// 条 —— 另一条永远不触发，而它那一行还显示着这个组合。处理是弹框让用户选：确认 =
-// 强行换绑（原来占着它的那条变成「未绑定」），取消 = 什么都不写。
+// 末尾两组收的都是「录制态监听器挂在 `document` 上」这条根因剩下的静默路径：
+//
+// 1. **关掉设置面板 / 重建行的窗口**：关掉设置没有收掉录制态，用户回到列表敲的第一个
+//    字符被吞掉并静默改绑；重建行与取消录制之间还隔着等 keymap 的轮询窗口，窗口里点
+//    「重绑」照样留下一份隐形监听器。
+// 2. **录到的组合已经被另一条 action 占着**：写进去不会报错（后端只查语法与全局热键的
+//    OS 注册），但 `matches()` 只会派发给排序靠前的那条 —— 另一条永远不触发，而它那一
+//    行还显示着这个组合。处理是弹框让用户选：确认 = 强行换绑（原来占着它的那条变成
+//    「未绑定」），取消 = 什么都不写。
+//
+// 另有录制**成功 / 失败**两条：按下新组合键 → set_hotkey →（成功时 reloadKeymap）→ cancelRecording。
+// 两条此前都只有人工验收 —— 成功那条钉的是顺序（reload 必须在 cancel 之前，否则 refreshRow
+// 先把旧绑定写回键帽、之后再没人纠正）；失败那条钉的是「写库没成功就别 reload」以及
+// 「给出提示 + 键帽回退到库里那一份」。
 //
 // settings.ts 是重 DOM 的模块，但这里只覆盖这几段：用最小 DOM 替身驱动，不引 jsdom
 // （与 keymap.test.ts 里手写 `ev()` 替身同一思路）。
@@ -129,6 +139,8 @@ interface FakeDom {
   /** 快捷键列表容器（`renderRow` 的产物写在 `innerHTML` 里，只做文本断言）。 */
   globalList: FakeList;
   panelList: FakeList;
+  /** `#settings` 模态替身：`classList.add("hidden")` = 用户关掉了设置。 */
+  settingsModal: FakeEl;
   /** `#toast` 替身：重绑 / 换绑失败会往这里写提示。 */
   toast: FakeEl;
   /** 「强行换绑」弹框：遮罩 + 文案 + 两个按钮。 */
@@ -150,6 +162,7 @@ interface FakeDom {
 function makeDom(): FakeDom {
   const rows = new Map<string, FakeRow>(ALL_ACTIONS.map((a) => [a, new FakeRow(a)]));
   const resetBtn = new FakeButton("重置默认");
+  const settingsModal = new FakeEl();
   const toast = new FakeEl();
   const globalList = new FakeList(["open_panel"], rows);
   const panelList = new FakeList(PANEL_ACTIONS, rows);
@@ -160,11 +173,12 @@ function makeDom(): FakeDom {
   const confirmOk = new FakeButton("强行换绑");
   const confirmCancel = new FakeButton("取消");
   const byId = new Map<string, FakeEl>([
+    ["settings", settingsModal],
+    ["toast", toast],
     ["hotkey-group-global", new FakeEl()],
     ["hotkey-list-global", globalList],
     ["hotkey-list-panel", panelList],
     ["hotkey-reset", resetBtn],
-    ["toast", toast],
     ["hotkey-confirm", confirmOverlay],
     ["hotkey-confirm-msg", confirmMsg],
     ["hotkey-confirm-note", confirmNote],
@@ -190,6 +204,7 @@ function makeDom(): FakeDom {
     resetBtn,
     globalList,
     panelList,
+    settingsModal,
     toast,
     confirmOverlay,
     confirmMsg,
@@ -244,9 +259,13 @@ function modsToken(mods: string[]): string {
   return ["meta", "shift", "alt", "ctrl"].filter((m) => mods.includes(m)).join("+");
 }
 
-/** 取一份全新的 settings 模块（模块级录制态 / 弹框态不能跨用例复用）。 */
+/** 取一份全新的 settings 模块（模块级录制态 / 弹框态不能跨用例复用）。
+ *  `failSetHotkey` 传一个字符串 = 模拟后端拒绝这次改绑，这个字符串就是错误文案。 */
 async function freshSettings(
-  options: { wire?: { version: number; actions: Record<string, WireCombo> }; failSetHotkey?: boolean } = {},
+  options: {
+    wire?: { version: number; actions: Record<string, WireCombo> };
+    failSetHotkey?: string;
+  } = {},
 ): Promise<typeof import("./settings")> {
   vi.resetModules();
   setHotkeyCalls = [];
@@ -268,7 +287,7 @@ async function freshSettings(
         case "set_hotkey": {
           if (!args) return undefined;
           setHotkeyCalls.push({ action: args.action, combo: args.combo, force: args.force });
-          if (options.failSetHotkey) throw "boom";
+          if (options.failSetHotkey !== undefined) throw options.failSetHotkey;
           // 像后端一样落库：force 时把原来占着这个组合的其它 action 解绑（`claim`）。
           for (const [action, bound] of Object.entries(wire.actions)) {
             if (
@@ -390,6 +409,139 @@ describe("重复渲染设置区", () => {
     await renderHotkeysSection(); // 重建行 → 必须先把录制态收掉
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.rows.get("paste")!.btn.textContent).toBe("重绑");
+  });
+
+  it("等 keymap 的轮询窗口里点「重绑」，也留不下隐形监听器", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { renderHotkeysSection, startRecording } = await freshSettings();
+
+    const rendering = renderHotkeysSection(); // 不 await：停在等 keymap 的轮询里
+    await new Promise((resolve) => setTimeout(resolve, 0)); // 让渲染跑到轮询处
+    startRecording("paste"); // 窗口内用户点了「重绑」
+    expect(dom.keydownListeners()).toHaveLength(1);
+
+    await rendering; // 轮询结束 → 重建行
+    expect(dom.keydownListeners()).toHaveLength(0);
+  });
+});
+
+describe("设置面板关掉后录制态必须失效", () => {
+  it("放行按键：不吞键、不静默改绑，键帽回到当前绑定", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    expect(row.kbd.textContent).toBe("请按新键…");
+
+    dom.settingsModal.classList.add("hidden"); // 用户点了「关闭」
+
+    const listeners = dom.keydownListeners();
+    const onKeyDown = listeners[listeners.length - 1];
+    let prevented = false;
+    let stopped = false;
+    onKeyDown({
+      key: "a",
+      code: "KeyA",
+      metaKey: false,
+      ctrlKey: false,
+      shiftKey: false,
+      altKey: false,
+      preventDefault: () => {
+        prevented = true;
+      },
+      stopPropagation: () => {
+        stopped = true;
+      },
+    } as unknown as KeyboardEvent);
+
+    // 录制态自我了断：这一下按键不属于它，要留给下面的面板快捷键。
+    // 修复前 `a` 会被吞掉（preventDefault）并写成 paste 的新绑定。
+    expect(prevented).toBe(false);
+    expect(stopped).toBe(false);
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.keydownListeners()).toHaveLength(0);
+    expect(row.kbd.textContent).toBe("↩");
+    expect(row.btn.textContent).toBe("重绑");
+  });
+});
+
+/** 把一次 ⇧⌘K 派发给当前录制监听器；返回它有没有吞掉这一下。 */
+function pressRecordedKey(dom: FakeDom): { prevented: boolean; stopped: boolean } {
+  const listeners = dom.keydownListeners();
+  const onKeyDown = listeners[listeners.length - 1];
+  let prevented = false;
+  let stopped = false;
+  onKeyDown({
+    key: "k",
+    code: "KeyK",
+    metaKey: true,
+    shiftKey: true,
+    altKey: false,
+    ctrlKey: false,
+    preventDefault: () => {
+      prevented = true;
+    },
+    stopPropagation: () => {
+      stopped = true;
+    },
+  } as unknown as KeyboardEvent);
+  return { prevented, stopped };
+}
+
+describe("录制成功：按下新组合键", () => {
+  it("一次画对新绑定：键帽是新值、录制态收干净、IPC 拿到新组合", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
+
+    startRecording("paste");
+    const { prevented } = pressRecordedKey(dom);
+
+    // 录制态先吞掉这一下（它就是被录进去的那一下），再把组合键交给 IPC。
+    expect(prevented).toBe(true);
+    // 等 set_hotkey → reloadKeymap → cancelRecording 这条链跑完。
+    await flush();
+
+    // ⇧⌘K 没被别的 action 占着 → 走普通路径（`force` 为 false），替身像后端一样落库，
+    // 所以这一条同时覆盖「IPC 拿到新组合」与「reloadKeymap 读到的就是新绑定」。
+    expect(setHotkeyCalls).toEqual([
+      { action: "paste", combo: { mods: ["meta", "shift"], key: "k" }, force: false },
+    ]);
+    // 顺序护栏：refreshRow 必须读到 reload 之后的新 keymap —— 反过来（先 cancel 再
+    // reload）会把旧值「↩」写回键帽，再也没人纠正它。
+    expect(row.kbd.textContent).toBe("⌘+⇧+K");
+    expect(row.classList.contains("recording")).toBe(false);
+    expect(row.btn.textContent).toBe("重绑");
+    expect(dom.keydownListeners()).toHaveLength(0);
+    // 成功路径不该弹失败提示。
+    expect(dom.toast.textContent).toBe("");
+  });
+});
+
+describe("录制失败：后端拒绝这次改绑", () => {
+  it("键帽回退到原绑定并给出提示，录制态一样收干净", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings({
+      failSetHotkey: "unrecognised key '≈'", // 后端拒绝（`wire` 不变 = 库里没改）
+    });
+    const row = seedRow(dom, "paste", "↩"); // paste 当前是 Enter
+
+    startRecording("paste");
+    const { prevented } = pressRecordedKey(dom);
+    expect(prevented).toBe(true);
+    await flush();
+
+    // 写库失败 → 不 reload → 键帽回到库里那一份（旧绑定），而不是刚按下的组合。
+    expect(row.kbd.textContent).toBe("↩");
+    expect(row.classList.contains("recording")).toBe(false);
+    expect(row.btn.textContent).toBe("重绑");
+    expect(dom.keydownListeners()).toHaveLength(0);
+    expect(dom.toast.textContent).toBe("重绑失败：unrecognised key '≈'，已回退到原绑定");
   });
 });
 
@@ -607,7 +759,7 @@ describe("重绑到已被占用的组合：弹框让用户选", () => {
   it("换绑（force）失败：toast 说清楚，两行键帽都不动", async () => {
     const dom = makeDom();
     vi.stubGlobal("document", dom.document);
-    const { startRecording } = await freshSettings({ failSetHotkey: true });
+    const { startRecording } = await freshSettings({ failSetHotkey: "boom" });
     const pasteRow = seedRow(dom, "paste", "↩");
     const editRow = seedRow(dom, "edit_note", "⌘+E");
 
