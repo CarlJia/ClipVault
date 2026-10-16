@@ -64,6 +64,7 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 
 - R12. ClipVault 必须从主面板底部 `.hint` div 完全移除快捷键展示;`styles.css` 移除 `.hint` / `.hint kbd` / `.hint .keycap` / `.hint-note` 样式;保留 `.editor-hint`(编辑器底栏仍需)。
 - R13. ClipVault 必须不引入「快捷键在设置里」的指引条(用户选定完全静默移除)。
+- R14. 组合键在快捷键表内必须 1:1。Carbon / `RegisterHotKey` 只管「全局热键被系统或别的程序占了」,管不到「同一张表里另一条 action 已经占着它」—— 后者放进去是静默的:前端 `matches()` 只派发给排序靠前的那条,另一条永远不触发而它那一行仍显示着这个组合。前端录制路径写库前查表(`actionOwningCombo`),命中则不调 `set_hotkey`、键帽回到原绑定、Toast 指名占用者;后端 `set_hotkey` 同样拒收(写入口兜底,覆盖前端查不到的路径)。已存在的历史重复不自动改写 —— 重绑任一条、或点「重置默认」即可。
 
 ### Acceptance Examples
 
@@ -71,6 +72,7 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 - AE2. 用户把面板内 `⌘P`(置顶)改成 `⌘T`,选中条目按 `⌘T` → 切换置顶,`⌘P` 不再响应。
 - AE3. 把全局热键改成已被其它程序占用的组合,Toast 提示「被占用」并保持原 binding,settings 表 `hotkeys` 行未改。
 - AE4. 重启 ClipVault,自定义 binding 仍然生效(从 `settings` 表 `hotkeys` 行恢复)。
+- AE5. 用户把 `paste` 重绑成 `edit_note` 已占用的 `⌘E`:Toast 提示「`⌘E` 已被「编辑备注 / 标签」占用,已保留原绑定」,`paste` 仍是 `↩`,`settings` 表未改;即使绕过前端直呼 `set_hotkey` IPC,后端也返回 `Err` 且不动库与内存 slot。
 
 ### Scope Boundaries
 
@@ -78,7 +80,7 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 
 - 1 个全局热键(目前只有 `⌥⌘V`)+ 11 个面板内主要快捷键(`↩` / `↑↓` / `⌘E` / `⌘P` / `⌘L` / `⌘O` / `⌘⇧V` / `⌘⇧G` / `⌘⇧N` / `⌘,` / `esc`)可重绑。
 - 数据驱动 dispatch + 持久化 + 设置 UI + 点击捕获 + 冲突反馈。
-- 冲突检查 = Carbon / `RegisterHotKey` 返回非 0。
+- 冲突检查 = 表内组合键唯一性(前端录制路径查表 + 后端写入口兜底)+ Carbon / `RegisterHotKey` 返回非 0。
 
 **Out of scope (本 plan 不做).**
 

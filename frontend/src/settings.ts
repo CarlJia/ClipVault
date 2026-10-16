@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { WARN_SVG, type EntryDto } from "./panel";
 import { isWindows, isLinux, keys, whenPlatformReady } from "./platform";
 import {
+  actionOwningCombo,
   currentKeyMap,
   localizedCombo,
   parseKeyCombo,
@@ -401,6 +402,19 @@ export function startRecording(action: HotkeyAction): void {
 
     const combo = parseKeyCombo(ev);
     if (!combo) return;
+
+    // 表内冲突：这个组合已经被另一条 action 占着。写进去不会报错（后端只查语法与
+    // 全局热键的 OS 注册），但两条 action 同组合时 `matches()` 只会派发给排序靠前的
+    // 那条 —— 另一条从此永远不触发，而它那一行仍然显示着这个组合（把 `paste` 改成
+    // `⌘E` 之后，旧的 `↩` 没了、新的 `⌘E` 又永远不灵，回贴快捷键实际失效）。
+    // 模型里没有「未绑定」状态，组合键抢不过来，所以直接拦下：不写库、键帽回到原
+    // 绑定，并说出被谁占着。
+    const owner = actionOwningCombo(combo, action);
+    if (owner) {
+      cancelRecording();
+      showToast(`${comboLabel(combo)} 已被「${ACTION_LABELS[owner]}」占用，已保留原绑定`);
+      return;
+    }
 
     void (async () => {
       const result = await setHotkey(action, combo);

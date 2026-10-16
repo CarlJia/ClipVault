@@ -262,6 +262,41 @@ export function matches(ev: KeyboardEvent): HotkeyAction | null {
   return null;
 }
 
+/** 四个修饰键的规范顺序（`mods` 的顺序不做承诺，比较前要先归一化）。 */
+const MOD_ORDER: Mod[] = ["meta", "shift", "alt", "ctrl"];
+
+/** 把 `mods` 归一化成与顺序无关的 token。 */
+function modsToken(mods: Mod[]): string {
+  return MOD_ORDER.filter((m) => mods.includes(m)).join("+");
+}
+
+/** 组合键结构相等：mods 集合相同，且键是同一个键（`keyToken` 同一套解释）。 */
+function comboEquals(a: KeyCombo, b: KeyCombo): boolean {
+  return keyToken(a.key) === keyToken(b.key) && modsToken(a.mods) === modsToken(b.mods);
+}
+
+/**
+ * 查「已经占着 `combo` 的那条 action」（`except` 自己不算）。
+ *
+ * 组合键在表里必须唯一：两条 action 共用同一个组合时，[`matches`] 只会派发给迭代
+ * 顺序靠前的那条（线格式由后端 `serialize` 的 `BTreeMap` 按 action 名排序，前端
+ * `keyMapFromWire` 原样保留该顺序），另一条从此永远不触发 —— 而设置里那一行仍然
+ * 显示着这个组合。录制路径据此把这种重绑拦下来。
+ *
+ * 迭代顺序与 [`matches`] 相同，所以返回的确实是「真会拿到派发的那条」。
+ */
+export function actionOwningCombo(combo: KeyCombo, except: HotkeyAction): HotkeyAction | null {
+  if (!currentKeyMap) return null;
+  for (const [action, bound] of Object.entries(currentKeyMap.actions) as [
+    HotkeyAction,
+    KeyCombo,
+  ][]) {
+    if (action === except) continue;
+    if (comboEquals(bound, combo)) return action;
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // 线格式 → 内部表示（IPC 边界）
 // ---------------------------------------------------------------------------

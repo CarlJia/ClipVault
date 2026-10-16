@@ -9,6 +9,10 @@
 // 再绑一个监听器；进行中的录制态在重建行时不清理，会留下「按任意键就悄悄改绑」的
 // 隐形 keydown 监听器。
 //
+// 末尾一组收紧最后一条静默路径：录制到的组合已经被**另一条 action** 占着。写进去不
+// 会报错（后端只查语法与全局热键的 OS 注册），但 `matches()` 只会派发给排序靠前的那
+// 条 —— 另一条永远不触发，而它那一行还显示着这个组合。正确行为是拦下并说出占用者。
+//
 // settings.ts 是重 DOM 的模块，但这里只覆盖这几段：用最小 DOM 替身驱动，不引 jsdom
 // （与 keymap.test.ts 里手写 `ev()` 替身同一思路）。
 
@@ -115,6 +119,8 @@ const ALL_ACTIONS: HotkeyAction[] = ["open_panel", ...PANEL_ACTIONS];
 interface FakeDom {
   rows: Map<string, FakeRow>;
   resetBtn: FakeButton;
+  /** `#toast` 替身：被拦下的重绑会往这里写提示。 */
+  toast: FakeEl;
   document: {
     querySelector: (sel: string) => FakeEl | null;
     getElementById: (id: string) => FakeEl | null;
@@ -128,11 +134,13 @@ interface FakeDom {
 function makeDom(): FakeDom {
   const rows = new Map<string, FakeRow>(ALL_ACTIONS.map((a) => [a, new FakeRow(a)]));
   const resetBtn = new FakeButton("重置默认");
+  const toast = new FakeEl();
   const byId = new Map<string, FakeEl>([
     ["hotkey-group-global", new FakeEl()],
     ["hotkey-list-global", new FakeList(["open_panel"], rows)],
     ["hotkey-list-panel", new FakeList(PANEL_ACTIONS, rows)],
     ["hotkey-reset", resetBtn],
+    ["toast", toast],
   ]);
   let keydown: EventListener[] = [];
   const document = {
@@ -148,7 +156,7 @@ function makeDom(): FakeDom {
       if (type === "keydown") keydown = keydown.filter((f) => f !== fn);
     },
   };
-  return { rows, resetBtn, document, keydownListeners: () => keydown };
+  return { rows, resetBtn, toast, document, keydownListeners: () => keydown };
 }
 
 // ---------------------------------------------------------------------------
@@ -175,15 +183,22 @@ const DEFAULT_WIRE = {
   },
 };
 
+/** `set_hotkey` 收到的 IPC 入参（时间序）—— 用来断言「被拦下的重绑一次都没写库」。 */
+let setHotkeyCalls: Array<{ action: string; combo: { mods: string[]; key: string } }>;
+
 /** 取一份全新的 settings 模块（模块级录制态不能跨用例复用）。 */
 async function freshSettings(): Promise<typeof import("./settings")> {
   vi.resetModules();
-  const invoke = vi.fn(async (cmd: string) => {
+  setHotkeyCalls = [];
+  const invoke = vi.fn(async (cmd: string, args?: { action: string; combo: { mods: string[]; key: string } }) => {
     switch (cmd) {
       case "platform_info":
         return { os: "macos" };
       case "get_hotkeys":
         return JSON.stringify(DEFAULT_WIRE);
+      case "set_hotkey":
+        if (args) setHotkeyCalls.push({ action: args.action, combo: args.combo });
+        return undefined;
       default:
         return undefined;
     }
@@ -290,5 +305,100 @@ describe("重复渲染设置区", () => {
     await renderHotkeysSection(); // 重建行 → 必须先把录制态收掉
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.rows.get("paste")!.btn.textContent).toBe("重绑");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 表内冲突：重绑到另一条 action 已经占着的组合
+// ---------------------------------------------------------------------------
+//
+// 模型里没有「未绑定」状态，组合键没法从另一条 action 上抢过来。放进去的后果是
+// 静默的：`matches()` 只会派发给序列化排序（按 action 名）靠前的那条，另一条
+// 从此永远不触发 —— 而设置里那一行仍然显示着这个组合（`paste` 改成 `⌘E` 之后，
+// 旧的 `↩` 没了、新的 `⌘E` 又永远不灵，回贴快捷键实际失效，界面却不这么说）。
+
+/** 把一次按键派发给当前录制监听器（settings.ts 挂在 `document` 上的捕获监听器）。 */
+function pressRecordingKey(
+  dom: FakeDom,
+  init: { key: string; code: string; metaKey?: boolean; shiftKey?: boolean; altKey?: boolean },
+): void {
+  const listeners = dom.keydownListeners();
+  const onKeyDown = listeners[listeners.length - 1];
+  onKeyDown({
+    key: init.key,
+    code: init.code,
+    metaKey: init.metaKey ?? false,
+    shiftKey: init.shiftKey ?? false,
+    altKey: init.altKey ?? false,
+    ctrlKey: false,
+    preventDefault: () => {},
+    stopPropagation: () => {},
+  } as unknown as KeyboardEvent);
+}
+
+describe("重绑到已被占用的组合", () => {
+  it("不写库、提示占用者、键帽回到原绑定、监听器收干净", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const pasteRow = seedRow(dom, "paste", "↩");
+    const editRow = seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("paste");
+    pressRecordingKey(dom, { key: "e", code: "KeyE", metaKey: true }); // ⌘E = edit_note 的
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    // 修复前：这一次照样发给 set_hotkey，toast 为空，两行同时显示 ⌘E。
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.toast.textContent).toBe("⌘+E 已被「编辑备注 / 标签」占用，已保留原绑定");
+    expect(pasteRow.kbd.textContent).toBe("↩");
+    expect(pasteRow.btn.textContent).toBe("重绑");
+    expect(pasteRow.classList.contains("recording")).toBe(false);
+    expect(dom.keydownListeners()).toHaveLength(0);
+    expect(editRow.kbd.textContent).toBe("⌘+E"); // 占用者那一行不受影响
+  });
+
+  it("重绑成自己当前的组合：放行（不该被自己的旧值挡住）", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    pressRecordingKey(dom, { key: "Enter", code: "Enter" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(setHotkeyCalls).toEqual([{ action: "paste", combo: { mods: [], key: "enter" } }]);
+    expect(dom.toast.textContent).toBe("");
+  });
+
+  it("面板动作想拿全局热键（⌥⌘V）的组合：也拦", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "edit_note", "⌘+E");
+
+    startRecording("edit_note");
+    pressRecordingKey(dom, { key: "v", code: "KeyV", metaKey: true, altKey: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.toast.textContent).toBe("⌘+⌥+V 已被「唤出主面板」占用，已保留原绑定");
+    expect(dom.rows.get("edit_note")!.kbd.textContent).toBe("⌘+E");
+  });
+
+  it("全局热键想拿面板动作（⌘E）的组合：也拦", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    seedRow(dom, "open_panel", "⌘+⌥+V");
+
+    startRecording("open_panel");
+    pressRecordingKey(dom, { key: "e", code: "KeyE", metaKey: true });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(setHotkeyCalls).toHaveLength(0);
+    expect(dom.toast.textContent).toBe("⌘+E 已被「编辑备注 / 标签」占用，已保留原绑定");
+    expect(dom.rows.get("open_panel")!.kbd.textContent).toBe("⌘+⌥+V");
   });
 });

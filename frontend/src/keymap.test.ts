@@ -285,3 +285,49 @@ describe("平台主修饰键规则", () => {
   // 把默认呼出键描述为 Ctrl+Alt+V，两边尚未对齐。见 review finding #1。
   it.todo("Windows：Ctrl+X 能命中线格式 mods=[\"meta\"] 的绑定（待主修饰键语义决定）");
 });
+
+// ---------------------------------------------------------------------------
+// actionOwningCombo — 组合键在表内必须唯一
+// ---------------------------------------------------------------------------
+//
+// 录制路径据此把「已被别的 action 占着」的组合拦下来。判定必须是**结构相等**
+// （mods 集合 + 键 token 都相同），否则会把「同键不同修饰键」误判成冲突；
+// 线格式里 mods 的顺序不做承诺，所以比较前要归一化。
+
+describe("actionOwningCombo：找出已经占着这个组合的 action", () => {
+  it("找到占用者，且 mods 顺序无关（⌥⌘V 与 ⌘⌥V 是同一个）", async () => {
+    const km = await freshKeymap();
+    expect(
+      km.actionOwningCombo({ mods: ["alt", "meta"], key: { kind: "char", ch: "v" } }, "paste"),
+    ).toBe("open_panel");
+    expect(
+      km.actionOwningCombo({ mods: ["meta", "alt"], key: { kind: "char", ch: "v" } }, "paste"),
+    ).toBe("open_panel");
+  });
+
+  it("排除正在改绑的那条：自己占着自己不算冲突", async () => {
+    const km = await freshKeymap();
+    expect(km.actionOwningCombo({ mods: [], key: { kind: "enter" } }, "paste")).toBeNull();
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "e" } }, "edit_note"))
+      .toBeNull();
+  });
+
+  it("mods 与 key 必须都相同：只撞一半不算冲突", async () => {
+    const km = await freshKeymap();
+    // 对照：⌘P 确实是 toggle_pin 的。
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "p" } }, "paste"))
+      .toBe("toggle_pin");
+    // 键同、mods 不同（⇧E 在表里没人占）。
+    expect(km.actionOwningCombo({ mods: ["shift"], key: { kind: "char", ch: "e" } }, "paste"))
+      .toBeNull();
+    // mods 同、键不同（⌘Z 在表里没人占）。
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "char", ch: "z" } }, "paste"))
+      .toBeNull();
+  });
+
+  it("命名键与字符键不互相冒充（enter ≠ 'e'）", async () => {
+    const km = await freshKeymap();
+    expect(km.actionOwningCombo({ mods: [], key: { kind: "char", ch: "e" } }, "paste")).toBeNull();
+    expect(km.actionOwningCombo({ mods: ["meta"], key: { kind: "enter" } }, "paste")).toBeNull();
+  });
+});
