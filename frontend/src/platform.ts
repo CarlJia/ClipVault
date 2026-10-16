@@ -52,6 +52,7 @@ const KEY_LABELS: ReadonlyArray<readonly [string, string]> = [
   ["⌥", "Alt+"],
   ["⇧", "Shift+"],
   ["↩", "Enter"],
+  ["⌫", "Backspace"],
 ];
 
 /**

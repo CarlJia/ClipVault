@@ -30,7 +30,8 @@ export type Key =
   | { kind: "escape" }
   | { kind: "arrow_up" }
   | { kind: "arrow_down" }
-  | { kind: "comma" };
+  | { kind: "comma" }
+  | { kind: "backspace" };
 
 export interface KeyCombo {
   mods: Mod[];
@@ -61,6 +62,7 @@ export type HotkeyAction =
   | "edit_note"
   | "toggle_pin"
   | "move_to_vault"
+  | "delete_entry"
   | "open_url"
   | "open_vault"
   | "toggle_guest_mode"
@@ -134,6 +136,11 @@ export function parseKeyCombo(ev: KeyboardEvent): KeyCombo | null {
   const key = keyFromEvent(ev);
   if (!key) return null; // 不认识的键
 
+  // 无修饰的 Backspace 不是可用的绑定：它是文本编辑键，绑上之后**在任何输入框里**
+  // 按退格都会触发该动作（`delete_entry` 会真的删掉一条记录）。要绑就带修饰键
+  // （默认绑定的 ⌘⌫ 就是这种形状）。
+  if (mods.length === 0 && key.kind === "backspace") return null;
+
   return { mods, key };
 }
 
@@ -161,6 +168,8 @@ function keyFromEvent(ev: KeyboardEvent): Key | null {
       return { kind: "arrow_down" };
     case "Comma":
       return { kind: "comma" };
+    case "Backspace":
+      return { kind: "backspace" };
     default:
       break;
   }
@@ -187,6 +196,8 @@ function keyFromKeyString(key: string): Key | null {
       return { kind: "arrow_down" };
     case ",":
       return { kind: "comma" };
+    case "Backspace":
+      return { kind: "backspace" };
     default:
       return key.length === 1 ? { kind: "char", ch: key.toLowerCase() } : null;
   }
@@ -274,7 +285,14 @@ export function matches(ev: KeyboardEvent): HotkeyAction | null {
  * 新增命名键时改这里一处，两个方向同时生效（否则两个方向会各维护一份 switch，
  * 迟早只改一边 —— 那正是本次修复要关掉的那类失效）。
  */
-const NAMED_KEY_KINDS = ["enter", "escape", "arrow_up", "arrow_down", "comma"] as const;
+const NAMED_KEY_KINDS = [
+  "enter",
+  "escape",
+  "arrow_up",
+  "arrow_down",
+  "comma",
+  "backspace",
+] as const;
 
 function isNamedKeyKind(raw: string): raw is (typeof NAMED_KEY_KINDS)[number] {
   return (NAMED_KEY_KINDS as readonly string[]).includes(raw);
@@ -407,6 +425,8 @@ export function localizedCombo(combo: KeyCombo): string {
         return "↓";
       case "comma":
         return ",";
+      case "backspace":
+        return "⌫";
     }
   })();
 
@@ -427,6 +447,7 @@ type Handlers = {
   editNote: () => void;
   togglePin: () => Promise<void>;
   moveCurrentToVault: () => Promise<void>;
+  deleteCurrentEntry: () => Promise<void>;
   openUrlAction: (e: import("./panel").EntryDto) => Promise<void>;
   openVault: () => Promise<void>;
   toggleGuestMode: () => Promise<void>;
@@ -475,6 +496,9 @@ export function dispatchHotkeyAction(action: HotkeyAction): void {
     case "move_to_vault":
       void handlers.moveCurrentToVault();
       break;
+    case "delete_entry":
+      void handlers.deleteCurrentEntry();
+      break;
     case "open_url": {
       const e = handlers.currentEntry();
       if (e) void handlers.openUrlAction(e);
@@ -499,6 +523,55 @@ export function dispatchHotkeyAction(action: HotkeyAction): void {
 }
 
 // ---------------------------------------------------------------------------
+// 焦点门 — 破坏性快捷键让位给文本控件
+// ---------------------------------------------------------------------------
+
+/** 不吃 ⌘⌫ 的 `<input type>`：按钮、勾选框、滑块等没有可编辑文本。 */
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button",
+  "checkbox",
+  "color",
+  "file",
+  "image",
+  "radio",
+  "range",
+  "reset",
+  "submit",
+]);
+
+/**
+ * 「焦点门」：当前聚焦的控件此刻是否会**自己**消费 ⌘⌫ —— 是则破坏性快捷键让位。
+ *
+ * 为什么需要它：面板里搜索框是**常焦**的（唤出 / 关闭 / 切 tab / 关闭模态等路径都调
+ * `searchEl.focus()`，方向键导航也不会让它失焦），而 macOS 单行输入框里 ⌘⌫ 的语义是
+ * 「删到行首」。不加判据的话，用户在搜索框里按 ⌘⌫ 会**删掉一条记录**。
+ *
+ * 为什么不能简单地「有输入框聚焦就不动手」：搜索框常焦，那样 `⌘⌫` 在面板里就彻底失效了。
+ * 判据落在**原生动作此刻有没有事可做**上：
+ * - 文本框 / 文本域：**里面有内容**时才让位（此时原生的「删到行首」才是用户要的）；
+ *   空的时候原生什么都不做，我们照常删条目 —— 这也是面板的常规状态（唤出时是空查询）。
+ * - contenteditable：没法便宜地判断里面有没有内容，保守让位。
+ * - 其余元素（列表行、body、面板空白处）：不是文本控件，不让位。
+ *
+ * 结构性判断而不是 `instanceof HTMLInputElement`：面板外还有 contenteditable，且
+ * keymap 的测试环境没有 DOM（见 `keymap.test.ts` 顶部）。
+ */
+export function textFieldOwnsDeleteKey(target: EventTarget | null): boolean {
+  const el = target as (Partial<HTMLElement> & { type?: string; value?: string }) | null;
+  switch (el?.tagName?.toUpperCase()) {
+    case "TEXTAREA":
+      return (el.value ?? "").length > 0;
+    case "INPUT": {
+      const type = (el.type ?? "text").toLowerCase();
+      if (NON_TEXT_INPUT_TYPES.has(type)) return false;
+      return (el.value ?? "").length > 0;
+    }
+    default:
+      return el?.isContentEditable === true;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // handleVaultKey — 加密区模态内 keydown
 // 逻辑与原有 main.ts:653-685 完全一致，保留以便 keydown listener 调用。
 // ---------------------------------------------------------------------------
@@ -510,6 +583,7 @@ export function handleVaultKey(
     moveVaultSelection: (delta: number) => void;
     pasteVaultEntry: () => Promise<void>;
     editVaultNote: () => void;
+    deleteVaultEntry: () => Promise<void>;
   },
 ): boolean {
   if (ev.key === "Escape") {
@@ -535,6 +609,14 @@ export function handleVaultKey(
   if ((ev.metaKey || ev.ctrlKey) && (ev.key === "e" || ev.key === "E")) {
     ev.preventDefault();
     ctx.editVaultNote();
+    return true;
+  }
+  // ⌘⌫：删除选中的加密区条目（与主列表 delete_entry 的默认绑定同一组键）。
+  // 加密区内快捷键是硬编码的默认镜像（⌘E 亦同），不经 keymap 表。
+  if ((ev.metaKey || ev.ctrlKey) && !ev.shiftKey && !ev.altKey && ev.key === "Backspace") {
+    ev.preventDefault();
+    // 自动重复：按住不放会连删下去，只认第一次 keydown（仍然吞掉事件）。
+    if (!ev.repeat) void ctx.deleteVaultEntry();
     return true;
   }
   // ⌘⇧V：再次按下收起加密区模态

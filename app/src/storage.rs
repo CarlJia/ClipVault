@@ -263,6 +263,26 @@ impl Storage {
         .await
     }
 
+    /// 删除单条记录，连同它的标签行。返回被删除的条目行数（`0` 表示 id 不存在）。
+    ///
+    /// `tags` 必须显式删：连接没有开 `PRAGMA foreign_keys`，schema 里的
+    /// `ON DELETE CASCADE` 不会生效。FTS 索引由 `entries_fts_delete` 触发器同步移除。
+    pub async fn delete_entry(&self, id: i64) -> SqliteResult<usize> {
+        self.with_conn(move |conn| {
+            let tx = conn.transaction()?;
+            // 先删 entries 再删 tags：两个触发器都是逐行触发的，反过来写的话
+            // `tags_fts_delete` 会对每个标签行各重写一次 `entries_fts.tags_text`，
+            // 而那一行 FTS 记录紧接着就被 `entries_fts_delete` 整个删掉 —— 纯浪费
+            // （删大文本 + 多标签时可按 10ms 量级实测到）。这个顺序下 tags 触发器的
+            // `WHEN (SELECT is_vault FROM entries …)` 取不到行、求值为 NULL，直接跳过。
+            let removed = tx.execute("DELETE FROM entries WHERE id = ?1", params![id])?;
+            tx.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])?;
+            tx.commit()?;
+            Ok(removed)
+        })
+        .await
+    }
+
     /// Return all distinct tag strings in the database.
     pub async fn get_all_tags(&self) -> SqliteResult<Vec<String>> {
         self.with_conn(|conn| {
@@ -815,6 +835,71 @@ mod tests {
         let tags = db.get_all_tags().await.unwrap();
         assert!(tags.contains(&"tag1".to_string()));
         assert!(tags.contains(&"tag2".to_string()));
+    }
+
+    /// 删除单条：条目行消失、它的标签行同时清掉（连接没开 `PRAGMA foreign_keys`，
+    /// `ON DELETE CASCADE` 不生效，必须显式删）、FTS 索引由触发器同步移除。
+    #[tokio::test]
+    async fn delete_entry_removes_row_tags_and_search_index() {
+        let db = open_test_db();
+        let id = db
+            .insert_entry("del1", "git webhook endpoint", "code")
+            .await
+            .unwrap();
+        db.update_note_and_tags(id, "note", &["doomed".to_string()])
+            .await
+            .unwrap();
+        // 旁观条目：它证明下面「标签清空」的断言是因为删了这一条，而不是库本来就空。
+        let keep = db.insert_entry("del2", "keep me", "plain").await.unwrap();
+        db.update_note_and_tags(keep, "", &["survivor".to_string()])
+            .await
+            .unwrap();
+
+        async fn hits(db: &super::Storage, q: &str) -> Vec<clipvault_core::Entry> {
+            db.search_entries(crate::search::build_search_query(
+                q,
+                &crate::search::parse_tab("all"),
+                10,
+            ))
+            .await
+            .unwrap()
+        }
+        // 直接探 `entries_fts` 本身。只断言「搜不到」是不够的：`search_entries` 要 join
+        // `entries`，所以条目行删掉后即使 FTS 里留着索引行也照样搜不到 —— 触发器坏掉
+        // 时那条断言仍是绿的。
+        async fn fts_rows(db: &super::Storage, id: i64) -> i64 {
+            db.with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM entries_fts WHERE rowid = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap()
+        }
+        assert!(!hits(&db, "webhook").await.is_empty(), "删前必须能搜到");
+        assert_eq!(fts_rows(&db, id).await, 1, "删前 FTS 里应有它的索引行");
+
+        assert_eq!(db.delete_entry(id).await.unwrap(), 1, "应删除 1 行");
+
+        assert!(db.get_by_id(id).await.unwrap().is_none(), "条目应已删除");
+        assert_eq!(
+            db.get_all_tags().await.unwrap(),
+            vec!["survivor".to_string()],
+            "被删条目的标签必须清掉，旁观条目的标签必须留下"
+        );
+
+        assert!(
+            hits(&db, "webhook").await.is_empty(),
+            "删除后全文搜索不应再命中"
+        );
+        assert_eq!(fts_rows(&db, id).await, 0, "FTS 索引行必须由触发器同步移除");
+        assert_eq!(fts_rows(&db, keep).await, 1, "旁观条目的索引行必须留下");
+        assert!(!hits(&db, "keep").await.is_empty(), "旁观条目仍应搜得到");
+
+        // 幂等：再删同一个 id 返回 0，不报错。
+        assert_eq!(db.delete_entry(id).await.unwrap(), 0, "重复删除应返回 0");
     }
 
     #[tokio::test]

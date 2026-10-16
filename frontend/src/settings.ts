@@ -182,6 +182,11 @@ export async function clearUndecryptable(): Promise<number> {
   return await invoke<number>("clear_undecryptable");
 }
 
+/** 删除单条记录（主列表与加密区管理共用），返回实际删掉的行数（`0` = 该 id 已不存在）。 */
+export async function deleteEntry(id: number): Promise<number> {
+  return await invoke<number>("delete_entry", { id });
+}
+
 /**
  * 刷新「密钥托管不可用」横幅（plan U9）：数据密钥取不到时持续显示，
  * 提示加密区不可用；恢复后自动隐藏。
@@ -288,7 +293,7 @@ export async function setLogLevel(level: string): Promise<string> {
   }
 }
 
-/** 把全部 13 个热键重置为出厂默认。失败抛错(由 UI toast 展示)。 */
+/** 把全部 14 个热键重置为出厂默认。失败抛错(由 UI toast 展示)。 */
 export async function resetHotkeys(): Promise<void> {
   await invoke("reset_hotkeys");
 }
@@ -319,6 +324,7 @@ const ACTION_LABELS: Record<HotkeyAction, string> = {
   edit_note: "编辑备注 / 标签",
   toggle_pin: "切换置顶",
   move_to_vault: "移入加密区",
+  delete_entry: "删除选中条目",
   open_url: "在浏览器打开 URL",
   open_vault: "打开加密区管理",
   toggle_guest_mode: "切换访客模式",
@@ -336,6 +342,7 @@ const PANEL_ACTIONS: HotkeyAction[] = [
   "edit_note",
   "toggle_pin",
   "move_to_vault",
+  "delete_entry",
   "open_url",
   "open_vault",
   "toggle_guest_mode",
@@ -490,7 +497,7 @@ export async function renderHotkeysSection(): Promise<void> {
   globalList.innerHTML = GLOBAL_ACTIONS.map(renderRow).join("");
   panelList.innerHTML = PANEL_ACTIONS.map(renderRow).join("");
 
-  // 绑定「重置默认」按钮:IPC 把全部 13 条热键还原 + 全局热键 OS 侧重注册,
+  // 绑定「重置默认」按钮:IPC 把全部 14 条热键还原 + 全局热键 OS 侧重注册,
   // 成功后再 reloadKeymap() + 重渲染本区(沿用 record 流程的 reload 模式)。
   const resetBtn = document.getElementById("hotkey-reset");
   if (resetBtn) {

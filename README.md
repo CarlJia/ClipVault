@@ -197,7 +197,7 @@ ClipVault 默认全部离线，不做云同步、不上传任何数据（见下�
 ### 可重绑的快捷键
 
 - **全局**（仅 macOS / Windows；Linux 上整组隐藏）：`OpenPanel` 唤出主面板（默认 `⌥⌘V` / `Ctrl+Alt+V`）。
-- **面板内**（13 项）：`Paste`、`EditNote`、`TogglePin`、`MoveToVault`、`OpenUrl`、`OpenVault`、`ToggleGuestMode`、`SkipOnce`、`OpenSettings`、`Close`、`MoveUp`、`MoveDown`。
+- **面板内**（13 项）：`Paste`、`EditNote`、`TogglePin`、`MoveToVault`、`DeleteEntry`、`OpenUrl`、`OpenVault`、`ToggleGuestMode`、`SkipOnce`、`OpenSettings`、`Close`、`MoveUp`、`MoveDown`。
 - **不在范围**：`⌘1-9` 序号直选（用户范围协商结果未选）；`⌥` 双击「本次不记录」修饰键（watcher 侧机制不同）。
 
 ### 重绑流程

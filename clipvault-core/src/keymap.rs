@@ -1,8 +1,8 @@
 //! HotkeyMap 数据层：平台无关的快捷键抽象。
 //!
 //! 数据结构：
-//! - [`HotkeyAction`] — 13 个语义化动作标识符（与前端 dispatch 入口 1:1 对应）。
-//! - [`CharKind`] — 键值类别（字母/数字/符号、Enter、Escape、方向键、逗号）。
+//! - [`HotkeyAction`] — 14 个语义化动作标识符（与前端 dispatch 入口 1:1 对应）。
+//! - [`CharKind`] — 键值类别（字母/数字/符号、Enter、Escape、方向键、逗号、退格）。
 //! - [`KeyCombo`] — 一个具体的按键组合 `{ mods, key }`。
 //! - [`HotkeyMap`] — Action → KeyCombo 的全量映射表（启动时从 settings 表加载，
 //!   运行时存于 `Arc<RwLock<HotkeyMap>>`）。
@@ -129,6 +129,8 @@ pub enum CharKind {
     ArrowUp,
     ArrowDown,
     Comma,
+    /// 退格键（`⌫`）。删除动作的默认主修饰键组合用它。
+    Backspace,
 }
 
 impl Default for CharKind {
@@ -146,6 +148,7 @@ impl CharKind {
             "arrow_up" => Some(CharKind::ArrowUp),
             "arrow_down" => Some(CharKind::ArrowDown),
             "comma" => Some(CharKind::Comma),
+            "backspace" => Some(CharKind::Backspace),
             s if s.len() == 1 => Some(CharKind::Char(
                 s.chars().next().unwrap().to_ascii_lowercase(),
             )),
@@ -161,7 +164,7 @@ pub struct KeyCombo {
     pub key: CharKind,
 }
 
-/// 13 个语义化动作标识符。
+/// 14 个语义化动作标识符。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HotkeyAction {
     OpenPanel,
@@ -169,6 +172,7 @@ pub enum HotkeyAction {
     EditNote,
     TogglePin,
     MoveToVault,
+    DeleteEntry,
     OpenUrl,
     OpenVault,
     ToggleGuestMode,
@@ -188,6 +192,7 @@ impl HotkeyAction {
             "edit_note" => Some(HotkeyAction::EditNote),
             "toggle_pin" => Some(HotkeyAction::TogglePin),
             "move_to_vault" => Some(HotkeyAction::MoveToVault),
+            "delete_entry" => Some(HotkeyAction::DeleteEntry),
             "open_url" => Some(HotkeyAction::OpenUrl),
             "open_vault" => Some(HotkeyAction::OpenVault),
             "toggle_guest_mode" => Some(HotkeyAction::ToggleGuestMode),
@@ -207,6 +212,7 @@ impl HotkeyAction {
             HotkeyAction::EditNote => "edit_note",
             HotkeyAction::TogglePin => "toggle_pin",
             HotkeyAction::MoveToVault => "move_to_vault",
+            HotkeyAction::DeleteEntry => "delete_entry",
             HotkeyAction::OpenUrl => "open_url",
             HotkeyAction::OpenVault => "open_vault",
             HotkeyAction::ToggleGuestMode => "toggle_guest_mode",
@@ -222,7 +228,7 @@ impl HotkeyAction {
 /// Action → KeyCombo 全量映射表。
 ///
 /// **不** 派生 `Default` —— `HashMap` 的派生 Default 产生空表，而本类型的"默认"
-/// 含义是 [`default_map`] 提供的 13 条硬编码条目。`parse` 路径从 default_map 出发、
+/// 含义是 [`default_map`] 提供的 14 条硬编码条目。`parse` 路径从 default_map 出发、
 /// 缺失字段保留默认值；如果本类型有 `Default::default()`，调用方很容易拿到空表。
 /// 调用方请使用 [`HotkeyMap::default_map`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -231,7 +237,7 @@ pub struct HotkeyMap {
 }
 
 impl HotkeyMap {
-    /// 构建包含 13 个默认条目的 HotkeyMap（与 main.ts:649-778 硬编码 1:1 对应）。
+    /// 构建内置的默认热键映射（每个面板动作各一条）。
     pub fn default_map() -> HotkeyMap {
         let mut actions = std::collections::HashMap::new();
         actions.insert(
@@ -267,6 +273,13 @@ impl HotkeyMap {
             KeyCombo {
                 mods: Mods::META,
                 key: CharKind::Char('l'),
+            },
+        );
+        actions.insert(
+            HotkeyAction::DeleteEntry,
+            KeyCombo {
+                mods: Mods::META,
+                key: CharKind::Backspace,
             },
         );
         actions.insert(
@@ -360,6 +373,7 @@ pub fn serialize(map: &HotkeyMap) -> String {
             CharKind::ArrowUp => serde_json::Value::String("arrow_up".to_string()),
             CharKind::ArrowDown => serde_json::Value::String("arrow_down".to_string()),
             CharKind::Comma => serde_json::Value::String("comma".to_string()),
+            CharKind::Backspace => serde_json::Value::String("backspace".to_string()),
         };
         entries.insert(
             action.json_key().to_string(),
@@ -465,6 +479,10 @@ mod tests {
             Some(CharKind::ArrowDown)
         );
         assert_eq!(CharKind::from_json_str("comma"), Some(CharKind::Comma));
+        assert_eq!(
+            CharKind::from_json_str("backspace"),
+            Some(CharKind::Backspace)
+        );
         assert_eq!(CharKind::from_json_str("v"), Some(CharKind::Char('v')));
         assert_eq!(CharKind::from_json_str("V"), Some(CharKind::Char('v'))); // upper normalised
     }
@@ -476,14 +494,17 @@ mod tests {
         assert_eq!(CharKind::from_json_str("vv"), None);
     }
 
-    #[test]
-    fn hotkeyaction_roundtrip() {
-        for action in [
+    /// 全变体清单的唯一副本：`hotkeyaction_roundtrip` 用它做线格式往返，
+    /// `default_map_covers_every_action` 用它当默认映射的基数锚点。
+    /// 返回定长数组，所以新增一个变体时这里会编译失败 —— 这正是要的提醒。
+    fn all_actions() -> [HotkeyAction; 14] {
+        [
             HotkeyAction::OpenPanel,
             HotkeyAction::Paste,
             HotkeyAction::EditNote,
             HotkeyAction::TogglePin,
             HotkeyAction::MoveToVault,
+            HotkeyAction::DeleteEntry,
             HotkeyAction::OpenUrl,
             HotkeyAction::OpenVault,
             HotkeyAction::ToggleGuestMode,
@@ -492,7 +513,12 @@ mod tests {
             HotkeyAction::Close,
             HotkeyAction::MoveUp,
             HotkeyAction::MoveDown,
-        ] {
+        ]
+    }
+
+    #[test]
+    fn hotkeyaction_roundtrip() {
+        for action in all_actions() {
             let key = action.json_key();
             assert_eq!(
                 HotkeyAction::from_json_str(key),
@@ -500,6 +526,36 @@ mod tests {
                 "{key:?} roundtrip failed"
             );
         }
+    }
+
+    /// 默认映射必须给每个动作都留一条。缺一条的后果是设置面板那一行显示 `—`、
+    /// 键位静默失效，而 `default_map()` 与 load 回落路径的比较是同源的，抓不到。
+    #[test]
+    fn default_map_covers_every_action() {
+        let map = HotkeyMap::default_map();
+        for action in all_actions() {
+            assert!(map.actions.contains_key(&action), "{action:?} 缺默认绑定");
+        }
+        assert_eq!(
+            map.actions.len(),
+            all_actions().len(),
+            "默认映射出现了变体清单之外的条目"
+        );
+    }
+
+    /// `delete_entry` 的默认绑定钉在 ⌘⌫（`Meta + Backspace`）—— 它是「删除选中条目」
+    /// 的唯一默认入口，改坏前端就再没有办法删条目。
+    #[test]
+    fn default_delete_entry_is_meta_backspace() {
+        let map = HotkeyMap::default_map();
+        assert_eq!(
+            map.actions.get(&HotkeyAction::DeleteEntry),
+            Some(&KeyCombo {
+                mods: Mods::META,
+                key: CharKind::Backspace,
+            }),
+            "DeleteEntry 必须是 Meta+Backspace"
+        );
     }
 
     #[test]

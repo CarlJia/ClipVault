@@ -174,7 +174,7 @@ mod tests {
     async fn load_none_returns_default() {
         let db = open_test_db();
         let map = load_persist_hotkeys(&db).await.expect("load must succeed");
-        assert_eq!(map.actions.len(), 13, "无 row时应返回 13 条默认映射");
+        assert_eq!(map, HotkeyMap::default_map(), "无 row 时应返回完整默认映射");
         // DB 中应仍无该行
         let raw = db
             .get_setting(HOTKEYS_KEY)
@@ -188,7 +188,7 @@ mod tests {
     async fn persist_then_load_roundtrip() {
         let db = open_test_db();
         // HotkeyMap::default() 是派生 Default（空 HashMap）；
-        // round-trip 后 parse 以 default_map()（13 条）填充，所以 expected 用 default_map()。
+        // round-trip 后 parse 以 default_map()（14 条）填充，所以 expected 用 default_map()。
         let full_default = HotkeyMap::default_map();
         persist_hotkeys(&db, &full_default)
             .await
@@ -208,7 +208,11 @@ mod tests {
             .expect("set_setting must succeed");
 
         let map = load_persist_hotkeys(&db).await.expect("load must succeed");
-        assert_eq!(map.actions.len(), 13, "损坏 JSON 应回落到默认映射");
+        assert_eq!(
+            map,
+            HotkeyMap::default_map(),
+            "损坏 JSON 应回落到完整默认映射"
+        );
 
         // 确认库中仍然是损坏的 JSON（没有重写）
         let raw = db
@@ -248,6 +252,7 @@ mod tests {
             ("arrow_up", CharKind::ArrowUp),
             ("arrow_down", CharKind::ArrowDown),
             ("comma", CharKind::Comma),
+            ("backspace", CharKind::Backspace),
         ] {
             let (action, combo) =
                 parse_set_hotkey_args("move_up", &combo_json(&[], json_key.into()))
