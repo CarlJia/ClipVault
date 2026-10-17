@@ -20,6 +20,7 @@ import {
   matches,
   registerKeymapHandlers,
   textFieldOwnsDeleteKey,
+  textFieldOwnsSpace,
 } from "./keymap";
 import {
   type CategoryInfo,
@@ -62,6 +63,13 @@ import {
   openEditor,
   setEditorCloseHandler,
 } from "./editor";
+import {
+  bindPreviewPane,
+  closePreview,
+  resetPreviewCache,
+  togglePreview,
+  updatePreviewForSelection,
+} from "./preview";
 
 const LIMIT = 50;
 const SEARCH_DEBOUNCE_MS = 100;
@@ -308,6 +316,8 @@ async function load(preferId?: number): Promise<void> {
       }
       paintEntries();
       scrollToSelected();
+      // 列表整体换过（搜索 / 切 tab / 置顶重排 / 删除）：栏里那条可能已经不在选中位上。
+      syncPreview();
     }
   } catch (e) {
     // 取消的请求不报错。
@@ -347,9 +357,12 @@ async function activateIndex(idx: number): Promise<void> {
  *  回贴是「面板的一次性动作」：无论成功（后端直接隐藏面板）还是降级
  *  （内容已在剪贴板），用户都不会再回到模态里，留着它只会挡住下一次唤出，
  *  并让「看得见的是模态、敲进去的是搜索框」。故在每个回贴入口前统一收起。 */
-function dismissOverlays(): void {
+async function dismissOverlays(): Promise<void> {
   if (isVaultOpen()) closeVault();
   if (isEditorOpen()) closeEditor();
+  // 预览栏要把窗口从 960 收回 560（R12）：这里是所有回贴入口的唯一收口，
+  // 等它落回去再往下走 —— 面板随即被后端藏起来，尺寸漏收会留到下一次唤出。
+  await closePreview();
 }
 
 /** 回贴一条记录：面板**显不显示由后端按回贴结果决定**，前端不再插手。
@@ -365,7 +378,7 @@ function dismissOverlays(): void {
 async function pasteEntry(e: EntryDto): Promise<void> {
   // 入口即收起浮层：主列表 ↩ / ⌘1–9 / 双击，以及加密区模态内的 ↩ / 双击，
   // 都走这里，不需要各自记得关闭自己的模态。
-  dismissOverlays();
+  await dismissOverlays();
   try {
     const r = await invoke<PasteResult>("paste_entry", { id: e.id });
     if (r.status === "no_accessibility") {
@@ -430,6 +443,12 @@ function moveSelection(delta: number): void {
   // 选中切换走 classList 增量,DOM 不重建(jsdom 基准:50 行 ~0.02ms)。
   applySelectionPatch(selected);
   scrollToSelected();
+  syncPreview();
+}
+
+/** 选中变了 → 预览栏跟着换内容（R3）。栏没开时是空转。 */
+function syncPreview(): void {
+  updatePreviewForSelection(currentEntry());
 }
 
 /**
@@ -789,6 +808,13 @@ listEl.addEventListener("click", (ev) => {
   if (!row) return;
   selected = Number(row.dataset.index);
   applySelectionPatch(selected);
+  // 缩略图是预览栏的鼠标入口（R11 / KTD3）：仅 image 行的 `.row-thumb`，
+  // 行内其它区域维持「单击选中」原语义。
+  if (target.closest(".row-thumb") && row.dataset.kind === "image") {
+    togglePreview(currentEntry());
+    return;
+  }
+  syncPreview();
 });
 
 listEl.addEventListener("dblclick", (ev) => {
@@ -816,6 +842,7 @@ registerKeymapHandlers({
   triggerSkipOnce,
   openSettings,
   closeSettings,
+  togglePreview: () => togglePreview(currentEntry()),
   currentEntry,
 });
 void loadKeymap();
@@ -852,6 +879,11 @@ document.addEventListener("keydown", (ev) => {
     // 原生行为（否则用户在搜索框里按 ⌘⌫ 会删掉一条记录）；空查询时原生无事可做，
     // 照常删条目 —— 见 textFieldOwnsDeleteKey。
     if (action === "delete_entry" && textFieldOwnsDeleteKey(ev.target)) return;
+    // 焦点门：`preview` 默认是单按 Space，而搜索框常焦 —— 查询词非空时那个空格属于
+    // 用户正在打的字（R9 / KTD2），让给原生输入，不 preventDefault。
+    if (action === "preview" && (textFieldOwnsSpace(ev.target) || searchEl.value.length > 0)) {
+      return;
+    }
     ev.preventDefault();
     // 键盘自动重复：按住 ⌘⌫ 会源源不断地送 keydown，而删除每次都要重拉整表、
     // 「顶上来的下一条」在按下期间就换了人 —— 一次长按会把后面的条目连着删掉。
@@ -878,6 +910,10 @@ document.addEventListener("keydown", (ev) => {
 // 保持模态会让「看得见的是加密区、敲进去的是搜索框」，故每次唤出都从主列表开始。
 window.addEventListener("focus", () => {
   closeVault();
+  // 面板重新被唤出（R12）：预览栏一律收起、窗口回 normal，图片缓存也清掉 ——
+  // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
+  void closePreview();
+  resetPreviewCache();
   searchEl.focus();
   searchEl.select();
   void refreshAccessibilityBanner(bannerEl);
@@ -891,6 +927,7 @@ window.addEventListener("focus", () => {
 // ----------------------------------------------------------------
 
 renderTabs();
+bindPreviewPane(document.querySelector<HTMLElement>("#preview")!);
 searchEl.focus();
 // 编辑器 Esc 关闭后把焦点交还搜索框 / 列表。
 // 若编辑器是从加密区模态内唤起的（⌘⇧V → ⌘E），焦点留在模态里：搜索框在模态之下。
