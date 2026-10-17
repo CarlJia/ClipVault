@@ -13,6 +13,7 @@ import "./styles.css";
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { fetchAppInfo, openRepository, renderAbout, REPOSITORY_URL } from "./about";
 import {
   dispatchHotkeyAction,
   handleVaultKey,
@@ -139,8 +140,20 @@ const logSizeEl = document.querySelector<HTMLSpanElement>("#settings-log-size")!
 const logTailEl = document.querySelector<HTMLPreElement>("#settings-log-tail")!;
 const logClearEl = document.querySelector<HTMLButtonElement>("#settings-log-clear")!;
 
+// 关于浮层（U13）。入口只有托盘「关于 ClipVault」（后端 emit("open-about")），
+// 面板里没有第二个按钮 —— 它是一次性信息，不值得占 UI。
+const aboutEl = document.querySelector<HTMLDivElement>("#about")!;
+const aboutCloseEl = document.querySelector<HTMLButtonElement>("#about-close")!;
+const aboutVersionEl = document.querySelector<HTMLSpanElement>("#about-version")!;
+const aboutGithubEl = document.querySelector<HTMLButtonElement>("#about-github")!;
+
+// 最近一次渲染进关于面板的仓库地址。点「在浏览器打开」用的是它，而不是另一份
+// 写死的常量 —— 显示与打开必须是同一个地址。
+let aboutRepository: string = REPOSITORY_URL;
+
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
+const isAboutOpen = (): boolean => !aboutEl.classList.contains("hidden");
 
 // 当前视图是否在展示「条目列表」（可键盘导航 / 回贴）：
 // recent、all，或 标签/类别 已选中筛选项时。
@@ -653,6 +666,9 @@ function applyPanelOpacity(percent: number): void {
 
 /** 打开设置模态，并把 slider 位置 / 文本对齐到当前后端值。 */
 async function openSettings(): Promise<void> {
+  // 关于压在设置之上（DOM 靠后、同为 .editor 层级）：托盘点「设置…」时它可能
+  // 还开着，不收掉的话用户看到的是纹丝不动的关于界面，以为菜单没反应。
+  if (isAboutOpen()) closeAbout();
   const v = await getPanelOpacity();
   opacityEl.value = String(v);
   opacityValueEl.textContent = `${v}%`;
@@ -704,10 +720,43 @@ function closeSettings(): void {
   searchEl.focus();
 }
 
+/**
+ * 打开关于浮层（U13）：填版本 + GitHub 地址。
+ *
+ * 数据每次打开都重新取一遍（`app_info` 是纯读，代价一次 IPC）—— 版本号在进程
+ * 生命周期内不会变，但「启动时取一次」要多一处状态与失败重试，不划算。
+ * 设置开着时先收掉它：两个模态叠着，Esc 只能关掉上面那个，用户会以为卡住了。
+ */
+async function openAbout(): Promise<void> {
+  // 浮层之间互斥：关于压在最上层（DOM 靠后），底下留着加密区 / 编辑器 / 设置
+  // 会让「看见了关于、按 Esc 却关掉了被遮住的加密区」，更糟的是 `handleVaultKey`
+  // 还会把 ↩ / ⌘⌫ 落到用户看不见的那一层上。打开前统一收干净。
+  if (isVaultOpen()) closeVault();
+  if (isEditorOpen()) closeEditor();
+  if (isSettingsOpen()) closeSettings();
+  const info = await fetchAppInfo();
+  renderAbout({ version: aboutVersionEl, github: aboutGithubEl }, info);
+  // 点开的地址必须就是显示出来的那个：两份常量（Rust / TS）一旦漂移，
+  // 用户会看到 A 却打开 B。
+  aboutRepository = info.repository;
+  aboutEl.classList.remove("hidden");
+  searchEl.focus();
+}
+
+function closeAbout(): void {
+  aboutEl.classList.add("hidden");
+  searchEl.focus();
+}
+
 settingsCloseEl.addEventListener("click", closeSettings);
 // 齿轮入口：点它等同 ⌘, / 托盘「设置…」。
 settingsOpenEl.addEventListener("click", () => {
   void openSettings();
+});
+// 关于浮层：关闭按钮 + 点地址在系统浏览器打开（面板本身不做导航）。
+aboutCloseEl.addEventListener("click", closeAbout);
+aboutGithubEl.addEventListener("click", () => {
+  void openRepository(aboutRepository).catch((err) => toast(`打开失败：${String(err)}`));
 });
 // `input` 事件即时改 CSS 变量 + 文本预览；`change` 事件再写库，
 // 避免拖动过程产生数十次 IPC。
@@ -848,6 +897,16 @@ void loadKeymap();
 document.addEventListener("keydown", (ev) => {
   // 编辑器打开时，列表快捷键让位给编辑器（其 Esc / ⌘S 已在 editor.ts 处理）。
   if (isEditorOpen()) return;
+  // 关于浮层打开时，仅处理 Esc 关闭（U13）。放在加密区之前：关于压在所有浮层
+  // 之上（openAbout 会先收掉它们），但顺序若反过来，用户按 Esc 会关掉被遮住的
+  // 加密区、关于纹丝不动 —— 看起来就是「Esc 失灵」。
+  if (isAboutOpen()) {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeAbout();
+    }
+    return;
+  }
   // 加密区模态打开时：handleVaultKey 处理。
   if (isVaultOpen()) {
     if (
@@ -860,6 +919,15 @@ document.addEventListener("keydown", (ev) => {
       })
     )
       return;
+    return;
+  }
+  // 关于浮层打开时，仅处理 Esc 关闭（U13）。放在设置之前：两者理论上不会同时
+  // 打开（openAbout 会先收掉设置），但顺序写死免得日后新增入口时叠在一起。
+  if (isAboutOpen()) {
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      closeAbout();
+    }
     return;
   }
   // 设置模态打开时，仅处理 Esc 关闭(U12)。
@@ -937,6 +1005,11 @@ setEditorCloseHandler(() => {
 // listen 返回的 Promise unhandled rejection 静默丢弃：失败属异常路径，丢给 window 错误兜底。
 void listen("open-settings", () => {
   void openSettings();
+});
+// U13：托盘「关于 ClipVault」→ 后端 `emit("open-about")` → 前端转呼 openAbout()。
+// 与「设置…」同一套路：托盘没有 UI，只能借主面板这块画布。
+void listen("open-about", () => {
+  void openAbout();
 });
 // U12：启动时一次性把 `--panel-alpha` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。

@@ -1108,3 +1108,50 @@ body {
 .hotkey-rebind:hover {
   background: var(--surface-hover);
 }
+
+/* ---------------------------------------------------------------- */
+/* 关于浮层（U13）                                                   */
+/* ---------------------------------------------------------------- */
+
+/* 卡片比设置窄一档：内容只有产品名 / 版本 / 地址三行，不需要 420px 的宽度。
+   窄卡片也让「GitHub 地址」这一行不容易被撑成两行。 */
+.about-card {
+  max-width: 360px;
+}
+
+.about-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.about-name {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.about-desc {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* 地址做成按钮而不是 <a>：面板里没有可导航的文档流（<a href> 点了会让
+   WebView 自己跳走，把整个面板导航成 GitHub 页面）。点击由 main.ts 转给
+   `open_external_url`，交给系统浏览器。 */
+.about-link {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-align: right;
+  /* 地址较长：允许在任意位置折行，不撑破卡片。 */
+  overflow-wrap: anywhere;
+}
+
+.about-link:hover {
+  text-decoration: underline;
+}

@@ -193,6 +193,8 @@ fn main() {
             commands::list_vault,
             commands::clear_undecryptable,
             commands::open_url,
+            commands::open_external_url,
+            commands::app_info,
             commands::get_log_level,
             commands::set_log_level,
             commands::read_log,

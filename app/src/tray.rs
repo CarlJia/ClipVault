@@ -175,6 +175,21 @@ pub fn set_state(app: &AppHandle, state: TrayState) {
     }
 }
 
+/// 「借主面板画布」的托盘入口 → 需要发给前端的事件名。
+///
+/// 托盘本身没有 UI，设置与关于只能先唤出面板、再让前端打开对应浮层。
+/// 单独抽出来是为了可单测：这条映射一断，用户点菜单就只剩「面板弹一下」，
+/// 而 Rust 侧其它测试（tooltip 文案）一条都不会红。
+fn panel_event_for(id: &str) -> Option<&'static str> {
+    match id {
+        "settings" => Some("open-settings"),
+        // U13：此前 "about" 跟 "vault" 共用一个臂直接 `show_panel`，
+        // 于是「关于」只剩一次空弹面板 —— 关于浮层永远打不开。
+        "about" => Some("open-about"),
+        _ => None,
+    }
+}
+
 /// 托盘菜单事件分发。
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
     match event.id().as_ref() {
@@ -210,13 +225,16 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                 });
             }
         }
-        // 加密区（U9）/ 关于面板（后续）暂先打开主面板占位。
-        "vault" | "about" => crate::panel::show_panel(app),
-        // 设置(U12)：托盘没有 UI，唤出主面板后发事件让前端打开设置模态。
-        "settings" => {
+        // 加密区（U9）暂先打开主面板占位。
+        "vault" => crate::panel::show_panel(app),
+        // 设置(U12) / 关于(U13)：托盘没有 UI，唤出主面板后发事件让前端打开
+        // 对应浮层。两件事共用一条路径，差别只在事件名（见 `panel_event_for`）。
+        "settings" | "about" => {
             crate::panel::show_panel(app);
-            // emit 失败不影响窗口已显示；前端 listen 见 §main.ts openSettings 入口。
-            let _ = app.emit("open-settings", ());
+            // emit 失败不影响窗口已显示；前端 listen 见 §main.ts。
+            if let Some(name) = panel_event_for(event.id().as_ref()) {
+                let _ = app.emit(name, ());
+            }
         }
         // U5：在系统文件管理器中显示日志文件。KTD6 走纯函数 reveal_argv，
         // 失败 best-effort(打 log + 不阻塞其它动作)。
@@ -247,7 +265,7 @@ fn on_tray_icon_event(tray: &tauri::tray::TrayIcon, event: TrayIconEvent) {
 
 #[cfg(test)]
 mod tests {
-    use super::TrayState;
+    use super::{TrayState, panel_event_for};
 
     /// 四态在两端都靠 tooltip 区分（RW7），其中 Error 态的密钥托管叫法分平台。
     /// 文案函数吃显式 `is_macos`，所以 Windows 分支也能在 macOS 上被断言
@@ -272,6 +290,18 @@ mod tests {
             let text = state.tooltip(true);
             assert!(!text.contains("Keychain"), "{text}");
             assert!(!text.contains("凭据管理器"), "{text}");
+        }
+    }
+
+    /// 「设置 / 关于」必须带事件名：只 `show_panel` 等于点了没反应 ——
+    /// 关于面板最初的缺口正是这一条（"about" 与 "vault" 共用占位臂）。
+    #[test]
+    fn panel_entries_emit_their_layer_event() {
+        assert_eq!(panel_event_for("about"), Some("open-about"));
+        assert_eq!(panel_event_for("settings"), Some("open-settings"));
+        // 其它入口只打开面板，不该顺手弹浮层。
+        for id in ["open", "vault", "skip_once", "guest", "logs", "quit"] {
+            assert_eq!(panel_event_for(id), None, "{id} 不该发事件");
         }
     }
 }
