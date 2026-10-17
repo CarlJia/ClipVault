@@ -178,6 +178,8 @@ fn main() {
             commands::toggle_pin,
             commands::update_entry,
             commands::delete_entry,
+            commands::get_entry_preview,
+            commands::set_panel_mode,
             commands::set_guest_mode,
             commands::get_guest_mode,
             commands::set_skip_next,

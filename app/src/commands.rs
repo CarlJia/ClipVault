@@ -18,6 +18,12 @@ use tauri::{AppHandle, Manager, State};
 use crate::storage::Storage;
 use crate::tray::{self, TrayState};
 
+/// 预览栏的数据契约（列表旁预览栏 plan U1）。
+///
+/// 定义在 [`crate::preview`]（与缩放 / 解密逻辑同处），这里只把它带到命令层，
+/// 让「命令与其 DTO 放在一起」的既有读法在 `commands.rs` 里仍然成立。
+pub use crate::preview::PreviewDto;
+
 /// 进程内共享状态：存储句柄 + 与 watcher 共享的两个原子开关。
 ///
 /// `guest_mode` / `skip_next` 与 [`crate::watcher::Watcher`] 持有的是**同一批**
@@ -267,6 +273,19 @@ pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
     // 会把 ⌥⌘V 留在缺席状态。
     crate::keymap::restore_global_hotkey_after_leaving_panel(window.app_handle());
     result
+}
+
+/// 切换面板尺寸档位（列表旁预览栏 plan U2 / R1 / R4）。
+///
+/// `mode` 取 `"normal"`（560×420，列表独占）或 `"expanded"`（960×420，右侧长出
+/// 预览栏）。落在 `panel` 模块：尺寸 / 落位 / 收回时的归位都归它，命令层只做字符串
+/// 到枚举的解析（非法值直接 `Err`，不静默当 normal —— 那样窗口会莫名缩一下）。
+#[tauri::command]
+pub fn set_panel_mode(window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+    let mode = crate::panel::PanelMode::parse(&mode)
+        .ok_or_else(|| format!("未知面板模式：{mode}（应为 normal / expanded）"))?;
+    crate::panel::set_mode(&window, mode);
+    Ok(())
 }
 
 /// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
@@ -846,6 +865,34 @@ pub async fn reset_hotkeys(state: State<'_, AppState>) -> Result<(), String> {
         return Err(e.to_string());
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------
+// 列表旁预览栏（U1 / R5 / R6 / R7）
+// ----------------------------------------------------------------
+
+/// 取一条条目的预览数据（图片按预览尺寸缩放 / 文本给全文 / 其它给 `none`）。
+///
+/// 为什么单独一条命令而不是复用 `search_results` 的 DTO：列表里的 `content`
+/// 对加密区条目是**空**的（密文不下发），图片更是只有 64×64 缩略图。预览需要
+/// 的是「这一条的原内容」，按需取一次即可 —— 为它给整个列表多带一份原图是大浪费。
+///
+/// 错误语义（R5）：id 不存在、图片解不开 → `Err(String)`；「条目在、但这个类型
+/// 没有预览」→ `Ok(kind = "none")`。两种情形前端表现不同（前者 toast，后者显示提示）。
+#[tauri::command]
+pub async fn get_entry_preview(id: i64, state: State<'_, AppState>) -> Result<PreviewDto, String> {
+    // 解密器按平台给：macOS 是 Keychain、Windows 是凭据管理器（`crypto` 模块的两个
+    // `default_vault_cipher`），其余平台没有凭据库。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let decryptor = crate::crypto::default_vault_cipher();
+        crate::preview::get_entry_preview_inner(&state.storage, id, &decryptor).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        crate::preview::get_entry_preview_inner(&state.storage, id, &crate::preview::NoDecryptor)
+            .await
+    }
 }
 
 // ----------------------------------------------------------------

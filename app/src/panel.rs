@@ -20,11 +20,40 @@ use tauri::{AppHandle, Manager, Window};
 /// 主面板窗口 label（与 `tauri.conf.json` 的 `windows[0].label` 一致）。
 pub const PANEL_LABEL: &str = "main";
 
-/// 面板逻辑尺寸（与 `tauri.conf.json` 的 `width` × `height` 一致）。
+/// 面板尺寸档位（列表旁预览栏 plan KTD6）。
 ///
-/// macOS 的 AppKit 点即逻辑像素，不需要缩放换算；Windows 侧（U3）再按目标屏
-/// `scale_factor` 换成物理像素。
-const PANEL_SIZE: (f64, f64) = (560.0, 420.0);
+/// 两档而不是「随便设尺寸」：`tauri.conf.json` 里的初始尺寸必须与 [`PanelMode::Normal`]
+/// 一致，否则启动首帧会跳一下；`Expanded` 只是「normal + 右侧预览栏」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PanelMode {
+    /// 560×420：列表独占面板（`tauri.conf.json` 的初始尺寸）。
+    Normal,
+    /// 960×420：右侧长出 400pt 的预览栏，高度不变（列表不上下抖）。
+    Expanded,
+}
+
+impl PanelMode {
+    /// 前端 IPC 的字符串 → 档位。非法值返回 `None`（命令层据此报错，
+    /// 而不是悄悄当 normal —— 那样面板会莫名缩一下，用户只看到「预览打不开」）。
+    pub fn parse(raw: &str) -> Option<PanelMode> {
+        match raw {
+            "normal" => Some(PanelMode::Normal),
+            "expanded" => Some(PanelMode::Expanded),
+            _ => None,
+        }
+    }
+}
+
+/// 两档的逻辑尺寸（macOS 的 AppKit 点 / Windows 的逻辑像素，落位时再按平台换算）。
+pub fn panel_size_for(mode: PanelMode) -> (f64, f64) {
+    match mode {
+        PanelMode::Normal => (560.0, 420.0),
+        PanelMode::Expanded => (960.0, 420.0),
+    }
+}
+
+/// 几何比较的容差：落位坐标来自系统（整点或半像素），浮点相等的直接比较会偶发失败。
+const EPS: f64 = 0.5;
 
 // ================================================================
 // U1：摆放决策纯函数层（KTD2）
@@ -193,6 +222,87 @@ pub(crate) fn appkit_frame_origin(
     (top_x, top_y)
 }
 
+/// 展开 / 收回时窗口实际用的尺寸：工作区装不下 expanded 时把宽度收到工作区宽度，
+/// 但**不小于** normal 宽度（列表是主界面，再窄就没法用了）。
+///
+/// 这一档是 plan KTD7 的降级路径：正常 1440pt 以上的工作区走不到它，窄屏 / 分屏
+/// 拖到很窄时才生效 —— 那时预览栏自己按 flex 比例被挤窄，而不是窗口溢出屏外。
+pub(crate) fn fitted_size(work: Rect, mode: PanelMode) -> (f64, f64) {
+    let (w, h) = panel_size_for(mode);
+    let (normal_w, _) = panel_size_for(PanelMode::Normal);
+    (w.min(work.w.max(normal_w)), h)
+}
+
+/// 展开时窗口左上角的落点（左上原点、y 向下；KTD7）。
+///
+/// **以列表的左上角为锚点**：展开只是右侧多长出一栏，列表不该跟着挪 —— 用户正在
+/// 盯着的那一行动一下，方向键的连续操作就断了。
+///
+/// - 右侧装得下 → 左上角不动，栏向右长。
+/// - 右侧不够、左侧够 → 窗口整体左移「长出来的那一截」，列表位置不变、栏向左伸。
+/// - 两侧都不够（超窄工作区，宽度已被 [`fitted_size`] 收过）→ 工作区内居中。
+pub(crate) fn expanded_origin(
+    cur: Point,
+    work: Rect,
+    size: (f64, f64),
+    normal: (f64, f64),
+) -> Point {
+    let (w, _) = size;
+    let y = cur.y; // 高度两档相同，纵向一律不动。
+    if cur.x + w <= work.x + work.w + EPS {
+        return Point { x: cur.x, y };
+    }
+    let flipped = cur.x - (w - normal.0);
+    if flipped >= work.x - EPS {
+        return Point { x: flipped, y };
+    }
+    Point {
+        x: work.x + ((work.w - w) / 2.0).max(0.0),
+        y,
+    }
+}
+
+/// 展开前的窗口左上角，供收回时把列表放回原处（R4：对齐到开启前的那条工作区边界）。
+///
+/// 存的是**本平台的落位坐标**（macOS：AppKit 左上角点；Windows：物理像素左上角）——
+/// 两侧各写各读，不跨平台解释，也就没有换算误差。只记最新一次展开的前一档：
+/// 连续展开 / 收回本来就有序，成对调用（`Remember` → `Take`）之后自然清空。
+static RESTORE_ORIGIN: std::sync::Mutex<Option<(f64, f64)>> = std::sync::Mutex::new(None);
+
+/// 记住「展开前」的位置。只在切到 expanded 时调用。
+fn remember_restore_origin(origin: (f64, f64)) {
+    if let Ok(mut slot) = RESTORE_ORIGIN.lock() {
+        *slot = Some(origin);
+    }
+}
+
+/// 取走「展开前」的位置（取一次即清空）。收回时调用。
+fn take_restore_origin() -> Option<(f64, f64)> {
+    RESTORE_ORIGIN.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// 切换面板尺寸档位：先设尺寸，再按平台落位（macOS 见 [`imp_macos`]，Windows 见
+/// [`imp_win`]）。
+///
+/// 调用方是 `commands::set_panel_mode`（前端预览栏开 / 关时发的那条 IPC）。失败一律
+/// 内部消化并留一条日志：尺寸没变不会让面板不可用，而把错误抛给前端只会多一条
+/// 没人看得懂的 toast。
+pub fn set_mode(window: &tauri::WebviewWindow, mode: PanelMode) {
+    #[cfg(target_os = "macos")]
+    imp_macos::apply_mode(window, mode);
+    #[cfg(target_os = "windows")]
+    imp_win::apply_mode(window, mode);
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        // 其余平台没有预览栏（Deferred），但仍跟进尺寸，免得窗口停在一个
+        // 前端已经不再布局的宽度上。
+        let (w, h) = panel_size_for(mode);
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(w, h)) {
+            ::log::warn!(target: "panel", "set_panel_mode({mode:?}) 失败：{e}");
+        }
+    }
+}
+
 /// 失焦时是否应当自动收起面板。抽成纯判定便于单测。
 ///
 /// 两个条件缺一不可：
@@ -307,8 +417,9 @@ mod imp_macos {
     use objc2_foundation::{MainThreadMarker, NSPoint, NSRect};
 
     use super::{
-        Display, FocusSource, PANEL_SIZE, Point, Rect, appkit_frame_origin, centered_offset,
-        focused_source, log_skip_once, select_display,
+        Display, FocusSource, PanelMode, Point, Rect, appkit_frame_origin, centered_offset,
+        expanded_origin, fitted_size, focused_source, log_skip_once, panel_size_for,
+        select_display, take_restore_origin,
     };
 
     /// 面板的 NSWindow（`tauri::WebviewWindow::ns_window` 的稳定逃生口）。
@@ -397,8 +508,8 @@ mod imp_macos {
             log_skip_once("no-screen", "取不到任何显示器，保留面板原位置");
             return;
         };
-        let offset = centered_offset(display.work, PANEL_SIZE);
-        let (x, y) = appkit_frame_origin(offset, display.work, PANEL_SIZE);
+        let offset = centered_offset(display.work, panel_size_for(PanelMode::Normal));
+        let (x, y) = appkit_frame_origin(offset, display.work, panel_size_for(PanelMode::Normal));
 
         let Some(ns) = ns_window(window) else {
             log_skip_once("no-ns-window", "取不到 NSWindow，保留面板原位置");
@@ -407,6 +518,69 @@ mod imp_macos {
         // `show()` 在主线程上是同步的；直接在 `show()` 之前同步落位，避免 tao 的
         // `set_outer_position` 走 `dispatch_async` 造成「先画旧位置一帧」（KTD3）。
         ns.setFrameTopLeftPoint(NSPoint::new(x, y));
+    }
+
+    /// 切换尺寸档位（U2 / R1 / R4）：`Expanded` 把列表左上角锚在原地向右长，
+    /// `Normal` 回到展开前的位置。
+    ///
+    /// 全程 AppKit 点：`frame` 的 y 是**底边**，而 [`expanded_origin`] 与
+    /// [`appkit_frame_origin`] 吃的是「左上原点、y 向下」，故进出各翻转一次
+    /// （`work.y + work.h` 是工作区顶边）。
+    pub(super) fn apply_mode(window: &tauri::WebviewWindow, mode: PanelMode) {
+        // 尺寸先落：`setFrameTopLeftPoint` 只动左上角，与尺寸无关，顺序不会互相覆盖。
+        let Some(mtm) = MainThreadMarker::new() else {
+            log_skip_once("mode-not-main-thread", "不在主线程，只改尺寸不改位置");
+            set_size_only(window, mode);
+            return;
+        };
+        let screens = displays(mtm);
+        let Some(display) = pick_display(mtm, &screens) else {
+            log_skip_once("mode-no-screen", "取不到显示器，只改尺寸不改位置");
+            set_size_only(window, mode);
+            return;
+        };
+        let work = display.work;
+        let size = fitted_size(work, mode);
+        set_size(window, size);
+
+        let Some(ns) = ns_window(window) else {
+            log_skip_once("mode-no-ns-window", "取不到 NSWindow，只改尺寸不改位置");
+            return;
+        };
+
+        match mode {
+            PanelMode::Normal => {
+                // 收回：回到展开前的位置。没有记录（不是从 expanded 回来的，例如
+                // 启动后前端首次对齐）就什么都别做 —— 当前位置本来就是对的。
+                if let Some((x, y)) = take_restore_origin() {
+                    ns.setFrameTopLeftPoint(NSPoint::new(x, y));
+                }
+            }
+            PanelMode::Expanded => {
+                let frame = ns.frame();
+                super::remember_restore_origin((frame.origin.x, frame.origin.y));
+                let cur = Point {
+                    x: frame.origin.x,
+                    y: work.y + work.h - (frame.origin.y + frame.size.height),
+                };
+                let origin = expanded_origin(cur, work, size, panel_size_for(PanelMode::Normal));
+                let (x, y) =
+                    appkit_frame_origin((origin.x - work.x, origin.y - work.y), work, size);
+                ns.setFrameTopLeftPoint(NSPoint::new(x, y));
+            }
+        }
+    }
+
+    /// 只改尺寸（落位前置条件不满足时的降级）：窗口大小对了，位置留在原处。
+    fn set_size_only(window: &tauri::WebviewWindow, mode: PanelMode) {
+        set_size(window, panel_size_for(mode));
+    }
+
+    /// `set_size` 的失败只在日志里留痕：尺寸没变不影响面板可用。
+    fn set_size(window: &tauri::WebviewWindow, size: (f64, f64)) {
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(size.0, size.1)) {
+            ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
+        }
     }
 }
 
@@ -433,8 +607,9 @@ mod imp_win {
     };
 
     use super::{
-        Display, FocusSource, PANEL_SIZE, Point, Rect, centered_offset, focused_source,
-        log_skip_once, select_display,
+        Display, FocusSource, PanelMode, Point, Rect, centered_offset, expanded_origin,
+        fitted_size, focused_source, log_skip_once, panel_size_for, select_display,
+        take_restore_origin,
     };
 
     /// 当前前台窗口；无前台窗口（例如刚失去激活）时为 `None`。
@@ -556,7 +731,8 @@ mod imp_win {
         };
 
         // 面板逻辑尺寸按目标屏 `scale_factor` 换算成物理像素（Windows 全程物理像素）。
-        let window_size = (PANEL_SIZE.0 * scale, PANEL_SIZE.1 * scale);
+        let normal = panel_size_for(PanelMode::Normal);
+        let window_size = (normal.0 * scale, normal.1 * scale);
         let (dx, dy) = centered_offset(work, window_size);
         // Windows 用左上原点、y 向下，`centered_offset` 的偏移可直接相加，无需 AppKit
         // 式的 y 翻转（`appkit_frame_origin` 只对 macOS 有意义，故不在此处出现）。
@@ -565,6 +741,106 @@ mod imp_win {
 
         if window.set_position(PhysicalPosition::new(x, y)).is_err() {
             log_skip_once("set-position-failed", "set_position 失败，保留面板原位置");
+        }
+    }
+
+    /// 切换尺寸档位（U2 / R1 / R4）。本适配层跑在热键消息泵线程上，只用线程安全的
+    /// Tauri API；坐标全程**物理像素**（与 [`place`] 同一套）。
+    pub(super) fn apply_mode(window: &tauri::WebviewWindow, mode: PanelMode) {
+        let monitors = window.available_monitors().unwrap_or_default();
+        if monitors.is_empty() {
+            log_skip_once("mode-no-monitors", "取不到显示器列表，只改物理尺寸不改位置");
+            set_size_only(window, mode);
+            return;
+        }
+        let displays: Vec<Display> = monitors.iter().map(display_of).collect();
+        let self_pid = std::process::id() as i32;
+        let front = foreground_window();
+        let cursor = cursor_point();
+        let focused = match focused_source(front.and_then(window_process_id), self_pid) {
+            FocusSource::Frontmost => front.and_then(window_rect),
+            FocusSource::Cursor => None,
+        };
+        let target = match select_display(focused, cursor, &displays) {
+            Some(i) => monitors
+                .get(i)
+                .map(|m| (m.scale_factor(), displays[i].work)),
+            None => window
+                .primary_monitor()
+                .ok()
+                .flatten()
+                .map(|m| (m.scale_factor(), display_of(&m).work)),
+        };
+        let Some((scale, work)) = target else {
+            log_skip_once("mode-no-display", "解析不出目标显示器，只改尺寸不改位置");
+            set_size_only(window, mode);
+            return;
+        };
+
+        // `fitted_size` / `expanded_origin` 吃逻辑点：把工作区换算回逻辑尺寸再算，
+        // 最后统一乘回 `scale` 落到物理像素。
+        let work_logical = Rect {
+            x: work.x / scale,
+            y: work.y / scale,
+            w: work.w / scale,
+            h: work.h / scale,
+        };
+        let size = fitted_size(work_logical, mode);
+
+        match mode {
+            PanelMode::Normal => {
+                set_size(window, size);
+                // 回到展开前的位置（物理像素原样写回，不经过逻辑换算）。
+                if let Some((x, y)) = take_restore_origin() {
+                    let _ = window
+                        .set_position(PhysicalPosition::new(x.round() as i32, y.round() as i32));
+                }
+            }
+            PanelMode::Expanded => {
+                let cur = window
+                    .outer_position()
+                    .map(|p| Point {
+                        x: f64::from(p.x) / scale,
+                        y: f64::from(p.y) / scale,
+                    })
+                    .unwrap_or(Point {
+                        x: work_logical.x,
+                        y: work_logical.y,
+                    });
+                if let Ok(pos) = window.outer_position() {
+                    super::remember_restore_origin((f64::from(pos.x), f64::from(pos.y)));
+                }
+                let origin =
+                    expanded_origin(cur, work_logical, size, panel_size_for(PanelMode::Normal));
+                set_size(window, size);
+                let x = (origin.x * scale).round() as i32;
+                let y = (origin.y * scale).round() as i32;
+                if window.set_position(PhysicalPosition::new(x, y)).is_err() {
+                    log_skip_once(
+                        "mode-set-position-failed",
+                        "set_position 失败，保留面板原位置",
+                    );
+                }
+            }
+        }
+    }
+
+    /// 落位前置条件不满足时的降级：尺寸按物理像素算，位置留在原处。
+    fn set_size_only(window: &tauri::WebviewWindow, mode: PanelMode) {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let (w, h) = panel_size_for(mode);
+        if let Err(e) = window.set_size(tauri::PhysicalSize::new(
+            (w * scale).round() as u32,
+            (h * scale).round() as u32,
+        )) {
+            ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
+        }
+    }
+
+    /// 逻辑尺寸 → `set_size`（Tauri 内部按窗口 `scale_factor` 换算成物理像素）。
+    fn set_size(window: &tauri::WebviewWindow, size: (f64, f64)) {
+        if let Err(e) = window.set_size(tauri::LogicalSize::new(size.0, size.1)) {
+            ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
         }
     }
 }
@@ -781,5 +1057,102 @@ mod tests {
         let (x, top) = appkit_frame_origin(offset, work, window);
         assert_eq!((x, top), (680.0, 1080.0));
         assert_eq!(top - window.1, work.y);
+    }
+
+    // ----------------------------------------------------------------
+    // U2：尺寸档位 + 展开落位（列表旁预览栏 plan KTD6 / KTD7 / R1 / R4）
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn panel_size_normal_matches_tauri_conf() {
+        // normal 必须与 `tauri.conf.json` 的初始尺寸一致，否则启动首帧会跳一下。
+        assert_eq!(panel_size_for(PanelMode::Normal), (560.0, 420.0));
+    }
+
+    #[test]
+    fn panel_size_expanded_widens_only() {
+        // 高度两档必须相同：预览栏是「右侧多一栏」，列表不该上下跳。
+        assert_eq!(panel_size_for(PanelMode::Expanded), (960.0, 420.0));
+        assert_eq!(
+            panel_size_for(PanelMode::Expanded).1,
+            panel_size_for(PanelMode::Normal).1
+        );
+    }
+
+    #[test]
+    fn panel_mode_parses_wire_strings() {
+        assert_eq!(PanelMode::parse("normal"), Some(PanelMode::Normal));
+        assert_eq!(PanelMode::parse("expanded"), Some(PanelMode::Expanded));
+        // 非法值不静默当 normal（前端会收到 Err）。
+        assert_eq!(PanelMode::parse("Expanded"), None);
+        assert_eq!(PanelMode::parse(""), None);
+    }
+
+    #[test]
+    fn fitted_size_keeps_expanded_when_work_is_wide_enough() {
+        let work = rect(0.0, 0.0, 1440.0, 900.0);
+        assert_eq!(fitted_size(work, PanelMode::Expanded), (960.0, 420.0));
+        assert_eq!(fitted_size(work, PanelMode::Normal), (560.0, 420.0));
+    }
+
+    #[test]
+    fn fitted_size_shrinks_to_work_but_never_below_normal() {
+        // 工作区 800pt：expanded 收到 800（预览栏被挤窄），列表宽度保住。
+        assert_eq!(
+            fitted_size(rect(0.0, 0.0, 800.0, 900.0), PanelMode::Expanded),
+            (800.0, 420.0)
+        );
+        // 工作区比 normal 还窄：仍是 normal 宽度（宁可窗口溢出，也不把列表压扁）。
+        assert_eq!(
+            fitted_size(rect(0.0, 0.0, 400.0, 900.0), PanelMode::Expanded),
+            (560.0, 420.0)
+        );
+    }
+
+    #[test]
+    fn expanded_origin_keeps_list_in_place_when_right_side_fits() {
+        // 工作区 1440 宽、面板居中在 x=440：右侧还剩 1440-440=1000 ≥ 960 → 不动。
+        let work = rect(0.0, 0.0, 1440.0, 900.0);
+        let cur = Point { x: 440.0, y: 330.0 };
+        let origin = expanded_origin(cur, work, (960.0, 420.0), (560.0, 420.0));
+        assert_eq!(origin, cur);
+    }
+
+    #[test]
+    fn expanded_origin_flips_to_the_left_when_right_side_is_short() {
+        // 面板靠右侧（x=800，工作区 1440）：右侧只剩 640 < 960，左侧够 → 整体左移 400。
+        let work = rect(0.0, 0.0, 1440.0, 900.0);
+        let cur = Point { x: 800.0, y: 300.0 };
+        let origin = expanded_origin(cur, work, (960.0, 420.0), (560.0, 420.0));
+        assert_eq!(origin, Point { x: 400.0, y: 300.0 });
+        // 列表（窗口右侧那 560）仍在原处：800 = 400 + (960-560)。
+        assert_eq!(origin.x + (960.0 - 560.0), cur.x);
+    }
+
+    #[test]
+    fn expanded_origin_centers_when_neither_side_fits() {
+        // 工作区 900 宽、面板在 x=300：右侧 600、左侧 300 都不够 960 → 居中。
+        let work = rect(0.0, 0.0, 900.0, 900.0);
+        let cur = Point { x: 300.0, y: 300.0 };
+        let origin = expanded_origin(cur, work, (900.0, 420.0), (560.0, 420.0));
+        assert_eq!(origin, Point { x: 0.0, y: 300.0 });
+    }
+
+    #[test]
+    fn expanded_origin_works_on_negative_origin_display() {
+        // 副屏在主屏左侧（工作区原点 -1920）：判据只比相对位移，负原点同样成立。
+        let work = rect(-1920.0, 0.0, 1920.0, 1080.0);
+        let cur = Point {
+            x: -560.0,
+            y: 330.0,
+        }; // 贴工作区右缘（-560 + 960 = 400 > 0）
+        let origin = expanded_origin(cur, work, (960.0, 420.0), (560.0, 420.0));
+        assert_eq!(
+            origin,
+            Point {
+                x: -960.0,
+                y: 330.0
+            }
+        );
     }
 }

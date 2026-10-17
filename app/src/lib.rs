@@ -16,6 +16,7 @@ pub mod log;
 pub mod panel;
 pub mod pasteback;
 pub mod pin;
+pub mod preview;
 pub mod privacy;
 pub mod search;
 pub mod single_instance;
@@ -37,6 +38,8 @@ mod notes_test;
 mod pasteback_test;
 #[cfg(test)]
 mod pin_test;
+#[cfg(test)]
+mod preview_test;
 #[cfg(test)]
 mod privacy_test;
 #[cfg(test)]
