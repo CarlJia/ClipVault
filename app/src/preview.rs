@@ -197,8 +197,15 @@ pub async fn get_entry_preview_inner(
                 decryptor,
             ) {
                 Ok(bytes) => {
-                    let img = make_preview_image(&bytes, PREVIEW_MAX_DIM)
-                        .ok_or_else(|| format!("entry {id} 的图片数据无法解码"))?;
+                    // 解码 / 缩放 / PNG 重编码是 CPU 密集的（20MB 截图要几十毫秒），
+                    // 留在 async 线程上会顶住整条命令链 —— 用户按住方向键扫图时，
+                    // 后端就完全没空处理下一条请求了。解密很快，仍留在上面。
+                    let decoded = tokio::task::spawn_blocking(move || {
+                        make_preview_image(&bytes, PREVIEW_MAX_DIM)
+                    })
+                    .await
+                    .map_err(|e| format!("entry {id} 的预览解码任务失败：{e}"))?;
+                    let img = decoded.ok_or_else(|| format!("entry {id} 的图片数据无法解码"))?;
                     Ok(PreviewDto::image(&img))
                 }
                 Err(_) => Ok(PreviewDto::undecryptable(ContentKind::Image)),
