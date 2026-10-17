@@ -34,6 +34,7 @@ import {
   renderTags,
   renderVaultList,
 } from "./panel";
+import { createOverlayGate } from "./overlay-intent";
 import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
   type LogInfoDto,
@@ -140,7 +141,7 @@ const logSizeEl = document.querySelector<HTMLSpanElement>("#settings-log-size")!
 const logTailEl = document.querySelector<HTMLPreElement>("#settings-log-tail")!;
 const logClearEl = document.querySelector<HTMLButtonElement>("#settings-log-clear")!;
 
-// 关于浮层（U13）。入口只有托盘「关于 ClipVault」（后端 emit("open-about")），
+// 关于浮层（U13）。入口只有托盘「关于」（后端 emit("open-about")），
 // 面板里没有第二个按钮 —— 它是一次性信息，不值得占 UI。
 const aboutEl = document.querySelector<HTMLDivElement>("#about")!;
 const aboutCloseEl = document.querySelector<HTMLButtonElement>("#about-close")!;
@@ -154,6 +155,12 @@ let aboutRepository: string = REPOSITORY_URL;
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
 const isAboutOpen = (): boolean => !aboutEl.classList.contains("hidden");
+
+// 托盘浮层入口（加密区 / 设置… / 关于）的「刚被点名」豁免闸门。
+// `show_panel()` 会先让窗口拿到焦点，而下面的 focus 处理器一律「回到主列表」
+// （收回加密区）。两件事都在异步事件里，谁先到取决于平台事件循环 —— 见
+// `overlay-intent.ts`：不豁免的话，托盘点「加密区」等于点了没功能。
+const overlayGate = createOverlayGate();
 
 // 当前视图是否在展示「条目列表」（可键盘导航 / 回贴）：
 // recent、all，或 标签/类别 已选中筛选项时。
@@ -522,8 +529,14 @@ function clampVaultSelection(): void {
   if (vaultSelected < 0) vaultSelected = 0;
 }
 
-/** 打开加密区管理模态（⌘⇧V）：列出 vault 条目、按需暴露「清除不可解密」。 */
+/** 打开加密区管理模态（⌘⇧V / 托盘「加密区」）：列出 vault 条目、按需暴露「清除不可解密」。 */
 async function openVault(): Promise<void> {
+  // 浮层互斥：托盘三个入口共用这一块面板画布，若底下还压着关于 / 设置 / 编辑器，
+  // Esc 关掉的是被遮住的那层、`handleVaultKey` 的 ↩ / ⌘⌫ 还会落到看不见的地方。
+  // 与 `openAbout()` 同一套收口。
+  if (isAboutOpen()) closeAbout();
+  if (isSettingsOpen()) closeSettings();
+  if (isEditorOpen()) closeEditor();
   vaultEl.classList.remove("hidden");
   try {
     const items = await listVault();
@@ -921,15 +934,6 @@ document.addEventListener("keydown", (ev) => {
       return;
     return;
   }
-  // 关于浮层打开时，仅处理 Esc 关闭（U13）。放在设置之前：两者理论上不会同时
-  // 打开（openAbout 会先收掉设置），但顺序写死免得日后新增入口时叠在一起。
-  if (isAboutOpen()) {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      closeAbout();
-    }
-    return;
-  }
   // 设置模态打开时，仅处理 Esc 关闭(U12)。
   if (isSettingsOpen()) {
     if (ev.key === "Escape") {
@@ -975,7 +979,11 @@ document.addEventListener("keydown", (ev) => {
 // 收起加密区模态：面板被隐藏（热键 / 托盘）时模态可能仍处于打开态，而搜索框已获焦点，
 // 保持模态会让「看得见的是加密区、敲进去的是搜索框」，故每次唤出都从主列表开始。
 window.addEventListener("focus", () => {
-  closeVault();
+  // 托盘「加密区」刚点名要打开它时跳过这一次重置：`openVault()` 与这次 focus 谁先
+  // 到取决于平台事件循环，不豁免的话浮层刚打开就被收回 —— 与「点了没功能」同貌。
+  // 必须叠加 `isVaultOpen()`：focus 先到的顺序里浮层还没开，那时不需要豁免
+  // （关的只是空气），也不该把这份豁免借给之后不相干的 focus。
+  if (!(isVaultOpen() && overlayGate.isFresh())) closeVault();
   // 面板重新被唤出（R12）：预览栏一律收起、窗口回 normal，图片缓存也清掉 ——
   // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
   void closePreview();
@@ -1006,10 +1014,17 @@ setEditorCloseHandler(() => {
 void listen("open-settings", () => {
   void openSettings();
 });
-// U13：托盘「关于 ClipVault」→ 后端 `emit("open-about")` → 前端转呼 openAbout()。
+// U13：托盘「关于」→ 后端 `emit("open-about")` → 前端转呼 openAbout()。
 // 与「设置…」同一套路：托盘没有 UI，只能借主面板这块画布。
 void listen("open-about", () => {
   void openAbout();
+});
+// U9：托盘「加密区」→ 后端 `emit("open-vault")` → 前端转呼 openVault()。
+// mark() 先记下「这次是托盘点名的」：紧随其后的 focus 重置要豁免一次，
+// 否则加密区会被「回到主列表」立刻收回（见 `overlay-intent.ts`）。
+void listen("open-vault", () => {
+  overlayGate.mark();
+  void openVault();
 });
 // U12：启动时一次性把 `--panel-alpha` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
