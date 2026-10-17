@@ -106,6 +106,18 @@ date: 2026-10-15
   - **read_log**:同时读 `clipvault.log.1` 与 `clipvault.log`(按时间顺序拼接,旧在前新在后),再走 `tail_lines` 字节/行数 cap;`.1` 存在与否对调用方透明。设置面板 UI 上标注 "最近 ~400 行" 而非"整个文件",避免用户误以为轮转丢了数据。
   - **reveal_log**:继续选中 `clipvault.log`(`open -R` / `explorer /select,`),同一文件夹下 `.1` 仍可见;不改为打开父目录,避免破坏既有 R10 的"定位到该文件"的语义。
 
+**后续变更(2026-10-17,修 2026-10-15 落地时留下的两处缺陷)。** 上面 KTD7 的「不引入新 CSS 类」
+按原文保留 —— 它在当时成立,但「级别下拉框」与「文件路径」两行不适用,各自新增了一个类:
+
+- 级别 `<select>` 当时套的是 `.slider`,而那是 `input[type=range]` 的**轨道**样式
+  (`appearance:none` + `height:4px`),套在 select 上把控件压成一条看不见选中文案的细线。
+  改用专用类 `.settings-select`(自绘盒子 + 内联 caret + `color-scheme: dark`)。
+- 「文件路径」原本只有 `title` 能看全值(`max-width: 280px` 截断),现支持**点击复制**:
+  新增 IPC 命令 `copy_log_path`(复用回贴写剪贴板的平台后端),样式类 `.settings-log-path`。
+
+KTD7 的其余结论不变:仍不开新模态、仍复用 `.settings-body` 滚动容器与 `.settings-section` /
+`.settings-row` / `.settings-value` 视觉层级、仍用 `textContent` 写入、仍在展示层 cap 200 行。
+
 ### High-Level Technical Design
 
 ```mermaid

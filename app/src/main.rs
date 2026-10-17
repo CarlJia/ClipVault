@@ -194,6 +194,7 @@ fn main() {
             commands::set_log_level,
             commands::read_log,
             commands::clear_log,
+            commands::copy_log_path,
             commands::reset_hotkeys,
         ])
         .run(tauri::generate_context!())

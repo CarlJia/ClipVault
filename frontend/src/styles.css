@@ -187,12 +187,45 @@ body {
   color: var(--muted);
 }
 
-/* Tab 栏 */
-.tabs {
+/* Tab 栏 + 右端设置入口（`index.html` 的 `.tabs-row`）。
+   行框（内边距 / 下边框）由 `.tabs-row` 承担，`.tabs` 只留 tab 排布 —— 否则两个
+   兄弟节点各带一条 `border-bottom`，会画成双线。`.tabs` 占满剩余宽度（flex:1），
+   齿轮被自然顶到最右；`margin-left: auto` 是兜底（`.tabs` 若因故不伸缩仍靠右）。 */
+.tabs-row {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  gap: 6px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
+}
+.tabs {
+  display: flex;
+  flex: 1;
+  gap: 4px;
+}
+/* 设置入口：24×24 命中区 ≈ tab 按钮高度（13px 字号 + 4px 内边距），
+   与 tab 行居中对齐；默认 muted、hover 变主文本色 + 浅底，与 `.tab` 的 hover 一致。 */
+.tabs-action {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.tabs-action:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+.tabs-action svg {
+  display: block;
 }
 .tab {
   border: none;
@@ -475,7 +508,9 @@ body {
   white-space: nowrap;
 }
 
-/* Toast */
+/* Toast。z-index 必须盖过所有模态（`.editor` 20 / `#editor` 30）：设置与加密区里
+   的反馈都走 toast（复制日志路径、清空日志、清除不可解密条目），低于模态时会被
+   遮罩的 `backdrop-filter: blur` 糊掉 —— 用户操作完收不到任何反馈。 */
 .toast {
   position: absolute;
   bottom: 44px;
@@ -487,7 +522,7 @@ body {
   padding: 6px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  z-index: 10;
+  z-index: 40;
 }
 .toast.hidden {
   display: none;
@@ -890,6 +925,45 @@ body {
   font-size: 11px;
   color: var(--muted);
   margin-bottom: 2px;
+}
+
+/* U4 诊断日志区「级别」下拉框（`.slider` 只服务 range 输入框，套到 <select> 上
+   会把它压成 4px 细线）。面板根未设 color-scheme，走原生外观会在浅色系统下与
+   暗色底打架，故这里自绘盒子。caret 是 Bootstrap Icons `caret-down-fill`(MIT)
+   的内联 SVG：data URI 里用不了 var()，fill 写的是 `--muted` 的取值。
+   `color-scheme: dark` 管的是点击后由系统渲染的那个弹出列表。 */
+.settings-select {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 24px;
+  padding: 0 22px 0 8px;
+  font-family: var(--font-ui);
+  font-size: 12px;
+  color: var(--text);
+  background-color: var(--surface-hover);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 16 16' fill='%239a9aa2'%3E%3Cpath d='M7.247 11.14 2.451 5.658C1.885 5.013 2.345 4 3.204 4h9.592a1 1 0 0 1 .753 1.659l-4.796 5.48a1 1 0 0 1-1.506 0z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color-scheme: dark;
+  cursor: pointer;
+}
+.settings-select:hover {
+  background-color: var(--surface);
+}
+.settings-select:focus-visible {
+  outline: 1px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* U4 诊断日志区「文件路径」：真实路径通常长过 280px，故超长省略；完整值靠点击复制。 */
+.settings-log-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 280px;
+  cursor: pointer;
 }
 
 /* U4 诊断日志区尾部<pre>：等宽字体,固定高度,内部滚动,避免撑开设置卡片。 */
