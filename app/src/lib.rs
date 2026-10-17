@@ -1,10 +1,12 @@
-//! ClipVault app library.
+//! ClipVault app library：Tauri 主 binary 的模块根。
 //!
-//! U1 scaffold: placeholder.
-//! U2 added storage.
-//! U3 added the pasteboard watcher + auto-category classification.
-//! U4 adds the frontend shell wiring: IPC commands, the menu-bar tray,
-//! and the Carbon global hotkey.
+//! 模块按职责分组：
+//! - 采集 / 分类：`capture`、`watcher`、`winclip`、`classify`
+//! - 存储 / 检索：`storage`、`pin`、`search`、`thumbnail`
+//! - 加密 / 隐私：`crypto`、`privacy`
+//! - 交互 / 回贴：`pasteback`、`hotkey`、`keymap`
+//! - 前端桥接：`commands`、`tray`、`panel`、`preview`
+//! - 诊断 / Windows 平台：`log`、`single_instance`
 
 pub mod capture;
 pub mod classify;
