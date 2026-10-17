@@ -474,50 +474,55 @@ export async function setHotkeyRecording(active: boolean): Promise<void> {
 // localizedCombo — 用于 <kbd> 显示（U4）
 // ---------------------------------------------------------------------------
 
+/** 修饰键的 macOS 字形。Windows 写法由 `keys()` 产出，不在这里维护第二份。 */
+const MOD_GLYPHS: Record<Mod, string> = {
+  meta: "⌘",
+  shift: "⇧",
+  alt: "⌥",
+  ctrl: "⌃",
+};
+
+/** 按键的 macOS 字形（同上）。 */
+function keyGlyph(key: Key): string {
+  switch (key.kind) {
+    case "char":
+      // 空格键不能渲染成一个空键帽（用户会以为是显示坏了）。
+      return key.ch === " " ? "Space" : key.ch.toUpperCase();
+    case "enter":
+      return "↩";
+    case "escape":
+      return "esc";
+    case "arrow_up":
+      return "↑";
+    case "arrow_down":
+      return "↓";
+    case "comma":
+      return ",";
+    case "backspace":
+      return "⌫";
+  }
+}
+
 /**
- * 将 KeyCombo 渲染为平台化的按键说明字符串（如 `⌘+Shift+E` / `Ctrl+Shift+E`）。
- * 先用 Mac 字形构建，再过 `keys()` 做 Windows 替换。
+ * 将 KeyCombo 渲染为平台化的按键说明字符串（如 `⌘+⇧+E` / `Ctrl+Shift+E`）。
+ *
+ * **逐段本地化，再用 `+` 连接** —— 不能先把 mac 串连好（`⌘+⌥+V`）再整串交给
+ * `keys()`：`keys()` 面向的是**紧凑写法**（`⌘V` → `Ctrl+V`），它换出来的 Windows
+ * 写法自带尾随 `+`（`Ctrl+`），于是组合键说明里的分隔符与它叠成两个加号 ——
+ * Windows 设置面板的快捷键键帽曾整列显示成 `Ctrl++E` / `Ctrl++Alt++V`。
+ *
+ * 所以每段先各自过 `keys()`，**只对修饰键**去掉那个尾随 `+`（按键段没有它，`+`
+ * 键本身也必须原样保留），最后统一用 `+` 拼起来：macOS 的字形不带尾缀，规则
+ * 对两个平台同时成立。
+ *
+ * 拼接前按**平台写法**去重：Windows 上 Ctrl 既是 `meta`（主修饰键）又是 `ctrl`
+ * （`eventMods` 两个都置真，录出来的绑定是 `["meta","ctrl"]`），两段都渲染成
+ * `Ctrl` —— 不去重就是 `Ctrl+Ctrl+E`。macOS 上 `⌘` 与 `⌃` 是两个不同的键，
+ * 标签不同，去重自然不生效。
  */
 export function localizedCombo(combo: KeyCombo): string {
-  const modStr =
-    combo.mods.length === 0
-      ? ""
-      : combo.mods
-          .map((m) => {
-            switch (m) {
-              case "meta":
-                return "⌘";
-              case "shift":
-                return "⇧";
-              case "alt":
-                return "⌥";
-              case "ctrl":
-                return "⌃";
-            }
-          })
-          .join("+") + "+";
-
-  const keyStr = (() => {
-    switch (combo.key.kind) {
-      case "char":
-        // 空格键不能渲染成一个空键帽（用户会以为是显示坏了）。
-        return combo.key.ch === " " ? "Space" : combo.key.ch.toUpperCase();
-      case "enter":
-        return "↩";
-      case "escape":
-        return "esc";
-      case "arrow_up":
-        return "↑";
-      case "arrow_down":
-        return "↓";
-      case "comma":
-        return ",";
-      case "backspace":
-        return "⌫";
-    }
-  })();
-
-  return keys(modStr + keyStr);
+  const mods = new Set(combo.mods.map((m) => keys(MOD_GLYPHS[m]).replace(/\+$/, "")));
+  return [...mods, keys(keyGlyph(combo.key))].join("+");
 }
 
 // ---------------------------------------------------------------------------

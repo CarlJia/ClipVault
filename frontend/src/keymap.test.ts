@@ -675,3 +675,84 @@ describe("preview：单按 Space 的默认绑定与焦点门", () => {
     expect(km.localizedCombo({ mods: [], key: { kind: "char", ch: " " } })).toBe("Space");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 键帽文案的平台化渲染：Windows 不得出现 `++`
+// ---------------------------------------------------------------------------
+//
+// 这个 describe 存在的直接理由：Windows 上设置面板「快捷键」行的键帽整列显示成
+// `Ctrl++E` / `Ctrl++Alt++V`。`localizedCombo` 当时先把 mac 串连好（`⌘+⌥+V`）再
+// 整串交给 `keys()`，而 `keys()` 面向的是**紧凑写法**（`⌘V` → `Ctrl+V`），它给出的
+// Windows 改写自带尾随 `+`（`Ctrl+`）—— 分隔符与尾随 `+` 各叠一个。
+// 用例按平台分组：macOS 那半是「旧写法不许变」的护栏，Windows 那半是本 bug 的红线。
+
+describe("localizedCombo：组合键文案按平台渲染", () => {
+  it("macOS 保持「字形 + 加号」的既有写法", async () => {
+    const km = await freshKeymap();
+    expect(km.localizedCombo({ mods: ["meta"], key: { kind: "char", ch: "e" } })).toBe("⌘+E");
+    expect(km.localizedCombo({ mods: ["meta", "shift"], key: { kind: "char", ch: "k" } })).toBe(
+      "⌘+⇧+K",
+    );
+    expect(km.localizedCombo({ mods: ["meta"], key: { kind: "backspace" } })).toBe("⌘+⌫");
+    expect(km.localizedCombo({ mods: [], key: { kind: "enter" } })).toBe("↩");
+    expect(km.localizedCombo({ mods: [], key: { kind: "comma" } })).toBe(",");
+    expect(km.localizedCombo({ mods: [], key: { kind: "escape" } })).toBe("esc");
+    expect(km.localizedCombo({ mods: [], key: { kind: "arrow_down" } })).toBe("↓");
+    // macOS 的 ⌃ 是独立修饰键，与 ⌘ 并存（Windows 上这两个会折叠成一个 Ctrl）。
+    expect(km.localizedCombo({ mods: ["meta", "ctrl"], key: { kind: "char", ch: "e" } })).toBe(
+      "⌘+⌃+E",
+    );
+  });
+
+  it("Windows 单 / 双修饰键只有一个加号（修复前是 Ctrl++E、Ctrl++Alt++V）", async () => {
+    const km = await freshKeymap({ os: "windows" });
+    expect(km.localizedCombo({ mods: ["meta"], key: { kind: "char", ch: "e" } })).toBe("Ctrl+E");
+    expect(km.localizedCombo({ mods: ["meta", "alt"], key: { kind: "char", ch: "v" } })).toBe(
+      "Ctrl+Alt+V",
+    );
+    expect(km.localizedCombo({ mods: ["meta", "shift"], key: { kind: "char", ch: "v" } })).toBe(
+      "Ctrl+Shift+V",
+    );
+  });
+
+  it("Windows 的命名键 / 符号键 / 无修饰键文案", async () => {
+    const km = await freshKeymap({ os: "windows" });
+    expect(km.localizedCombo({ mods: ["meta"], key: { kind: "backspace" } })).toBe(
+      "Ctrl+Backspace",
+    );
+    expect(km.localizedCombo({ mods: ["meta"], key: { kind: "comma" } })).toBe("Ctrl+,");
+    expect(km.localizedCombo({ mods: [], key: { kind: "enter" } })).toBe("Enter");
+    expect(km.localizedCombo({ mods: [], key: { kind: "escape" } })).toBe("Esc");
+    expect(km.localizedCombo({ mods: [], key: { kind: "arrow_up" } })).toBe("↑");
+    expect(km.localizedCombo({ mods: [], key: { kind: "char", ch: " " } })).toBe("Space");
+  });
+
+  it("Windows 把 meta + ctrl 折叠成一个 Ctrl（录出来的绑定就是这个形状）", async () => {
+    // Windows 上按 Ctrl 时 `eventMods` 的 meta 与 ctrl 同时为真（Ctrl 是主修饰键），
+    // 修复前去重缺失 + 尾随加号会渲染成 `Ctrl++Ctrl+E` / 更早的 `Ctrl++⌃+E`。
+    const km = await freshKeymap({ os: "windows" });
+    expect(km.localizedCombo({ mods: ["meta", "ctrl"], key: { kind: "char", ch: "e" } })).toBe(
+      "Ctrl+E",
+    );
+    expect(km.localizedCombo({ mods: ["meta", "shift", "ctrl"], key: { kind: "char", ch: "k" } })).toBe(
+      "Ctrl+Shift+K",
+    );
+  });
+
+  it("15 条默认组合在两种平台上都不含 `++`，也不以加号开头 / 结尾", async () => {
+    for (const os of ["macos", "windows"]) {
+      const km = await freshKeymap({ os });
+      // 先钉住条数：`keyFromWire` 认不出的 token 会让整个 action 消失（`undefined`），
+      // 若不校验，这条红线会在「15 条全被跳过」时空转通过。
+      const combos = Object.entries(km.currentKeyMap!.actions).filter(
+        (entry): entry is [string, NonNullable<typeof entry[1]>] => entry[1] != null,
+      );
+      expect(combos, os).toHaveLength(15);
+      for (const [action, combo] of combos) {
+        const label = km.localizedCombo(combo);
+        expect(label, `${os} / ${action}`).not.toContain("++");
+        expect(label, `${os} / ${action}`).not.toMatch(/^\+|\+$/);
+      }
+    }
+  });
+});
