@@ -48,8 +48,8 @@ Invoke-Step '[1/2] 安装前端依赖' {
     if ($LASTEXITCODE -ne 0) { throw "npm ci 失败" }
     # 这里不 build：tauri.conf.json 的 beforeBuildCommand 会在 cargo tauri build 开头
     # 自己跑一遍前端构建（在 Rust 编译之前，前端报错照样早失败），重复一次纯属浪费。
-    # 注意 CI 的 windows job 另有一处显式构建 —— 那处是给前置的 clippy/test 用的
-    # （tauri-build 的 build.rs 要求 frontendDist 目录存在），不能删。
+    # 注意 CI 的 windows-verify job 另有一处显式构建 —— 那处是给它前置的 clippy/test
+    # 用的（tauri-build 的 build.rs 要求 frontendDist 目录存在），不能删。
 }
 
 Invoke-Step '[2/2] cargo tauri build --bundles nsis' {
