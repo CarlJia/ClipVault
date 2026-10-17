@@ -117,6 +117,7 @@ class FakeList extends FakeEl {
 
 /** 与 `settings.ts` 的分组一致（断言只需要动作集合本身）。 */
 const PANEL_ACTIONS: HotkeyAction[] = [
+  "preview",
   "paste",
   "edit_note",
   "toggle_pin",
@@ -235,6 +236,7 @@ const DEFAULT_WIRE = {
     open_url: { mods: ["meta"], key: "o" },
     open_vault: { mods: ["meta", "shift"], key: "v" },
     paste: { mods: [], key: "enter" },
+    preview: { mods: [], key: " " },
     skip_once: { mods: ["meta", "shift"], key: "n" },
     toggle_guest_mode: { mods: ["meta", "shift"], key: "g" },
     toggle_pin: { mods: ["meta"], key: "p" },
@@ -963,7 +965,7 @@ describe("未绑定的行", () => {
 });
 
 describe("动作基数与分组：设置面板列出的 = keymap 里有的", () => {
-  it("1 全局 + 13 面板 = 14，且与 keymap 的动作集合逐项一致", async () => {
+  it("1 全局 + 14 面板 = 15，且与 keymap 的动作集合逐项一致", async () => {
     const dom = makeDom();
     vi.stubGlobal("document", dom.document);
     const { GLOBAL_ACTIONS, PANEL_ACTIONS: panel } = await freshSettings();
@@ -972,8 +974,8 @@ describe("动作基数与分组：设置面板列出的 = keymap 里有的", () 
     // 锚点：动作加了却漏进设置面板 → 用户再也重绑不到它，这里先红。
     expect(GLOBAL_ACTIONS).toEqual(["open_panel"]);
     expect(GLOBAL_ACTIONS).toHaveLength(1);
-    expect(panel).toHaveLength(13);
-    expect(Object.keys(DEFAULT_WIRE.actions)).toHaveLength(14);
+    expect(panel).toHaveLength(14);
+    expect(Object.keys(DEFAULT_WIRE.actions)).toHaveLength(15);
     expect([...GLOBAL_ACTIONS, ...panel].sort()).toEqual(
       Object.keys(DEFAULT_WIRE.actions).sort(),
     );

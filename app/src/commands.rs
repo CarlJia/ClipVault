@@ -15,6 +15,7 @@ use rusqlite::Result as SqliteResult;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
+use crate::preview::PreviewDto;
 use crate::storage::Storage;
 use crate::tray::{self, TrayState};
 
@@ -261,12 +262,28 @@ pub fn platform_info() -> PlatformInfo {
 /// 手动 ⌘V（`pasteback::hide_panel_and_restore_focus`）。
 #[tauri::command]
 pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
+    // 预览栏开着就先收回 560×420 再隐藏（R12）：否则窗口以 960 宽留在隐藏态，
+    // 下一次唤出会与按 normal 算出来的落位对不上。
+    crate::panel::restore_normal(&window);
     let result = crate::pasteback::hide_panel_and_restore_focus(&window);
     // 面板收起 = 录制态结束（快捷键 plan KTD9）：失焦自动收起那条走 `panel::handle_window_event`，
     // Esc / 前端收起这条走这里 —— 两条都得让全局热键归位，否则「录制中把面板收起来」
     // 会把 ⌥⌘V 留在缺席状态。
     crate::keymap::restore_global_hotkey_after_leaving_panel(window.app_handle());
     result
+}
+
+/// 切换面板尺寸档位（列表旁预览栏 plan U2 / R1 / R4）。
+///
+/// `mode` 取 `"normal"`（560×420，列表独占）或 `"expanded"`（960×420，右侧长出
+/// 预览栏）。落在 `panel` 模块：尺寸 / 落位 / 收回时的归位都归它，命令层只做字符串
+/// 到枚举的解析（非法值直接 `Err`，不静默当 normal —— 那样窗口会莫名缩一下）。
+#[tauri::command]
+pub fn set_panel_mode(window: tauri::WebviewWindow, mode: String) -> Result<(), String> {
+    let mode = crate::panel::PanelMode::parse(&mode)
+        .ok_or_else(|| format!("未知面板模式：{mode}（应为 normal / expanded）"))?;
+    crate::panel::set_mode(&window, mode);
+    Ok(())
 }
 
 /// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
@@ -846,6 +863,30 @@ pub async fn reset_hotkeys(state: State<'_, AppState>) -> Result<(), String> {
         return Err(e.to_string());
     }
     Ok(())
+}
+
+// ----------------------------------------------------------------
+// 列表旁预览栏（U1 / R5 / R6 / R7）
+// ----------------------------------------------------------------
+
+/// 取一条条目的预览数据（图片按预览尺寸缩放 / 文本给全文 / 其它给 `none`）。
+///
+/// 错误语义（R5）：id 不存在、图片解不开 → `Err(String)`；「条目在、但这个类型
+/// 没有预览」→ `Ok(kind = "none")`。两种情形前端表现不同（前者 toast，后者显示提示）。
+#[tauri::command]
+pub async fn get_entry_preview(id: i64, state: State<'_, AppState>) -> Result<PreviewDto, String> {
+    // 解密器按平台给：macOS 是 Keychain、Windows 是凭据管理器（`crypto` 模块的两个
+    // `default_vault_cipher`），其余平台没有凭据库。
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        let decryptor = crate::crypto::default_vault_cipher();
+        crate::preview::get_entry_preview_inner(&state.storage, id, &decryptor).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        crate::preview::get_entry_preview_inner(&state.storage, id, &crate::preview::NoDecryptor)
+            .await
+    }
 }
 
 // ----------------------------------------------------------------

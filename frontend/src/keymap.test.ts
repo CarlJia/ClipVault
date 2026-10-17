@@ -45,7 +45,7 @@ interface WireMap {
   actions: Record<string, { mods: string[]; key: string } | null>;
 }
 
-/** 与 `HotkeyMap::default_map()` 一致的 14 条默认映射（`key` 为线格式字符串）。 */
+/** 与 `HotkeyMap::default_map()` 一致的 15 条默认映射（`key` 为线格式字符串）。 */
 const DEFAULT_WIRE: WireMap = {
   version: 1,
   actions: {
@@ -60,6 +60,7 @@ const DEFAULT_WIRE: WireMap = {
     open_url: { mods: ["meta"], key: "o" },
     open_vault: { mods: ["meta", "shift"], key: "v" },
     paste: { mods: [], key: "enter" },
+    preview: { mods: [], key: " " },
     skip_once: { mods: ["meta", "shift"], key: "n" },
     toggle_guest_mode: { mods: ["meta", "shift"], key: "g" },
     toggle_pin: { mods: ["meta"], key: "p" },
@@ -142,7 +143,7 @@ describe("loadKeymap：线格式 key 字符串 → 内部带标签 Key", () => {
     });
   });
 
-  it("14 条默认映射逐条都能命中（修复前这里全为 null）", async () => {
+  it("15 条默认映射逐条都能命中（修复前这里全为 null）", async () => {
     const km = await freshKeymap();
     const cases: Array<[string, EvInit, string]> = [
       ["⌘E", { key: "e", code: "KeyE", metaKey: true }, "edit_note"],
@@ -155,6 +156,8 @@ describe("loadKeymap：线格式 key 字符串 → 内部带标签 Key", () => {
       ["⌘⇧N", { key: "N", code: "KeyN", metaKey: true, shiftKey: true }, "skip_once"],
       ["⌘,", { key: ",", code: "Comma", metaKey: true }, "open_settings"],
       ["↩", { key: "Enter", code: "Enter" }, "paste"],
+      // 单按 Space：预览栏的默认键（列表旁预览栏 plan U5 / KTD2）。
+      ["space", { key: " ", code: "Space" }, "preview"],
       ["esc", { key: "Escape", code: "Escape" }, "close"],
       ["↑", { key: "ArrowUp", code: "ArrowUp" }, "move_up"],
       ["↓", { key: "ArrowDown", code: "ArrowDown" }, "move_down"],
@@ -607,5 +610,68 @@ describe("录制规则：无修饰的 Backspace 不可绑定", () => {
       mods: ["meta"],
       key: { kind: "backspace" },
     });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 列表旁预览栏：`preview` 动作（plan U5 / R8 / R9 / KTD2）
+// ---------------------------------------------------------------------------
+
+describe("preview：单按 Space 的默认绑定与焦点门", () => {
+  it("default_preview_is_space：默认映射里 preview = 无修饰的 Space", async () => {
+    const km = await freshKeymap();
+    expect(km.currentKeyMap?.actions.preview).toEqual({
+      mods: [],
+      key: { kind: "char", ch: " " },
+    });
+  });
+
+  it("preview_matches_in_empty_search：空查询时 Space 命中 preview", async () => {
+    const km = await freshKeymap();
+    // WebKit / WebView2 的 Space：`key === " "`、`code === "Space"`（没有 Key/Digit 前缀，
+    // 走 `keyFromKeyString` 的回落分支）。带修饰键的 Space 不该命中。
+    expect(km.matches(ev({ key: " ", code: "Space" }))).toBe("preview");
+    expect(km.matches(ev({ key: " ", code: "Space", metaKey: true }))).toBeNull();
+  });
+
+  it("preview_skipped_when_search_nonempty：搜索框有内容时 Space 让位给原生输入", async () => {
+    const km = await freshKeymap();
+    const el = (fields: Record<string, unknown>) =>
+      ({ tagName: "INPUT", ...fields }) as unknown as EventTarget;
+    expect(km.textFieldOwnsSpace(el({ value: "foo" }))).toBe(true);
+    expect(km.textFieldOwnsSpace(el({ value: "" }))).toBe(false);
+    // 退格删空之后同一个门就放行了 —— 这正是 AE2 的第二段。
+    expect(km.textFieldOwnsSpace(el({ value: "" }))).toBe(false);
+    // 列表行 / 空目标不是文本控件，不让位。
+    expect(km.textFieldOwnsSpace(el({ tagName: "DIV" }))).toBe(false);
+    expect(km.textFieldOwnsSpace(null)).toBe(false);
+  });
+
+  it("dispatchHotkeyAction(\"preview\") 调 togglePreview（而不是别的 handler）", async () => {
+    const km = await freshKeymap();
+    const calls: string[] = [];
+    km.registerKeymapHandlers({
+      activate: async () => void calls.push("activate"),
+      moveSelection: () => void calls.push("move"),
+      editNote: () => void calls.push("edit_note"),
+      togglePin: async () => void calls.push("toggle_pin"),
+      moveCurrentToVault: async () => void calls.push("vault"),
+      deleteCurrentEntry: async () => void calls.push("delete"),
+      openUrlAction: async () => void calls.push("open_url"),
+      openVault: async () => void calls.push("open_vault"),
+      toggleGuestMode: async () => void calls.push("guest"),
+      triggerSkipOnce: async () => void calls.push("skip"),
+      openSettings: async () => void calls.push("open_settings"),
+      closeSettings: () => void calls.push("close_settings"),
+      togglePreview: () => void calls.push("toggle_preview"),
+      currentEntry: () => undefined,
+    });
+    km.dispatchHotkeyAction("preview");
+    expect(calls).toEqual(["toggle_preview"]);
+  });
+
+  it("键帽把空格渲染成 Space，不是空字符串", async () => {
+    const km = await freshKeymap();
+    expect(km.localizedCombo({ mods: [], key: { kind: "char", ch: " " } })).toBe("Space");
   });
 });

@@ -116,6 +116,15 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
+- **列表旁预览栏**：U1–U6 完成（见 `docs/plans/2026-10-16-1430-feat-side-preview-pane-plan.md`）——
+  选中图片 / 长文本条目按 **Space**（keymap 新动作 `preview`，可重绑）或点行内缩略图，
+  面板从 560×420 长到 960×420、右侧（放不下时左侧）多出预览栏，列表位置不动；图片由
+  后端缩到长边 ≤ 1600px 再 base64 回传（原图不进 WebView），文本给全文，file / rtf / color
+  只给提示。R13 仍为空（零新 crate：`image` / `base64` 早就在树内）。剩余：macOS 真机
+  AE1–AE4 与 Windows 真机复跑；加密区模态内的预览入口列入后续 PR（模态遮住预览栏）。
+  代码评审留下的 6 条已全部落地：图片解码进 `spawn_blocking`、方向键扫图时请求单飞合并、
+  尺寸切换按**窗口所在屏**取工作区（不再跟鼠标跳屏）、`hintHtml` 转义收口、去掉三处
+  测试专用导出、`panel.rs` 拆成 `panel/{mod,geometry,macos,windows}.rs`（原 1171 行）。
 - **启动不再重捕既有剪贴板**（`Watcher::new`）：`last_change_count` 改为用构造时的剪贴板
   序列号播种（原来硬编码 `-1`，导致启动首轮必定捕获一次既有剪贴板）。这是「删除能扛过重启」
   的前提 —— 否则删掉的内容只要还在剪贴板里，就会在重启后原样回到历史；加密区条目更糟，
@@ -132,8 +141,20 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   **只有真的让出过才装回** —— 否则面板每次收起都会重注册一次全局热键。撤销必须按 action
   定位，**不能**用 `unregister_all`（Windows 侧它会把消息泵线程 `Quit` 掉，等于永久失联）。
   真机 AE7（按当前全局组合重绑）仍是人工步骤，见 plan 的 Verification Contract。
-- **测试基线**：app 232 passed + core 43 passed（合计 275），1 个 trigram 测试 ignored；
-  本轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
+- **测试基线**：app 261 passed + core 44 passed（合计 305），1 个 trigram 测试 ignored。
+  其中 1 例来自同期合入 main 的 `app/src/pasteback_test.rs` 增量，与本轮预览栏无关。
+  本轮增量是「列表旁预览栏」（plan U1–U6）：app +28（`app/src/preview_test.rs` 的 19 例 ——
+  缩放算术 3 / 重编码 3 / 明文图片与文本 3 / 加密区 4（vault 文本、vault 图片、
+  `is_decryptable=false` 不下发内容、错 key 走 undecryptable）/ 错误与边界 6；`app/src/panel/geometry.rs`
+  的 9 例 —— `panel_size_for` 两档、`PanelMode::parse`、`fitted_size` 窄屏收缩、
+  `expanded_origin` 右侧够 / 翻左侧 / 两侧都不够居中 / 负原点）、core +1
+  （`default_preview_is_space`，并把 `all_actions()` 迁到 15、`default_map_covers_every_action`
+  钉住基数）、前端 +24（`preview.test.ts` 19 例：开关状态机与尺寸 IPC、三种 kind 派发、
+  图片缓存、跟随选中（扫过一串时请求合并）、旧结果不覆盖新内容、加密区「无法解密」、
+  IPC 失败与转义；`keymap.test.ts` 5 例：
+  `default_preview_is_space` / 空查询命中 / 空格焦点门 / dispatch 到 `togglePreview` /
+  键帽渲染 `Space`；`settings.test.ts` 不新增用例，只把两处基数断言从 13/14 改成 14/15）。
+  上一轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
   （`app/src/keymap.rs` 的 `recording_transition_releases_on_entry_only` —— 进录制必须让出、
   收工才装回、其余空转；`set_recording_tracks_state` —— 标记与动作由同一次 `swap` 给出）、
   前端 +6（`settings.test.ts` 的「录制态让出全局热键」6 例：进录制先让位 / `Esc` 也装回 /
@@ -169,13 +190,14 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  前端 3 个文件共 69 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
+  前端 4 个文件共 92 例 + 1 todo（`keymap.test.ts` 39 + 1 todo（含加密区模态的重绑传导与
   `Esc` 逃生口、命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs`
   源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 28（其中 11 例钉住
   「强行换绑」弹框的三条出口与「未绑定」的显示，4 例钉住录制态的收口路径 —— 关掉设置面板、
   等 keymap 的轮询窗口内重绑、录制成功 / 失败，6 例钉住「录制时让出全局热键」的时机与顺序，
-  1 例钉住「1 全局 + 13 面板 = 14」的动作基数
-  与分组）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
+  1 例钉住「1 全局 + 14 面板 = 15」的动作基数
+  与分组）、`preview.test.ts` 18（预览栏开关状态机与尺寸 IPC、kind 派发、图片缓存、
+  跟随选中、迟到响应、加密区「无法解密」）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查

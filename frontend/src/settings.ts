@@ -332,6 +332,7 @@ function showToast(msg: string): void {
 /** action → 中文标签 */
 const ACTION_LABELS: Record<HotkeyAction, string> = {
   open_panel: "唤出主面板",
+  preview: "切换预览栏",
   paste: "粘贴选中条目",
   edit_note: "编辑备注 / 标签",
   toggle_pin: "切换置顶",
@@ -351,6 +352,8 @@ const ACTION_LABELS: Record<HotkeyAction, string> = {
 // 动作」：这张表是手写的，加动作时漏掉一行，用户就再也重绑不到它。
 export const GLOBAL_ACTIONS: HotkeyAction[] = ["open_panel"];
 export const PANEL_ACTIONS: HotkeyAction[] = [
+  // `preview` 放在「粘贴选中条目」之前：它是在回贴**之前**确认内容的那一步。
+  "preview",
   "paste",
   "edit_note",
   "toggle_pin",
