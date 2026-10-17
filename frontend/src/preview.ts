@@ -4,7 +4,8 @@
 //
 // 模块边界与 `editor.ts` 同型：DOM 节点 + 模块级状态 + open/close + render + IPC，
 // 外部只经 `bindPreviewPane` / `openPreview` / `closePreview` / `togglePreview` /
-// `updatePreviewForSelection` 驱动；两侧状态（面板尺寸）由本模块独占，主流程不碰。
+// `updatePreviewForSelection` / `resetPreviewCache` 驱动；两侧状态（面板尺寸）由本模块
+// 独占，主流程不碰。
 //
 // 为什么预览栏要「长在面板里」而不是另开一个窗口：焦点必须一直在搜索框（用户还在
 // 打字 / 按方向键），第二个 WebView 会把焦点、生命周期、失焦收起全部再实现一遍。
@@ -45,6 +46,10 @@ const UNDECRYPTABLE_HINT = "🔒 无法解密";
 let open = false;
 /** 栏内正在展示的条目 id；`null` 表示没有（栏关闭或列表空）。 */
 let currentId: number | null = null;
+/** 正在飞的预览请求的条目 id（单飞：同一时刻最多一个）。 */
+let inflightId: number | null = null;
+/** 请求在飞期间又换了选中：只留最新一条，前一个落地后再发。 */
+let queuedEntry: EntryDto | null = null;
 
 /**
  * 图片预览缓存：`id -> data URL`。
@@ -70,16 +75,6 @@ function cacheImage(id: number, url: string): void {
 /** 绑定 DOM 节点。重复调用是幂等的（HMR 重载时不会留下两个引用）。 */
 export function bindPreviewPane(el: HTMLElement): void {
   pane = el;
-}
-
-/** 预览栏是否展开（R10：再按 Space / Esc 时据此决定开还是关）。 */
-export function isPreviewOpen(): boolean {
-  return open;
-}
-
-/** 栏内当前展示的条目 id（测试与「跟随选中」判重用）。 */
-export function getPreviewEntryId(): number | null {
-  return currentId;
 }
 
 /** 清空图片缓存。面板每次被唤出时调用（见模块顶部注释）。 */
@@ -117,7 +112,8 @@ export async function closePreview(): Promise<void> {
   if (!open) return;
   open = false;
   currentId = null;
-  paint(hintHtml("无预览"), "none");
+  queuedEntry = null;
+  paint(hintHtml("无预览"));
   pane?.classList.add("hidden");
   await setPanelMode("normal");
 }
@@ -153,9 +149,8 @@ export function updatePreviewForSelection(entry: EntryDto | undefined): void {
 // 渲染
 // ---------------------------------------------------------------------------
 
-function paint(html: string, kind: string): void {
+function paint(html: string): void {
   if (!pane) return;
-  pane.dataset.kind = kind;
   pane.innerHTML = html;
 }
 
@@ -169,71 +164,90 @@ function renderEntry(entry: EntryDto): void {
   const kind = entry.content_kind ?? "text";
   // 加密区条目已知解不开：不必再跑一次 IPC（后端也会拒），直接说结果。
   if (entry.is_vault && !entry.is_decryptable) {
-    paint(hintHtml(UNDECRYPTABLE_HINT), kind);
+    paint(hintHtml(UNDECRYPTABLE_HINT));
     return;
   }
   switch (kind) {
     case "image": {
       const cached = imageCache.get(entry.id);
       if (cached) {
-        paint(imageHtml(cached), kind);
+        paint(imageHtml(cached));
         return;
       }
-      paint(hintHtml("正在加载图片…"), kind);
-      void loadPreview(entry);
+      paint(hintHtml("正在加载图片…"));
+      requestPreview(entry);
       return;
     }
     case "text": {
       if (!entry.is_vault) {
-        paint(textHtml(entry.content), kind);
+        paint(textHtml(entry.content));
         return;
       }
       // 加密区文本：`content` 是空的（密文不下发），全文只能由后端解出来。
-      paint(hintHtml("正在解密…"), kind);
-      void loadPreview(entry);
+      paint(hintHtml("正在解密…"));
+      requestPreview(entry);
       return;
     }
     case "file":
     case "rtf":
     case "color":
-      paint(hintHtml(`无预览（${escapeHtml(kind)}）`), kind);
+      paint(hintHtml(`无预览（${kind}）`));
       return;
     default:
-      paint(textHtml(entry.content), kind);
+      paint(textHtml(entry.content));
   }
+}
+
+/**
+ * 排一次预览请求（图片 / 加密区文本）。
+ *
+ * 同一时刻只让**一个** `get_entry_preview` 在飞：方向键按住扫过十几条时，之前的写法
+ * 是每条各发一次全量解码（20MB 原图 × N 并发），既拖慢当前这条、又把 CPU 打满。
+ * 在飞期间的新选中只记最新的一条，等前一个落地再发 —— 用户停在哪条，最后画出来的
+ * 就是哪条（中间的选中本来就没人看得到）。
+ */
+function requestPreview(entry: EntryDto): void {
+  if (inflightId !== null) {
+    queuedEntry = entry;
+    return;
+  }
+  void loadPreview(entry);
 }
 
 /**
  * 取一次预览数据并渲染（图片 / 加密区文本）。
  *
- * 返回时先核对「还是不是同一条、栏还开着」：连按方向键时多个请求会同时在飞，
- * 慢的那个回来时不能覆盖快的那张图（AE1 的「结果不混」）。
+ * 返回时先核对「还是不是同一条、栏还开着」：关栏 / 收起后迟到的响应不能往栏里画，
+ * 切换到别条时旧结果也不能覆盖新内容（AE1 的「结果不混」）。
  */
 async function loadPreview(entry: EntryDto): Promise<void> {
   const id = entry.id;
+  inflightId = id;
   try {
     const dto = await invoke<PreviewDto>("get_entry_preview", { id });
     const image = dto.kind === "image" ? dto.data_url : null;
     // 先入缓存再判「还是不是这一条」：迟到的响应也得留下，否则再转回来还要重解码一次。
     // 加密区条目例外：解密结果不留在模块级缓存里，只在栏内显示一次。
     if (image && !entry.is_vault) cacheImage(id, image);
-    if (!isCurrent(id)) return;
-    if (image) {
-      paint(imageHtml(image), "image");
-      return;
+    if (isCurrent(id)) {
+      if (image) {
+        paint(imageHtml(image));
+      } else if (dto.kind === "text" && dto.content !== null) {
+        paint(textHtml(dto.content));
+      } else if (dto.undecryptable) {
+        paint(hintHtml(UNDECRYPTABLE_HINT));
+      } else {
+        paint(hintHtml("无预览"));
+      }
     }
-    if (dto.kind === "text" && dto.content !== null) {
-      paint(textHtml(dto.content), "text");
-      return;
-    }
-    if (dto.undecryptable) {
-      paint(hintHtml(UNDECRYPTABLE_HINT), dto.kind);
-      return;
-    }
-    paint(hintHtml("无预览"), dto.kind);
   } catch (err) {
-    if (!isCurrent(id)) return;
-    paint(hintHtml(`预览失败：${escapeHtml(String(err))}`), entry.content_kind ?? "text");
+    if (isCurrent(id)) paint(hintHtml(`预览失败：${String(err)}`));
+  } finally {
+    inflightId = null;
+    const next = queuedEntry;
+    queuedEntry = null;
+    // 排队的这条可能已经被跳过（又按了方向键 / 栏关了）：只发当前真正在展示的那条。
+    if (next && next.id !== id && isCurrent(next.id)) void loadPreview(next);
   }
 }
 
@@ -251,8 +265,9 @@ function textHtml(content: string): string {
   return `<pre class="preview-text">${escapeHtml(content)}</pre>`;
 }
 
+/** 提示文案：唯一一处把纯文本放进 HTML 的地方，转义收在这里。 */
 function hintHtml(text: string): string {
-  return `<div class="preview-hint">${text}</div>`;
+  return `<div class="preview-hint">${escapeHtml(text)}</div>`;
 }
 
 // ---------------------------------------------------------------------------
