@@ -33,13 +33,13 @@ jobs:
     name: macOS（fmt / clippy / test / 前端）
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # 只缓存 crates.io 索引与源码。**刻意不缓存 target/**：debug 产物在本地是 GB 量级，
       # 塞进仓库 10GB 的缓存额度会把其它条目挤掉，而它省下的只是这一条快线上的几分钟编译
       # —— 净收益不划算（package.yml 的 windows job 对同一取舍有更长的说明）。
       - name: 缓存 crates.io 索引与源码
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -54,7 +54,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy,rustfmt
           rustup default stable
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: npm
@@ -97,11 +97,11 @@ jobs:
     name: Windows（clippy / test）
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # 与 macos job 同理：只缓存 registry，不缓存 target/debug（见那边的注释）。
       - name: 缓存 crates.io 索引与源码
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry
@@ -114,7 +114,7 @@ jobs:
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: npm
