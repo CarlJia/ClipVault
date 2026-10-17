@@ -7,11 +7,16 @@
 //! - `boot_load_hotkeys` — 启动路径：load → 写入 `Arc<RwLock<HotkeyMap>>`
 //! - `apply_hotkeys` — 运行时更新 in-memory slot
 //! - `apply_global_hotkey` — 全局热键 re-register（U2：串起 `hotkey::register`）
+//! - 录制态（快捷键 plan KTD9）：`set_recording` 给出该做什么（`HotkeySync`），
+//!   `release_global_hotkey` / `restore_global_hotkey_after_leaving_panel` 执行 ——
+//!   设置面板等用户按键期间把全局热键从 OS 摘掉，否则用户按下的组合会被 OS 自己吃掉
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use clipvault_core::keymap::{HotkeyMap, parse as parse_keymap_json, serialize};
 use rusqlite::Result as SqliteResult;
+use tauri::Manager;
 
 use crate::storage::Storage;
 
@@ -86,6 +91,96 @@ pub fn apply_global_hotkey(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 录制态：让出全局热键（快捷键 plan KTD9）
+// ---------------------------------------------------------------------------
+
+/// 设置面板正在等用户按键（由前端 `startRecording` / `cancelRecording` 驱动）。
+///
+/// 进程级全局：全局热键本身就是进程级资源，与哪个窗口、哪一行无关。
+static RECORDING: AtomicBool = AtomicBool::new(false);
+
+/// 一次录制态切换，要对 OS 侧全局热键做的事。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeySync {
+    /// 什么都不做：没进过录制态，或把同一个值又设了一遍。
+    Nothing,
+    /// 把 `open_panel` 的组合从 OS 摘掉（进录制态）。
+    Release,
+    /// 按当前生效的 map 把全局热键装回 OS（离开录制态）。
+    Restore,
+}
+
+/// 由「切换前后的录制态」决定该做什么（纯函数，可单测）。
+///
+/// **本次 bug 的修复点就是 `false → true` 这一支**：`open_panel` 的 ⌥⌘V 是
+/// `RegisterEventHotKey` 注册到 OS 的**系统级**热键，HIToolbox 在按键进入前台 App 的
+/// 派发链**之前**就把它截走 —— 设置面板里那个「请按新键…」因此收不到任何 keydown，
+/// 行永远停在那里、什么也不写（Windows 同理：`RegisterHotKey` 只投 `WM_HOTKEY`，
+/// 按键同样进不了 WebView）。想让用户能重新录这个组合，只能先把 OS 侧摘掉。
+///
+/// 反向同样重要：只有**真的让出过**才装回。`Nothing` 那一支挡住两种空转 ——
+/// 面板每次收起都重注册一次全局热键（白费，而且会把「组合被别的 App 占着」的注册
+/// 失败刷进日志），以及启动路径上凭空弹一条「全局热键恢复失败」。
+pub fn recording_transition(was_recording: bool, now_recording: bool) -> HotkeySync {
+    match (was_recording, now_recording) {
+        (false, true) => HotkeySync::Release,
+        (true, false) => HotkeySync::Restore,
+        _ => HotkeySync::Nothing,
+    }
+}
+
+/// 设置录制态，并返回随之要做的事。
+///
+/// 标记与动作由同一个函数给出，调用方没法「只改标记不做动作」（那会让 ⌥⌘V 缺席到重启）。
+/// 返回值本身也是「标记现在是什么」的观测口：同一个值设两次，第二次必然是
+/// [`HotkeySync::Nothing`]（`cargo test` 里的 `set_recording_tracks_state` 就靠这个断言）。
+pub fn set_recording(active: bool) -> HotkeySync {
+    let was = RECORDING.swap(active, Ordering::SeqCst);
+    recording_transition(was, active)
+}
+
+/// 把全局热键从 OS 摘掉（[`HotkeySync::Release`] 的执行侧）。
+///
+/// 不需要 `AppHandle`：注销按 action 定位，平台实现在 `crate::hotkey::unregister`。
+/// 未注册时是 no-op，重复调用安全。
+pub fn release_global_hotkey() {
+    crate::hotkey::unregister(clipvault_core::keymap::HotkeyAction::OpenPanel);
+}
+
+/// 按当前生效的 map 把全局热键装回 OS（[`HotkeySync::Restore`] 的执行侧）。
+///
+/// map 从共享 slot 现取：收工路径拿不到前端那份 map，而 `AppState::keymap` 是单一
+/// 事实来源。`AppState` 还没 `manage`（启动极早期）时什么都不做 —— 那时也没有录制态。
+fn restore_global_hotkey(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(map) = app
+        .try_state::<crate::commands::AppState>()
+        .map(|state| state.keymap.read().unwrap().clone())
+    else {
+        return Ok(());
+    };
+    apply_global_hotkey(app, &map).map_err(|e| e.to_string())
+}
+
+/// 「面板已经离开」的兜底：面板隐藏（失焦自动收起 / `hide_panel`）时走这里。
+///
+/// 面板都看不见了，谁还在录键 —— 所以这里连录制标记一起清掉，并把让出过的热键装回。
+/// 不清标记只装热键的话，下一轮判定会被这个陈旧标记挡住，⌥⌘V 一直失灵到用户点托盘
+/// 再唤出，且全程没有任何提示。
+///
+/// 没让出过（绝大多数收起）时一步都不做。
+pub fn restore_global_hotkey_after_leaving_panel(app: &tauri::AppHandle) {
+    if set_recording(false) == HotkeySync::Nothing {
+        return;
+    }
+    // 这是正常路径之一（用户录到一半点去别的 App），不是异常：面板先一步藏起来，
+    // 前端的 `cancelRecording` 往往还没来得及发 active=false，所以由这里接住。
+    ::log::debug!(target: "keymap", "面板已收起，把录制期间让出的全局热键装回");
+    if let Err(e) = restore_global_hotkey(app) {
+        ::log::warn!(target: "keymap", "面板离开后恢复全局热键失败：{e}（热键可能不生效）");
+    }
 }
 
 /// 这份新 map 是否动了全局热键（`OpenPanel` 的组合变了，或从有键变成未绑定）。
@@ -457,5 +552,65 @@ mod tests {
         new.claim(HotkeyAction::OpenPanel, combo(Mods::META | Mods::ALT, 'v'));
         assert_eq!(new, old);
         assert!(!global_hotkey_changed(&old, &new));
+    }
+
+    // ----------------------------------------------------------------
+    // 录制态：让出全局热键（快捷键 plan KTD9）
+    // ----------------------------------------------------------------
+
+    /// 切换表：进录制必须让出，收工才装回，其余一律空转。
+    ///
+    /// 第一行就是本次 bug 的修复点 —— 写成 `Nothing` 的话，用户在设置里按 ⌥⌘V 按的是
+    /// 被 OS 截走的那一下，那一行永远停在「请按新键…」。
+    #[test]
+    fn recording_transition_releases_on_entry_only() {
+        assert_eq!(
+            recording_transition(false, true),
+            HotkeySync::Release,
+            "进录制态必须让出全局热键，否则用户按下的正是被 OS 截走的那一下"
+        );
+        assert_eq!(
+            recording_transition(true, false),
+            HotkeySync::Restore,
+            "收工必须装回，否则 ⌥⌘V 失灵到重启"
+        );
+        assert_eq!(
+            recording_transition(false, false),
+            HotkeySync::Nothing,
+            "没让出过就别装回：面板每次收起都重注册是空转，还会刷出假的注册失败"
+        );
+        assert_eq!(
+            recording_transition(true, true),
+            HotkeySync::Nothing,
+            "重复进录制态别再摘一次（摘的是已经不在的那条）"
+        );
+    }
+
+    /// `set_recording` 的标记进出与返回值一致（返回值就是「标记现在是什么」的观测口）。
+    ///
+    /// 本用例独占进程级的 `RECORDING`（`cargo test` 同进程多线程跑），别再加第二个
+    /// 碰它的用例 —— 两个用例交错会把各自的断言踩坏。
+    #[test]
+    fn set_recording_tracks_state() {
+        assert_eq!(
+            set_recording(true),
+            HotkeySync::Release,
+            "起点不该是录制态，所以第一次进录制要摘"
+        );
+        assert_eq!(
+            set_recording(true),
+            HotkeySync::Nothing,
+            "重复进录制态不该再摘一次"
+        );
+        assert_eq!(
+            set_recording(false),
+            HotkeySync::Restore,
+            "收工要报告「该装回了」，否则 ⌥⌘V 留在缺席状态"
+        );
+        assert_eq!(
+            set_recording(false),
+            HotkeySync::Nothing,
+            "已经收工过就不再报告，免得每次收起面板都白跑一次注册"
+        );
     }
 }

@@ -185,6 +185,7 @@ fn main() {
             commands::set_panel_opacity,
             commands::get_hotkeys,
             commands::set_hotkey,
+            commands::set_hotkey_recording,
             commands::keychain_available,
             commands::move_to_vault,
             commands::list_vault,

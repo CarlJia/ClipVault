@@ -48,6 +48,7 @@ import {
   refreshAccessibilityBanner,
   refreshKeychainBanner,
   renderHotkeysSection,
+  restoreGlobalHotkeys,
   setGuestMode,
   setLogLevel,
   setPanelOpacity,
@@ -885,6 +886,9 @@ void listen("open-settings", () => {
 // U12：启动时一次性把 `--panel-alpha` CSS 变量对齐到后端持久化的透明度，
 // 即使模态不打开，刷新面板也能直接看到上次设置；getPanelOpacity 失败回退默认 78。
 void getPanelOpacity().then(applyPanelOpacity);
+// 页面（重新）加载 = 任何在录的录制态都已随风而去（dev 期 HMR 每次改代码都会重载）：
+// 后端可能还停在「已让出全局热键」，不补这一刀 ⌥⌘V 会失灵到重启 App。幂等 no-op。
+restoreGlobalHotkeys();
 // U7：平台标识（`platform_info`）先到位再首屏渲染 —— 底部键帽、行序号徽标（⌘1–9）、
 // 各横幅文案都含平台差异，晚一步就会先用 macOS 文案画出来而之后没人重渲染。
 // `initPlatform()` 同时会遍历改写 `<kbd>` 键帽；三个 refresh 函数内部也会

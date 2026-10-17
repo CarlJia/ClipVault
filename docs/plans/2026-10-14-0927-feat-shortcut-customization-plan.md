@@ -67,6 +67,8 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 - R14. 组合键在快捷键表内必须 1:1。Carbon / `RegisterHotKey` 只管「全局热键被系统或别的程序占了」,管不到「同一张表里另一条 action 已经占着它」—— 后者放进去是静默的:前端 `matches()` 只派发给排序靠前的那条,另一条永远不触发而它那一行仍显示着这个组合。前端录制路径写库前查表(`actionOwningCombo`),命中则**不直接写库**,而是弹确认框说清占用者与后果;用户选「强行换绑」→ 抢过来(见 R15),选「取消」/`Esc` → 键帽回原绑定、`settings` 表未改。后端 `set_hotkey` 在不带 `force` 时同样拒收(写入口兜底,覆盖前端查不到的路径),`force` 只由用户在弹框里确认后由前端传。已存在的历史重复不自动改写 —— 重绑任一条、或点「重置默认」即可。
 - R15. 快捷键表必须能表示「未绑定」(某个 action 没有键):用户确认「强行换绑」后,原来占着该组合的 action 变成未绑定,而不是两条共用同一个组合。模型上 `HotkeyMap.actions` 的值是 `Option<KeyCombo>`,线格式里该 action 写成 `null`;`conflict_for` 不把未绑定算作占用,前端 `matches()` / `actionOwningCombo` 跳过未绑定。设置里那一行显示「未绑定」,点「重绑」可以重新给它绑一个键。未绑定的若是全局热键 `open_panel`,OS 侧那条也要一并注销(否则界面写着「未绑定」、实际还能按出来);此后面板只能从托盘/菜单栏图标唤出——弹框必须提前把这句警告说出来。
 
+- R16. 录制态必须让出全局热键:用户点「重绑」后、按下新键之前,后端必须把 `open_panel` 在 OS 侧的那条热键摘掉(`UnregisterEventHotKey` / `UnregisterHotKey`,按 action 定位,不碰别的 action)。不让出的话,用户按的正是被系统截走的那一下 —— `RegisterEventHotKey` / `RegisterHotKey` 在按键进入前台 App / WebView **之前**就吃掉它,录制监听器收不到任何 keydown,那一行永远停在「请按新键…」,什么也不写(不是 macOS 独有)。收工必须装回,且**只有真的让出过才装回**:采到键 / `Esc` / 行内「取消」/ 切行 / 关设置都经 `cancelRecording` 一个收口;面板隐藏(失焦自动收起 / `hide_panel`)与前端页面重新加载是兜底收口(前端那份录制态可能已经不见了)。没让出过时是空转 —— 不重注册、不报「恢复失败」。
+
 ### Acceptance Examples
 
 - AE1. 用户在设置里把全局 `⌥⌘V` 改成 `⌃⌥L`,保存后从下个 `⌃⌘L` 起呼出面板,`⌥⌘V` 不再响应。
@@ -75,6 +77,8 @@ ClipVault 当前把快捷键硬编码在三处:`hotkey.rs:144-156` 用 Carbon `R
 - AE4. 重启 ClipVault,自定义 binding 仍然生效(从 `settings` 表 `hotkeys` 行恢复)。
 - AE5. 用户把 `paste` 重绑成 `edit_note` 已占用的 `⌘E`:弹出确认框,文案说出「`⌘E` 已被「编辑备注 / 标签」占用」以及「强行换绑后「编辑备注 / 标签」会变成「未绑定」」。点「取消」或按 `Esc` → `paste` 仍是 `↩`、`edit_note` 仍是 `⌘E`、`settings` 表未改;点「强行换绑」或按 `Enter` → `paste` 变成 `⌘E`、`edit_note` 那行显示「未绑定」、`settings` 表随之更新。即使绕过前端直呼 `set_hotkey` IPC(不带 `force`),后端也返回 `Err` 且不动库与内存 slot。
 - AE6. 未绑定的 action:`edit_note` 被抢走键位后,按 `⌘E` 触发 `paste`(不再被 `edit_note` 抢走派发),设置里 `edit_note` 那行显示「未绑定」,点它的「重绑」仍可重新绑一个键;重启后未绑定状态保持(线格式里是 `null`)。若被抢的是全局热键 `⌥⌘V`,弹框额外警告「解绑后只能从托盘/菜单栏图标打开面板」,确认后 `⌥⌘V` 不再响应,从托盘仍能唤出面板。
+
+- AE7. 用户在设置里点「唤出主面板」那行的「重绑」,再按 `⌥⌘V`(当前正被 OS 占着的那个组合):录制监听器**收到**这次 keydown,行上写回 `⌥⌘V` 并提示「已经绑在 ⌥⌘V 上,未做改动」(不再是「按了没反应」)。收工后 `⌥⌘V` 仍能唤出面板 —— 录制期间让出、收工装回。若录制中点了别的 App 让面板自动收起,或 dev 期页面重载,`⌥⌘V` 同样恢复响应,不会失灵到重启。
 
 ### Scope Boundaries
 
@@ -118,6 +122,15 @@ KTD6. 全局热键切换流程:`unregister_all` → 对每个新 combo 调 `regi
 KTD7. macOS / Windows 之外的平台(Linux)按现有 `#[cfg(...)]` 路径降级,`register` 返回 `Ok(())`(占位),设置 UI 不显示全局热键区;其它按 platform 列照常渲染。
 
 KTD8. 持久化路径与 `panel_opacity` 完全同形:`Arc<RwLock<HotkeyMap>>` 共享 + settings 表 `hotkeys` 行;`boot_load_hotkeys` 在 `setup` 中先于 watcher spawn 执行,与 `boot_load_panel_opacity` 同型。
+
+KTD9. 录制态让位用「一个纯函数状态机 + 一个进程级标记」:`keymap::recording_transition(was, now) -> HotkeySync { Nothing, Release, Restore }` 是纯函数(可单测,不需要 `AppHandle`),`keymap::set_recording(active)` 用 `AtomicBool::swap` 一次性给出标记与动作,调用方(IPC `set_hotkey_recording`、面板隐藏兜底)只执行返回的动作。`(session-settled: user-directed — 修复「重绑按 ⌥⌘V 无反应」时定下:摘与装必须对称且幂等,只有 `false→true` 摘、`true→false` 装,其余空转)`
+
+理由与约束:
+- **不这么拆就会写出「只为测试存在」的判定函数**:`holds_global_hotkey(recording)` 这类谓词没有任何生产调用点,断言它等于自说自话。状态机则真的驱动「摘 / 装 / 不动」三条分支。
+- **装回必须按「真的让出过」**:无条件装回会让面板每次收起都重注册一次全局热键 —— 白费,而且会把「组合被别的 App 占着」的注册失败报成一条假的「全局热键恢复失败」(启动路径那次 `active=false` 尤其显眼)。
+- **撤销按 action 定位**(`hotkey::unregister(OpenPanel)`),**不能**用 `unregister_all`:Windows 侧它会给消息泵线程发 `Quit` 并 join,等于全局热键永久失联。
+- 前端侧两条 IPC 是「写绝对状态」,而 Tauri 异步命令不保证「发送顺序 = 执行顺序」,所以前端把 `set_hotkey_recording` 串成一条 Promise 链(`settings.ts::setRecordingState`),避免「切行」时收工晚于让位落地。
+- 兜底:前端页面重新加载(`main.ts` 启动路径调 `restoreGlobalHotkeys`)与面板隐藏各补一刀,防止「前端那份录制态没了、后端还停在已让出」把 ⌥⌘V 留在缺席状态到重启。
 
 ### High-Level Technical Design
 
@@ -437,6 +450,8 @@ cargo test -p clipvault hotkey_test
 |---|---|---|---|---|
 | macOS | 手动 | 手动 | 手动 | 手动 |
 | Windows | 手动 | 手动 | 手动 | 手动 |
+
+**AE7(录制态让出全局热键)只能在真机上验**:它要的正是「系统级热键会不会把按键从 WebView 手里截走」这件事,jsdom / 单测都复现不出来 —— 单测只能钉「有没有让位、什么时候装回、顺序对不对」(见 `frontend/src/settings.test.ts` 的「录制态让出全局热键」与 `app/src/keymap.rs` 的 `recording_transition_*`)。两个平台各按一次「重绑 → 按当前全局组合」即算通过。
 
 ---
 

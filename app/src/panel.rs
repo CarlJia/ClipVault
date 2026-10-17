@@ -228,7 +228,11 @@ pub fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
     }
     if let Err(e) = window.hide() {
         ::log::warn!(target: "panel", "面板失焦自动收起失败：{e}");
+        return;
     }
+    // 收起同样意味着录制态结束（快捷键 plan KTD9）：用户点去别处时，设置里那一行不该还攥着
+    // 「请按新键…」，⌥⌘V 也不该继续缺席 —— 让全局热键就地归位。
+    crate::keymap::restore_global_hotkey_after_leaving_panel(window.app_handle());
 }
 
 // ================================================================
