@@ -1,7 +1,7 @@
 //! HotkeyMap 数据层：平台无关的快捷键抽象。
 //!
 //! 数据结构：
-//! - [`HotkeyAction`] — 14 个语义化动作标识符（与前端 dispatch 入口 1:1 对应）。
+//! - [`HotkeyAction`] — 15 个语义化动作标识符（与前端 dispatch 入口 1:1 对应）。
 //! - [`CharKind`] — 键值类别（字母/数字/符号、Enter、Escape、方向键、逗号、退格）。
 //! - [`KeyCombo`] — 一个具体的按键组合 `{ mods, key }`。
 //! - [`HotkeyMap`] — Action → KeyCombo 的全量映射表（启动时从 settings 表加载，
@@ -164,7 +164,7 @@ pub struct KeyCombo {
     pub key: CharKind,
 }
 
-/// 14 个语义化动作标识符。
+/// 15 个语义化动作标识符。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HotkeyAction {
     OpenPanel,
@@ -181,6 +181,8 @@ pub enum HotkeyAction {
     Close,
     MoveUp,
     MoveDown,
+    /// 「切换预览栏」（列表旁预览栏 plan U5 / R8 / KTD8）。
+    Preview,
 }
 
 impl HotkeyAction {
@@ -201,6 +203,7 @@ impl HotkeyAction {
             "close" => Some(HotkeyAction::Close),
             "move_up" => Some(HotkeyAction::MoveUp),
             "move_down" => Some(HotkeyAction::MoveDown),
+            "preview" => Some(HotkeyAction::Preview),
             _ => None,
         }
     }
@@ -225,6 +228,7 @@ impl HotkeyAction {
             HotkeyAction::Close => "close",
             HotkeyAction::MoveUp => "move_up",
             HotkeyAction::MoveDown => "move_down",
+            HotkeyAction::Preview => "preview",
         }
     }
 }
@@ -236,7 +240,7 @@ impl HotkeyAction {
 /// 变成 `None`，而不是让两条 action 共用同一个组合。
 ///
 /// **不** 派生 `Default` —— `HashMap` 的派生 Default 产生空表，而本类型的"默认"
-/// 含义是 [`default_map`] 提供的 14 条硬编码条目（14 条都有键，没有 `None`）。
+/// 含义是 [`default_map`] 提供的 15 条硬编码条目（15 条都有键，没有 `None`）。
 /// `parse` 路径从 default_map 出发、缺失字段保留默认值；如果本类型有
 /// `Default::default()`，调用方很容易拿到空表。调用方请使用 [`HotkeyMap::default_map`].
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -344,6 +348,16 @@ impl HotkeyMap {
             Some(KeyCombo {
                 mods: Mods::empty(),
                 key: CharKind::ArrowDown,
+            }),
+        );
+        // 单按 Space（列表旁预览栏 plan KTD2）：MV 期承诺的「Space 预览完整内容」。
+        // 与搜索框「打空格」的冲突由前端的焦点门解决（查询非空时让位给原生输入），
+        // 不靠换一个带修饰键的组合来回避。
+        actions.insert(
+            HotkeyAction::Preview,
+            Some(KeyCombo {
+                mods: Mods::empty(),
+                key: CharKind::Char(' '),
             }),
         );
         HotkeyMap { actions }
@@ -564,7 +578,7 @@ mod tests {
     /// 全变体清单的唯一副本：`hotkeyaction_roundtrip` 用它做线格式往返，
     /// `default_map_covers_every_action` 用它当默认映射的基数锚点。
     /// 返回定长数组，所以新增一个变体时这里会编译失败 —— 这正是要的提醒。
-    fn all_actions() -> [HotkeyAction; 14] {
+    fn all_actions() -> [HotkeyAction; 15] {
         [
             HotkeyAction::OpenPanel,
             HotkeyAction::Paste,
@@ -580,6 +594,7 @@ mod tests {
             HotkeyAction::Close,
             HotkeyAction::MoveUp,
             HotkeyAction::MoveDown,
+            HotkeyAction::Preview,
         ]
     }
 
@@ -607,6 +622,25 @@ mod tests {
             map.actions.len(),
             all_actions().len(),
             "默认映射出现了变体清单之外的条目"
+        );
+        // 变体数（列表旁预览栏 plan U5 / KTD8）：三处基数一起迁移到 15。
+        assert_eq!(all_actions().len(), 15, "动作数必须是 15");
+    }
+
+    /// `preview` 的默认绑定钉在**单按 Space**（plan KTD2 / R8）。
+    ///
+    /// 它是「列表旁预览栏」的唯一键盘入口；改成了带修饰键的组合，用户就得先学会
+    /// 一个新键才能看到内容 —— 而 MVP plan 的关键流程第 3 步承诺的就是 Space。
+    #[test]
+    fn default_preview_is_space() {
+        let map = HotkeyMap::default_map();
+        assert_eq!(
+            map.actions.get(&HotkeyAction::Preview),
+            Some(&Some(KeyCombo {
+                mods: Mods::empty(),
+                key: CharKind::Char(' '),
+            })),
+            "Preview 必须是单按 Space"
         );
     }
 

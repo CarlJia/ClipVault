@@ -74,7 +74,8 @@ export type HotkeyAction =
   | "open_settings"
   | "close"
   | "move_up"
-  | "move_down";
+  | "move_down"
+  | "preview";
 
 export interface HotkeyMap {
   /** `null` = 该 action 未绑定（没有快捷键）。 */
@@ -499,7 +500,8 @@ export function localizedCombo(combo: KeyCombo): string {
   const keyStr = (() => {
     switch (combo.key.kind) {
       case "char":
-        return combo.key.ch.toUpperCase();
+        // 空格键不能渲染成一个空键帽（用户会以为是显示坏了）。
+        return combo.key.ch === " " ? "Space" : combo.key.ch.toUpperCase();
       case "enter":
         return "↩";
       case "escape":
@@ -539,6 +541,8 @@ type Handlers = {
   triggerSkipOnce: () => Promise<void>;
   openSettings: () => Promise<void>;
   closeSettings: () => void;
+  /** 「切换预览栏」（列表旁预览栏 plan U4）：开 / 关由实现方判断当前状态。 */
+  togglePreview: () => void;
   currentEntry: () => import("./panel").EntryDto | undefined;
 };
 
@@ -601,6 +605,9 @@ export function dispatchHotkeyAction(action: HotkeyAction): void {
     case "open_settings":
       void handlers.openSettings();
       break;
+    case "preview":
+      handlers.togglePreview();
+      break;
     case "open_panel":
       // 全局热键由 Rust 端处理，前端 panel 内此 action 是 no-op
       break;
@@ -642,6 +649,34 @@ const NON_TEXT_INPUT_TYPES = new Set([
  * keymap 的测试环境没有 DOM（见 `keymap.test.ts` 顶部）。
  */
 export function textFieldOwnsDeleteKey(target: EventTarget | null): boolean {
+  const el = target as (Partial<HTMLElement> & { type?: string; value?: string }) | null;
+  switch (el?.tagName?.toUpperCase()) {
+    case "TEXTAREA":
+      return (el.value ?? "").length > 0;
+    case "INPUT": {
+      const type = (el.type ?? "text").toLowerCase();
+      if (NON_TEXT_INPUT_TYPES.has(type)) return false;
+      return (el.value ?? "").length > 0;
+    }
+    default:
+      return el?.isContentEditable === true;
+  }
+}
+
+/**
+ * 「焦点门」：当前聚焦的文本控件此刻会不会**自己**消费 Space ——
+ * 是则 `preview` 让位给原生输入（列表旁预览栏 plan R9 / KTD2）。
+ *
+ * 为什么需要它：搜索框是**常焦**的（唤出 / 关闭 / 切 tab 都会 `searchEl.focus()`），
+ * 而 `preview` 的默认键就是单按 Space。不加判据的话，用户想查 `foo bar` 时中间那个
+ * 空格会被吞掉并弹出一个预览栏。
+ *
+ * 判据与 [`textFieldOwnsDeleteKey`] 同形（同一类「原生动作此刻有没有事可做」）：
+ * - `<input>` / `<textarea>`：**里面有内容**才让位（空查询时原生只会打出一个没有
+ *   意义的空格，此时 Space 用来开预览栏更符合直觉）；
+ * - contenteditable：没法便宜地判断空不空，保守让位。
+ */
+export function textFieldOwnsSpace(target: EventTarget | null): boolean {
   const el = target as (Partial<HTMLElement> & { type?: string; value?: string }) | null;
   switch (el?.tagName?.toUpperCase()) {
     case "TEXTAREA":
