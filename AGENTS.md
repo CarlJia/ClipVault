@@ -122,6 +122,9 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   后端缩到长边 ≤ 1600px 再 base64 回传（原图不进 WebView），文本给全文，file / rtf / color
   只给提示。R13 仍为空（零新 crate：`image` / `base64` 早就在树内）。剩余：macOS 真机
   AE1–AE4 与 Windows 真机复跑；加密区模态内的预览入口列入后续 PR（模态遮住预览栏）。
+  代码评审留下的 6 条已全部落地：图片解码进 `spawn_blocking`、方向键扫图时请求单飞合并、
+  尺寸切换按**窗口所在屏**取工作区（不再跟鼠标跳屏）、`hintHtml` 转义收口、去掉三处
+  测试专用导出、`panel.rs` 拆成 `panel/{mod,geometry,macos,windows}.rs`（原 1171 行）。
 - **启动不再重捕既有剪贴板**（`Watcher::new`）：`last_change_count` 改为用构造时的剪贴板
   序列号播种（原来硬编码 `-1`，导致启动首轮必定捕获一次既有剪贴板）。这是「删除能扛过重启」
   的前提 —— 否则删掉的内容只要还在剪贴板里，就会在重启后原样回到历史；加密区条目更糟，
@@ -142,12 +145,13 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   其中 1 例来自同期合入 main 的 `app/src/pasteback_test.rs` 增量，与本轮预览栏无关。
   本轮增量是「列表旁预览栏」（plan U1–U6）：app +28（`app/src/preview_test.rs` 的 19 例 ——
   缩放算术 3 / 重编码 3 / 明文图片与文本 3 / 加密区 4（vault 文本、vault 图片、
-  `is_decryptable=false` 不下发内容、错 key 走 undecryptable）/ 错误与边界 6；`app/src/panel.rs`
+  `is_decryptable=false` 不下发内容、错 key 走 undecryptable）/ 错误与边界 6；`app/src/panel/geometry.rs`
   的 9 例 —— `panel_size_for` 两档、`PanelMode::parse`、`fitted_size` 窄屏收缩、
   `expanded_origin` 右侧够 / 翻左侧 / 两侧都不够居中 / 负原点）、core +1
   （`default_preview_is_space`，并把 `all_actions()` 迁到 15、`default_map_covers_every_action`
-  钉住基数）、前端 +23（`preview.test.ts` 18 例：开关状态机与尺寸 IPC、三种 kind 派发、
-  图片缓存、跟随选中、迟到响应不覆盖、加密区「无法解密」、IPC 失败；`keymap.test.ts` 5 例：
+  钉住基数）、前端 +24（`preview.test.ts` 19 例：开关状态机与尺寸 IPC、三种 kind 派发、
+  图片缓存、跟随选中（扫过一串时请求合并）、旧结果不覆盖新内容、加密区「无法解密」、
+  IPC 失败与转义；`keymap.test.ts` 5 例：
   `default_preview_is_space` / 空查询命中 / 空格焦点门 / dispatch 到 `togglePreview` /
   键帽渲染 `Space`；`settings.test.ts` 不新增用例，只把两处基数断言从 13/14 改成 14/15）。
   上一轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
