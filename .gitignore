@@ -2,6 +2,8 @@ target/
 .DS_Store
 node_modules/
 dist/
+# vitest 的本地运行缓存（`frontend/.vitest/json`），每次 `npm test` 都会重写。
+frontend/.vitest/
 *.pdb
 *.lock
 # Cargo.lock 必须提交：本仓库出的是可分发二进制，CI 打包要用与开发机同一棵依赖树。
@@ -16,3 +18,5 @@ dist/
 # CodeGraph 的本地代码索引：codegraph.db 是本机生成的二进制（数 MB），换台机器会重建，
 # 不需要进版本库。目录里自带一份 .gitignore 只挡 *.db，整个目录不跟踪更省事。
 .codegraph/
+# AI agent 的工作区记忆（`.workbuddy/memory/`），本机产物，不进版本库。
+.workbuddy/
