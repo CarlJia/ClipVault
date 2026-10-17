@@ -139,21 +139,24 @@
                   <ul class="hotkey-list" id="hotkey-list-panel"></ul>
                 </div>
               </div>
-              <!-- U4：诊断日志区块。复用 .settings-section 视觉层,无新 CSS。
+              <!-- U4：诊断日志区块。复用 .settings-section / .settings-row 视觉层。
+                   级别不要套 .slider —— 那是 range 输入框的轨道样式
+                   （appearance:none + height:4px），会把 <select> 压成一条看不见
+                   选中文案的细线。
                    进入设置时由 main.ts 调 refreshLogSection 拉取;切级别 / 清空
                    后再拉一次以反映。 -->
               <div class="settings-section settings-log-section">
                 <div class="settings-section-title">诊断日志</div>
                 <div class="settings-row">
                   <label class="editor-label" for="settings-log-level">级别</label>
-                  <select id="settings-log-level" class="slider">
+                  <select id="settings-log-level" class="settings-select">
                     <option value="info">标准（INFO+）</option>
                     <option value="verbose">详细（DEBUG+）</option>
                   </select>
                 </div>
                 <div class="settings-row">
                   <span class="editor-label">文件</span>
-                  <span id="settings-log-path" class="settings-value" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:280px" title=""></span>
+                  <span id="settings-log-path" class="settings-value settings-log-path" title=""></span>
                 </div>
                 <div class="settings-row">
                   <span class="editor-label">大小</span>

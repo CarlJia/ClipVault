@@ -264,6 +264,15 @@ pub fn file_text_fallback(paths: &[String]) -> String {
     paths.join("\n")
 }
 
+/// 把一段文本原样写入系统剪贴板(只写剪贴板,不回贴、不碰焦点)。
+///
+/// 调方是设置面板「诊断日志 → 文件路径」的点击复制(`commands::copy_log_path`)。
+/// 抽成吃 `PasteBackend` 的函数,是为了让平台无关单测能用 mock 断言写入的类型与内容
+/// (与 [`perform_paste`] 同一手法)。
+pub fn copy_text_to_clipboard<B: PasteBackend>(backend: &B, text: &str) {
+    backend.write_clipboard(ContentKind::Text, text, None, None);
+}
+
 /// 回贴编排(纯决策逻辑,平台副作用全走 trait)。
 ///
 /// 顺序对应计划 U8 Approach，并修正了「未授权时内容也进不了剪贴板」的缺陷：

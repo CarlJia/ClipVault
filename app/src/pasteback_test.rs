@@ -14,9 +14,9 @@ use clipvault_core::crypto::CryptoError;
 use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, InjectError, PasteBackend, PasteError, PasteOutcome, cgevent_fail_msg,
-    color_paste_text, file_paths, file_text_fallback, modifier_label, no_accessibility_msg,
-    perform_paste, should_replace_target, vault_decrypt_fail_msg, wait_for_frontmost,
-    window_switched_msg,
+    color_paste_text, copy_text_to_clipboard, file_paths, file_text_fallback, modifier_label,
+    no_accessibility_msg, perform_paste, should_replace_target, vault_decrypt_fail_msg,
+    wait_for_frontmost, window_switched_msg,
 };
 
 /// 固定返回布尔的 Accessibility mock。
@@ -257,6 +257,23 @@ fn clipboard_written_even_when_not_trusted() {
     );
     assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Text));
     assert!(!*backend.simulated.borrow(), "未授权时不应模拟 ⌘V 按键注入");
+}
+
+#[test]
+fn copy_text_to_clipboard_writes_path_as_plain_text() {
+    let backend = MockBackend::default();
+    let path = "/Users/me/Library/Application Support/clipvault/diagnostics/clipvault.log";
+
+    copy_text_to_clipboard(&backend, path);
+
+    // 必须是**文本**类型：写成 File/Rtf 会让接收方拿到别的东西。
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some(path),
+        "复制的是原样路径文本"
+    );
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Text));
+    assert_eq!(*backend.wrote_payload_len.borrow(), None);
 }
 
 #[test]

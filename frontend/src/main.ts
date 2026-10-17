@@ -38,6 +38,7 @@ import {
   type PasteResult,
   clearLog,
   clearUndecryptable,
+  copyLogPath,
   deleteEntry,
   getGuestMode,
   getPanelOpacity,
@@ -653,6 +654,8 @@ async function refreshLogSection(): Promise<void> {
   const info: LogInfoDto | null = await readLog();
   if (!info) {
     logPathEl.textContent = "(无法读取)";
+    // 读取失败不影响点击复制(命令自己取路径),所以入口提示照留。
+    logPathEl.title = "点击复制日志路径";
     logSizeEl.textContent = "—";
     logTailEl.textContent = "";
     return;
@@ -662,7 +665,7 @@ async function refreshLogSection(): Promise<void> {
     logLevelEl.value = info.level;
   }
   logPathEl.textContent = info.path;
-  logPathEl.title = info.path; // 完整路径 hover 提示
+  logPathEl.title = `${info.path}（点击复制）`;
   // 当前 + .1 一并显示;后者为 0 时省略。
   const sizeText =
     info.backup_size_bytes > 0
@@ -710,6 +713,16 @@ logClearEl.addEventListener("click", () => {
       await refreshLogSection();
     } catch (e) {
       toast(`清空失败：${String(e)}`);
+    }
+  })();
+});
+logPathEl.addEventListener("click", () => {
+  void (async () => {
+    try {
+      await copyLogPath();
+      toast("日志路径已复制");
+    } catch (e) {
+      toast(`复制失败：${String(e)}`);
     }
   })();
 });

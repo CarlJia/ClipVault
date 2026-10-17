@@ -642,6 +642,47 @@ pub async fn clear_log() -> Result<(), String> {
     Ok(())
 }
 
+/// 把日志文件路径写进系统剪贴板(U4 补充:面板里的路径被 `max-width` 截断,只能靠点击拿全)。
+///
+/// 复用**回贴写剪贴板**的同一条平台路径([`crate::pasteback::copy_text_to_clipboard`]),
+/// 不走 WebView 的 `navigator.clipboard`:仓库未装 `tauri-plugin-clipboard-manager`
+/// (grep `Cargo.toml` / `app/Cargo.toml` / `tauri.conf.json` 均无),裸 async
+/// clipboard API 在 WKWebView 下的可用性不可依赖。
+///
+/// 两条**已知边界**,改这里的人需要知道:
+/// - 平台侧写入失败(Windows 剪贴板被别的进程占用、macOS `setStringForType` 返回 false)
+///   只在日志里留痕,`Err` 不会回传 —— 前端 toast 可能报「已复制」而剪贴板没变。
+///   要真正区分,得让 `PasteBackend::write_clipboard` 可失败,属独立改动。
+/// - 写完后 watcher 会把这条路径当成一次新复制入库(剪贴板历史多一条),与用户自己
+///   复制任何内容无异;目前没有自写抑制。
+#[tauri::command]
+pub async fn copy_log_path(window: tauri::WebviewWindow) -> Result<(), String> {
+    let path = crate::log::default_log_path()
+        .to_string_lossy()
+        .into_owned();
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    {
+        use crate::pasteback::RealPasteBackend;
+
+        // 平台调用放 `spawn_blocking`(与 `paste_entry` 同一理由):Windows 侧的写剪贴板
+        // 会在剪贴板被别的进程占用时重试,不该堵住 async 线程。
+        tauri::async_runtime::spawn_blocking(move || {
+            let backend = RealPasteBackend::new(window);
+            crate::pasteback::copy_text_to_clipboard(&backend, &path);
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (&window, &path);
+        Err("当前平台不支持复制到剪贴板".to_string())
+    }
+}
+
 // ----------------------------------------------------------------
 // 「查看日志…」(U5 / R10)
 // ----------------------------------------------------------------

@@ -277,6 +277,13 @@ export async function clearLog(): Promise<void> {
   await invoke("clear_log");
 }
 
+/** 把日志文件路径写进系统剪贴板(走 Rust 侧平台后端,与回贴写剪贴板同一条路径)。
+ *  IPC 失败会抛错(由 UI toast 说明);平台侧写入是否真的成功则回传不了 —— 见
+ *  `commands::copy_log_path` 的「已知边界」。 */
+export async function copyLogPath(): Promise<void> {
+  await invoke("copy_log_path");
+}
+
 /** 读取当前日志级别字符串 ("info" / "verbose")。失败回落 "info"。 */
 export async function getLogLevel(): Promise<string> {
   try {
