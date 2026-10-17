@@ -437,6 +437,19 @@ sequenceDiagram
   - thumb data-URL 失效(空字符串)降级到文件大小文本。
   - 现有 AE1–AE8 在 UI 不退化(文本列表项视觉无变化)。
 - **Verification.** 手动 `cargo tauri dev` 启动,复制图片/文件/RTF/颜色各一次,主面板渲染正确;前端单元测试覆盖列表项 DOM。
+- **后续增量：image 预览栏**（见 [`2026-10-16-1430-feat-side-preview-pane-plan.md`](./2026-10-16-1430-feat-side-preview-pane-plan.md)）。
+  列表里的 64×64 缩略图只是「看得出是张图」,回贴前要确认内容得看原图。本增量在面板右侧
+  长出一栏(`set_panel_mode("expanded")`,960×420),图片由后端缩到长边 ≤ 1600px 再回传,
+  缩略图同时成为这一栏的鼠标入口。相关验收:
+  - AEP1. **选中→预览→翻页同步。** Given 主列表含 ≥2 条 image 条目；When 选中第一条按 Space；
+    Then 面板从 560×420 长到 960×420、右侧栏显示该图；When 按 ↓；Then 栏内换成第二条的图
+    （两次结果不混）。
+  - AEP2. **搜索框有内容时 Space 仍是打空格。** Given 搜索框里有 "foo"；When 按 Space；
+    Then 搜索框变成 "foo "、预览栏不打开；退格清空后再按 Space 才打开。
+  - AEP3. **加密区不可解密。** Given 加密区一条 image 条目且 `is_decryptable=false`；
+    When 触发预览；Then 栏内显示「无法解密」，后端不下发任何图片字节。
+  - AEP4. **关面板路径先收窗口。** Given 预览栏已开；When `Esc` / 失焦 / 回贴；Then 窗口先回到
+    560×420、预览栏随之隐藏。
 
 ### U6. Vault encryption extension + FTS search extension
 

@@ -116,6 +116,12 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   唤出入口收进 `app/src/panel.rs`；设置模态在固定的 560×420 面板内滚动、透明度滑块可达；
   透明度改由 `--panel-alpha` 单一变量驱动（面板背景与设置遮罩同源）。剩余：macOS 真机
   AE1–AE6、Windows 真机 AE1–AE3 与托盘自指场景。
+- **列表旁预览栏**：U1–U6 完成（见 `docs/plans/2026-10-16-1430-feat-side-preview-pane-plan.md`）——
+  选中图片 / 长文本条目按 **Space**（keymap 新动作 `preview`，可重绑）或点行内缩略图，
+  面板从 560×420 长到 960×420、右侧（放不下时左侧）多出预览栏，列表位置不动；图片由
+  后端缩到长边 ≤ 1600px 再 base64 回传（原图不进 WebView），文本给全文，file / rtf / color
+  只给提示。R13 仍为空（零新 crate：`image` / `base64` 早就在树内）。剩余：macOS 真机
+  AE1–AE4 与 Windows 真机复跑；加密区模态内的预览入口列入后续 PR（模态遮住预览栏）。
 - **启动不再重捕既有剪贴板**（`Watcher::new`）：`last_change_count` 改为用构造时的剪贴板
   序列号播种（原来硬编码 `-1`，导致启动首轮必定捕获一次既有剪贴板）。这是「删除能扛过重启」
   的前提 —— 否则删掉的内容只要还在剪贴板里，就会在重启后原样回到历史；加密区条目更糟，
@@ -132,8 +138,18 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   **只有真的让出过才装回** —— 否则面板每次收起都会重注册一次全局热键。撤销必须按 action
   定位，**不能**用 `unregister_all`（Windows 侧它会把消息泵线程 `Quit` 掉，等于永久失联）。
   真机 AE7（按当前全局组合重绑）仍是人工步骤，见 plan 的 Verification Contract。
-- **测试基线**：app 232 passed + core 43 passed（合计 275），1 个 trigram 测试 ignored；
-  本轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
+- **测试基线**：app 260 passed + core 44 passed（合计 304），1 个 trigram 测试 ignored；
+  本轮增量是「列表旁预览栏」（plan U1–U6）：app +29（`app/src/preview_test.rs` 的 19 例 ——
+  缩放算术 3 / 重编码 3 / 明文图片与文本 3 / 加密区 4（vault 文本、vault 图片、
+  `is_decryptable=false` 不下发内容、错 key 走 undecryptable）/ 错误与边界 6；`app/src/panel.rs`
+  的 10 例 —— `panel_size_for` 两档、`PanelMode::parse`、`fitted_size` 窄屏收缩、
+  `expanded_origin` 右侧够 / 翻左侧 / 两侧都不够居中 / 负原点）、core +1
+  （`default_preview_is_space`，并把 `all_actions()` 迁到 15、`default_map_covers_every_action`
+  钉住基数）、前端 +24（`preview.test.ts` 18 例：开关状态机与尺寸 IPC、三种 kind 派发、
+  图片缓存、跟随选中、迟到响应不覆盖、加密区「无法解密」、IPC 失败；`keymap.test.ts` 5 例：
+  `default_preview_is_space` / 空查询命中 / 空格焦点门 / dispatch 到 `togglePreview` /
+  键帽渲染 `Space`；`settings.test.ts` 的 1 例基数迁移到 1 全局 + 14 面板）。
+  上一轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
   （`app/src/keymap.rs` 的 `recording_transition_releases_on_entry_only` —— 进录制必须让出、
   收工才装回、其余空转；`set_recording_tracks_state` —— 标记与动作由同一次 `swap` 给出）、
   前端 +6（`settings.test.ts` 的「录制态让出全局热键」6 例：进录制先让位 / `Esc` 也装回 /
