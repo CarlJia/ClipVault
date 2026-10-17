@@ -51,10 +51,10 @@ const KEY_LABELS: ReadonlyArray<readonly [string, string]> = [
   ["⌘", "Ctrl+"],
   ["⌥", "Alt+"],
   ["⇧", "Shift+"],
-  // macOS 的 Control 与 ⌘ 是两个键；Windows 上 Ctrl 就是主修饰键（录制时记作
-  // `meta`，见 `keymap.ts` 的 `eventMods`）。两条都映射到 `Ctrl+`，同一个组合
-  // 里的 `meta` + `ctrl` 再由 `localizedCombo` 去重 —— 否则 Windows 的键帽会
-  // 冒出 mac 字形 `⌃`（RW9：Windows 不出现 mac 字形）。
+  // macOS 的 Control 与 ⌘ 是两个键；Windows 上 Ctrl 就是主修饰键（录制时只记作
+  // `meta`，见 `keymap.ts` 的 `eventMods`）。两条都映射到 `Ctrl+`：老版本库里存的
+  // `["meta","ctrl"]` 是历史值，加载时已折成 `meta`，这里再兜一层 —— 否则 Windows
+  // 的键帽会冒出 mac 字形 `⌃`（RW9：Windows 不出现 mac 字形）。
   ["⌃", "Ctrl+"],
   ["↩", "Enter"],
   ["⌫", "Backspace"],

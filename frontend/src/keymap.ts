@@ -9,7 +9,7 @@
 // - handleVaultKey(ev)  加密区模态内 keydown（走同一张 keymap，含重绑）
 
 import { invoke } from "@tauri-apps/api/core";
-import { isWindows, keys } from "./platform";
+import { isWindows, keys, whenPlatformReady } from "./platform";
 
 // ---------------------------------------------------------------------------
 // TS 类型 —— 与 clipvault_core::keymap 一一对应
@@ -114,7 +114,12 @@ function eventMods(ev: KeyboardEvent): {
     meta: ev.metaKey || (isWindows() && ev.ctrlKey),
     shift: ev.shiftKey,
     alt: ev.altKey,
-    ctrl: ev.ctrlKey && !ev.metaKey,
+    // Windows 上 Ctrl 已经记作 `meta`（上面那一行），这里必须排除 —— 否则同一次
+    // Ctrl 按压被记两遍：`["meta","ctrl"]` 既让键帽多出一个 macOS 的 `⌃`
+    // （`Ctrl+⌃+E`），又让「不得有多余修饰键」的匹配把线格式里的 meta-only 绑定
+    // （后端默认映射、重置后的全部默认键）整体拒掉。macOS 的 Control 是真·独立
+    // 修饰键，照旧。
+    ctrl: !isWindows() && ev.ctrlKey && !ev.metaKey,
   };
 }
 
@@ -367,6 +372,23 @@ function keyToWire(key: Key): string {
 }
 
 /**
+ * 平台化归一化线格式的 `mods`。
+ *
+ * Windows 上 Ctrl 就是主修饰键，在线格式里写作 `meta`（后端 `mods_to_win32`
+ * 也把 `META` 翻成 `MOD_CONTROL`，见 `app/src/hotkey.rs`）。旧版本录制时把同一次
+ * 按压记成 `meta` + `ctrl` 两份并落了库 —— 这类数据加载时按同一条规则折回去，
+ * 否则用户的绑定会在本次修复后失效。
+ *
+ * `ctrl` 一律折成 `meta` 而不是直接丢掉：丢掉会把 `["ctrl"]` 退化成**裸键**
+ * （绑 `X` 之后在搜索框里打个 x 就触发动作）。macOS 不受影响 —— 那里的 `⌃`
+ * 是独立修饰键。
+ */
+function normalizeMods(mods: Mod[]): Mod[] {
+  if (!isWindows()) return mods;
+  return [...new Set(mods.map((m) => (m === "ctrl" ? "meta" : m)))];
+}
+
+/**
  * 线格式 HotkeyMap → 内部 HotkeyMap。
  *
  * **不要**退回 `JSON.parse(json) as HotkeyMap` 的裸断言：线格式的 `key` 是字符串、
@@ -389,7 +411,7 @@ function keyMapFromWire(wire: WireHotkeyMap): HotkeyMap {
     // 会显示 `—`，用户可以直接重绑一个新的键把它救回来。
     if (!key) continue;
     actions[action as HotkeyAction] = {
-      mods: combo.mods,
+      mods: normalizeMods(combo.mods),
       key,
     };
   }
@@ -405,6 +427,12 @@ function keyMapFromWire(wire: WireHotkeyMap): HotkeyMap {
  * 失败时保留既有值（不静默回落），console.warn。
  */
 export async function loadKeymap(): Promise<void> {
+  // 平台标识必须**先**到位：`keyMapFromWire` 里的 `normalizeMods` 与 `keyFromWire`
+  // 都依赖 `isWindows()`，而 `main.ts` 是先 `loadKeymap()`、后 `initPlatform()` 的
+  // （模块求值阶段就要发出 IPC）。不等的话首轮归一化在 Windows 上会按 macOS 空转，
+  // 旧库里的 `["meta","ctrl"]` 原样留在内存里 —— 而新的 `eventMods` 不再产出 ctrl，
+  // 这些用户在升级后按自己的键就再也不触发（默认键反而正常，现象更隐蔽）。
+  await whenPlatformReady();
   try {
     // get_hotkeys 返回线格式 JSON 字符串，必须过 keyMapFromWire 转成内部表示。
     const json = await invoke<string>("get_hotkeys");
@@ -515,10 +543,10 @@ function keyGlyph(key: Key): string {
  * 键本身也必须原样保留），最后统一用 `+` 拼起来：macOS 的字形不带尾缀，规则
  * 对两个平台同时成立。
  *
- * 拼接前按**平台写法**去重：Windows 上 Ctrl 既是 `meta`（主修饰键）又是 `ctrl`
- * （`eventMods` 两个都置真，录出来的绑定是 `["meta","ctrl"]`），两段都渲染成
- * `Ctrl` —— 不去重就是 `Ctrl+Ctrl+E`。macOS 上 `⌘` 与 `⌃` 是两个不同的键，
- * 标签不同，去重自然不生效。
+ * 拼接前按**平台写法**去重：Windows 上 `ctrl` 与 `meta` 都渲染成 `Ctrl`（前者是
+ * 老版本录制的历史值，加载时已由 `normalizeMods` 折成后者 —— 这里只是渲染侧的
+ * 兜底，防止半个归一化的组合渲染成 `Ctrl+Ctrl+E`）。macOS 上 `⌘` 与 `⌃` 是两个
+ * 不同的键，标签不同，去重自然不生效。
  */
 export function localizedCombo(combo: KeyCombo): string {
   const mods = new Set(combo.mods.map((m) => keys(MOD_GLYPHS[m]).replace(/\+$/, "")));
