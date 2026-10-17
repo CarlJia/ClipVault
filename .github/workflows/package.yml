@@ -3,6 +3,10 @@ name: Package
 # 触发：
 #   - 推 `v*` tag：构建两个平台并把产物挂到对应的 GitHub Release。
 #   - 手动（Actions → Package → Run workflow）：只构建并上传 Artifacts，不发 Release。
+#
+# 四个 job：macos（按架构 matrix，出 DMG）/ windows（出 NSIS）/ windows-verify
+# （Windows 目标的 clippy + test，与 windows 打包并行）/ release（挂资产，仅 tag）。
+# 关键路径在 windows 打包上，所以校验刻意不串进它的步骤里。
 on:
   push:
     tags:
@@ -15,11 +19,14 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # 与本地开发用的 tauri-cli 同一条线（本地 2.11.5）。必须是 `~` 而不是 `^`：
-  # `^2.11` 实际会装到 2.12.x，装出来的 CLI 就不在 tauri crate（`~2.11`）的线上了。
-  # 这里只存版本号本身，`~` 在安装命令处拼、缓存 key 用这个干净值 ——
-  # 两边是同一个来源，不会出现「改了版本没改缓存 key」的漂移。
-  TAURI_CLI_MINOR: '2.11'
+  # **确切**版本，不是浮动的 minor。两个原因：
+  #   1) 必须与 app/Cargo.toml 的 `tauri = "~2.11"` 同一条 major.minor —— `cargo tauri build`
+  #      启动时会交叉校验 Rust crate 与 NPM 包的版本（tauri-cli 的 check_mismatched_packages），
+  #      不一致直接中止；`^2.11` 那种写法会漂到 2.12.x，正是首次 Windows 打包失败的根因。
+  #   2) tauri-cli 走官方**预编译二进制**，下载 URL 里带确切 tag（`tauri-cli-v2.11.5`），
+  #      给不出 minor 级别的 URL。本地开发机装的也是 2.11.5。
+  # 升级时改这一处即可（两边都会跟着走：URL 与回退用的 cargo install）。
+  TAURI_CLI_VERSION: '2.11.5'
 
 jobs:
   macos:
@@ -35,29 +42,25 @@ jobs:
           - arch: x64
             rust-target: x86_64-apple-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # ---- 三块缓存。都用 actions/cache（官方 action），符合 U8「不引入第三方 action」。----
+      # ---- 两块缓存，都用 actions/cache（官方 action），符合 U8「不引入第三方 action」。----
       #
-      # 1) cargo-install 出来的二进制。tauri-cli 拖着 oxc 那一整套解析器依赖，从源码
-      #    编一次要 7~9 分钟 —— 三个 job 各编一遍，是全流程最大的一笔开销。缓存命中后
-      #    这步退化成「什么都不做」。key 带 TAURI_CLI_MINOR，换版本时自动失效重编。
-      - name: 缓存 cargo 安装的二进制（cargo-tauri）
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
-
-      # 2) crates.io 索引 + 已下载/解包的 crate 源码。
+      # ⚠️ 关于命中率：GitHub 的缓存是 **ref 作用域**的 —— 一次运行只能读到「自己这个
+      # ref」或**默认分支**上的缓存。本 workflow 只在 tag 与手动触发时跑，而 main 上
+      # 从来没有攒缓存的 job，所以**发版那次永远是冷的**（实测 v0.6.0 / v0.7.0：
+      # `cargo-bin-` / `cargo-registry-` / `cargo-target-` 三条 restore 全部
+      # "Cache not found"）。留着这两块是为了：同一个分支上重复 workflow_dispatch、
+      # 以及同一个 tag 失败后重跑 —— 那些场景下它们确实命中（实测 x64 打包 5m → 1m50s）。
+      # 「拿掉冷启动」靠的不是缓存，而是下面的预编译 tauri-cli。
+      #
+      # 1) crates.io 索引 + 已下载/解包的 crate 源码。
       #    注意：这个 key 里没有 runner.os，但**并不会**让三个 job 共用一份 ——
       #    hashFiles() 的摘要不止算文件内容（实测同一份 Cargo.lock 在 macOS 与 Windows
       #    runner 上给出两个不同哈希），所以事实上就是各平台一份，加起来 ~323MB，
       #    占额度很小。不把 runner.os 显式写进 key 只是懒得改，行为上没有差别。
       - name: 缓存 crates.io 索引与源码
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -65,12 +68,14 @@ jobs:
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-
 
-      # 3) release 编译产物（主要是依赖的 rlib）。不存在「缓存用错」的可能：cargo 按
+      # 2) release 编译产物（主要是依赖的 rlib）。不存在「缓存用错」的可能：cargo 按
       #    指纹（含 rustc 版本、feature、编译参数）逐条校验，本仓库自己的 crate 改了
       #    只重编它自己和上层，依赖照旧复用。key 带 Cargo.lock 哈希，依赖变动时靠
       #    restore-keys 回退到上一次的缓存，还能捞回没变的那部分。
+      #    （原先还有第 3 块 `~/.cargo/bin` 缓存，用来跳过 `cargo install tauri-cli`
+      #      的源码编译；改用预编译二进制后它彻底没有意义了，已删 —— 见下面的安装步骤。）
       - name: 缓存 release 编译产物
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: target/${{ matrix.rust-target }}/release
           key: cargo-target-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
@@ -88,24 +93,19 @@ jobs:
       - name: 安装 ${{ matrix.rust-target }} 目标
         run: rustup target add ${{ matrix.rust-target }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: 安装 tauri-cli
-        run: |
-          # 缓存命中时 cargo-tauri 已在 PATH 上，直接跳过；否则从源码编（7~9 分钟）。
-          # 判据用「PATH 里有没有 cargo-tauri」而不是 cargo 自己的 "already installed"
-          # 记录：后者读 ~/.cargo/.crates*.json，万一二进制在、记录不在，cargo install
-          # 会以 "binary `cargo-tauri` already exists" 直接失败；也不要去执行
-          # `cargo tauri --version` 探测，那样会留下非零退出码给后续判断添乱。
-          if command -v cargo-tauri >/dev/null 2>&1; then
-            echo "tauri-cli 命中缓存，跳过源码编译"
-          else
-            cargo install tauri-cli --version "~$TAURI_CLI_MINOR" --locked
-          fi
+      # 装 tauri-cli。共享逻辑(下载官方预编译、失败回退 cargo install)抽到
+      # ./.github/actions/install-tauri-cli,两端 job 用同一份 —— 改 URL / 改回退策略
+      # 只动一处。原本内联时各占 ~25 行 bash 或 pwsh,且要分别跟进 shell-specific
+      # 不变量(set -euo pipefail / $LASTEXITCODE / curl.exe vs curl),写到一处更稳。
+      - uses: ./.github/actions/install-tauri-cli
+        with:
+          version: ${{ env.TAURI_CLI_VERSION }}
 
       # 直接复用仓库里的打包脚本，而不是把步骤摊在 workflow 里：本地怎么打，CI 就怎么打，
       # 差别只有传进去的架构参数。
@@ -123,33 +123,27 @@ jobs:
           cp -R target/${{ matrix.rust-target }}/release/bundle/macos/ClipVault.app \
             "staging/ClipVault_${{ matrix.arch }}.app"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ClipVault-macos-${{ matrix.arch }}
           if-no-files-found: error
           path: staging/
 
-  windows:
-    name: Windows（NSIS 安装包）
+  # clippy + test 单独成一个 job，与 windows 打包 job **并行**跑。
+  # 为什么要拆：这两步约 4.5 分钟（v0.7.0 实测 2m20s + 2m07s），原来串在打包 job 里
+  # 直接压在发版的关键路径上；拆开之后关键路径只取决于更慢的那个 job，校验一点没少。
+  # 代价是多占一个 Windows runner（两个 job 各装一次工具链、各建一次 frontend/dist）。
+  windows-verify:
+    name: Windows（clippy / test）
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      # 三块缓存，与 macos job 同理（见那边的注释）。差别只有一处：
-      # **只缓存 release，不缓存 debug** —— clippy/test 在 debug 下产出的 target/debug
-      # 比 release 大得多（本机量级 3~10GB），塞进 10GB 的仓库缓存额度会把其它条目挤掉，
-      # 而它能省的只有那 4 分钟 lint+测试。净收益不划算，故留作每次重编。
-      - name: 缓存 cargo 安装的二进制（cargo-tauri）
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/bin
-            ~/.cargo/.crates.toml
-            ~/.cargo/.crates2.json
-          key: cargo-bin-${{ runner.os }}-tauri-cli-${{ env.TAURI_CLI_MINOR }}
-
+      # 只缓存 crates.io 索引与源码（与 macos job 同理，ref 作用域的说明见那边）。
+      # **刻意不缓存 target/debug**：debug 产物比 release 大得多（本机量级 3~10GB），
+      # 塞进 10GB 的仓库缓存额度会把其它条目挤掉，而它能省的只有下面那 4 分钟。
       - name: 缓存 crates.io 索引与源码
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.cargo/registry
@@ -157,19 +151,12 @@ jobs:
           key: cargo-registry-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-registry-
 
-      - name: 缓存 release 编译产物
-        uses: actions/cache@v4
-        with:
-          path: target/release
-          key: cargo-target-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-target-${{ runner.os }}-release-
-
       - name: 安装 Rust 工具链
         run: |
           rustup toolchain install stable --profile minimal --component clippy
           rustup default stable
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: npm
@@ -182,31 +169,64 @@ jobs:
           npm --prefix frontend ci
           npm --prefix frontend run build
 
-      # 下面两步是这个 workflow 存在的主要理由：本地开发机是 macOS，
+      # 下面两步是本 job 存在的主要理由：本地开发机是 macOS，
       # cfg(target_os = "windows") 的分支在那里**根本不会被编译**，所以 Windows 目标的
-      # 整树编译与 lint 只能在 CI 上验证。
+      # 整树编译与 lint 只能在 CI 上验证（PR 上由 ci.yml 覆盖，tag 上由这里兜底）。
       - name: clippy（Windows 目标）
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: 测试（Windows 目标）
         run: cargo test --workspace
 
-      - name: 安装 tauri-cli
-        run: |
-          # 与 macos job 同理（见那边的注释）：判据是 PATH 里有没有 cargo-tauri，
-          # 不去执行探测命令 —— 免得留下非零的 $LASTEXITCODE 被 GHA 的 pwsh 包装
-          # 当成整步失败。
-          if (Get-Command cargo-tauri -ErrorAction SilentlyContinue) {
-            Write-Host "tauri-cli 命中缓存，跳过源码编译"
-          } else {
-            cargo install tauri-cli --version "~$env:TAURI_CLI_MINOR" --locked
-            if ($LASTEXITCODE -ne 0) { throw "cargo install tauri-cli 失败" }
-          }
+  windows:
+    name: Windows（NSIS 安装包）
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # 两块缓存，与 macos job 同理（见那边的 ref 作用域说明）。差别有两处：
+      # ① 这个 job 不再跑 clippy/test，所以只缓 release、连 clippy 组件都不装；
+      # ② 原先第 3 块 `~/.cargo/bin` 缓存（跳过 cargo install 的源码编译）已删 ——
+      #    改用预编译二进制后它没有意义了，见下面的安装步骤。
+      - name: 缓存 crates.io 索引与源码
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-registry-
+
+      - name: 缓存 release 编译产物
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: target/release
+          key: cargo-target-${{ runner.os }}-release-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-target-${{ runner.os }}-release-
+
+      - name: 安装 Rust 工具链
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # 装 tauri-cli,见 macos job 那里 —— 同一份 composite action。
+      - uses: ./.github/actions/install-tauri-cli
+        with:
+          version: ${{ env.TAURI_CLI_VERSION }}
+
+      # 这里不需要额外的前端步骤：build-windows.ps1 自己跑 `npm ci`，前端构建由
+      # beforeBuildCommand 在 `cargo tauri build` 开头完成（原来那处显式构建是给
+      # clippy/test 用的，已经跟着它们挪到 windows-verify 了）。
       - name: 打包（前端 → tauri build --bundles nsis）
         run: packaging/build-windows.ps1
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: ClipVault-windows-nsis
           if-no-files-found: error
@@ -214,7 +234,9 @@ jobs:
 
   release:
     name: 发布到 GitHub Release
-    needs: [macos, windows]
+    # windows-verify 不是产出方，但它是 tag 上的校验卡口：它红了就不该发版。
+    # 三个上游 job 并行跑，release 等最慢的那个（实测关键路径在 windows 打包上）。
+    needs: [macos, windows, windows-verify]
     # 只有 tag 推送才发版；手动触发时到此为止，产物留在 Artifacts 里。
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -227,7 +249,7 @@ jobs:
       # 既不依赖 git 上下文，也省掉一次 checkout。
       # 独立成一个 job（而不是让各平台/各架构自己往 Release 里塞）：它们并发跑时
       # 各自"没有就创建"会撞车。
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true

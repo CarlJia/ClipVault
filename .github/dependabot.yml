@@ -1,0 +1,21 @@
+# Dependabot —— 仅盯 github-actions 这条线;npm / cargo / Docker 等不在 CI 直接管。
+# `groups.actions` 把同一周的所有动作升级合并为 1 个 PR,避免每周五个 PR 的噪音。
+# 周一 07:07 UTC 触发(错开整点避免与全球其它仓库撞 API burst)。
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      timezone: "UTC"
+      hour: 7
+      minute: 7
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+    groups:
+      actions:
+        patterns:
+          - "*"

@@ -1,0 +1,85 @@
+name: 'Install tauri-cli'
+description: |
+  从 tauri-apps/tauri GitHub Release 下载 cargo-tauri 的官方预编译二进制,
+  失败回退 cargo install。两个平台各一份子 step,inputs.version 必须精确
+  (x.y.z) —— `cargo tauri build` 启动时会交叉校验 Rust crate 与 CLI 版本,
+  错开就直接中止。
+
+inputs:
+  version:
+    description: 'tauri-cli 精确版本,与 app/Cargo.toml 的 tauri 主次版本同一条线'
+    required: true
+
+outputs:
+  installed-version:
+    description: '实际装上的版本(cargo-tauri --version 的首行)'
+    value: ${{ steps.macos.outputs.installed-version || steps.windows.outputs.installed-version }}
+
+runs:
+  using: composite
+  steps:
+    - id: macos
+      if: runner.os == 'macos'
+      shell: bash
+      run: |
+        set -euo pipefail
+        version="${{ inputs.version }}"
+
+        # CLI 的架构跟随 **runner**(不是 matrix 里的构建目标):
+        # x64 job 也在 arm64 runner 上跑,下 x86_64 的 CLI 要走 Rosetta。
+        case "$(uname -m)" in
+          arm64)   cli_target="aarch64-apple-darwin" ;;
+          x86_64)  cli_target="x86_64-apple-darwin" ;;
+          *) echo "错误:未知 runner 架构 $(uname -m)" >&2; exit 1 ;;
+        esac
+
+        bin_dir="${HOME}/.cargo/bin"
+        mkdir -p "${bin_dir}"
+        url="https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v${version}/cargo-tauri-${cli_target}.zip"
+        tmp="$(mktemp -d)"
+
+        # -j:不展开压缩包目录;只取 cargo-tauri 这一个成员(LICENSE/README 不入 ~/.cargo/bin)。
+        if curl -fsSL --retry 3 --retry-delay 2 -o "${tmp}/cli.zip" "${url}" \
+           && unzip -j -o "${tmp}/cli.zip" cargo-tauri -d "${bin_dir}" >/dev/null; then
+          chmod +x "${bin_dir}/cargo-tauri"
+          echo "已从预编译包安装:$(basename "${url}")"
+        else
+          echo "预编译二进制不可用,回退从源码编译(约 8 分钟):${url}" >&2
+          cargo install tauri-cli --version "~${version}" --locked
+        fi
+
+        installed="$(cargo-tauri --version | head -1)"
+        echo "installed-version=${installed}" >> "$GITHUB_OUTPUT"
+        echo "${installed}"
+
+    - id: windows
+      if: runner.os == 'windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $version = "${{ inputs.version }}"
+        $binDir = Join-Path $env:USERPROFILE '.cargo\bin'
+        New-Item -ItemType Directory -Force -Path $binDir | Out-Null
+
+        $url = "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v$version/cargo-tauri-x86_64-pc-windows-msvc.zip"
+        $zip = Join-Path $env:TEMP 'cargo-tauri.zip'
+        $installed = $false
+
+        # 必须带 .exe 后缀:PowerShell 里 `curl` 是 Invoke-WebRequest 的别名,
+        # 语义不同;runner 自带的 curl.exe / tar.exe 失败不抛异常,自己查 $LASTEXITCODE。
+        curl.exe -fsSL --retry 3 --retry-delay 2 -o $zip $url
+        if ($LASTEXITCODE -eq 0) {
+          tar.exe -xf $zip -C $binDir cargo-tauri.exe
+          $installed = ($LASTEXITCODE -eq 0)
+        }
+
+        if (-not $installed) {
+          Write-Warning "预编译二进制不可用,回退从源码编译(约 9 分钟):$url"
+          cargo install tauri-cli --version "~$version" --locked
+          if ($LASTEXITCODE -ne 0) { throw "cargo install tauri-cli 失败" }
+        }
+
+        $installed = cargo-tauri --version
+        if ($LASTEXITCODE -ne 0) { throw "cargo-tauri 不可用" }
+        echo "installed-version=$installed" >> $env:GITHUB_OUTPUT
+        $installed
