@@ -287,7 +287,7 @@ function modsToken(mods: Mod[]): string {
 }
 
 /** 组合键结构相等：mods 集合相同，且键是同一个键（`keyToken` 同一套解释）。 */
-function comboEquals(a: KeyCombo, b: KeyCombo): boolean {
+export function comboEquals(a: KeyCombo, b: KeyCombo): boolean {
   return keyToken(a.key) === keyToken(b.key) && modsToken(a.mods) === modsToken(b.mods);
 }
 
@@ -452,6 +452,21 @@ export async function setHotkey(
   } catch (err) {
     return { ok: false, err: String(err) };
   }
+}
+
+/**
+ * 录制态开关 IPC：让后端在录制期间**让出**全局热键（快捷键 plan KTD9）。
+ *
+ * `active=true` = 用户正在设置里等按键：后端把 `open_panel` 的系统级热键从 OS 摘掉。
+ * 不摘的话，用户按 ⌥⌘V 按的是被 HIToolbox 截走的那一下，WebView 的录制监听器收不到
+ * 任何 keydown —— 那一行就永远停在「请按新键…」（Windows 同理，`RegisterHotKey` 只投
+ * `WM_HOTKEY`）。
+ *
+ * `active=false` = 录制收工：后端按当前 keymap 把热键装回 OS。调用方要保证所有收工路径
+ * 都会走到这里（`settings.ts` 的 `cancelRecording` 是唯一收口），失败会被 toast 出来。
+ */
+export async function setHotkeyRecording(active: boolean): Promise<void> {
+  await invoke("set_hotkey_recording", { active });
 }
 
 // ---------------------------------------------------------------------------

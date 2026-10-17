@@ -122,8 +122,24 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   它的 `content_hash` 是 salted 变体、永远不匹配明文指纹，回来的是一条**明文**普通条目。
   代价：ClipVault 未运行时复制的内容不再于启动后补录。纯规则抽在 `watcher::initial_change_count`
   里（吃 `Option`），跨平台可单测。
-- **测试基线**：app 230 passed + core 43 passed（合计 273），1 个 trigram 测试 ignored；
-  本轮增量是「快捷键冲突 → 弹框 → 强行换绑 + 未绑定」（plan R14 / R15）：core +6
+- **录制态让出全局热键**（plan R16 / AE7 / KTD9）：设置里点「重绑」后、按下新键之前，
+  `set_hotkey_recording(active=true)` 会把 `open_panel` 在 OS 侧的热键摘掉。不摘的话，
+  用户按的正是被系统截走的那一下 —— `RegisterEventHotKey` / `RegisterHotKey` 在按键进入
+  WebView **之前**就吃掉它，录制监听器收不到任何 `keydown`，那一行永远停在「请按新键…」
+  （macOS / Windows 同构）。收工装回有两条路：前端 `cancelRecording`（采到键 / `Esc` /
+  行内取消 / 切行 / 关设置的唯一收口）+ 后端兜底（面板隐藏、页面重载）。状态机在
+  `keymap::recording_transition`（纯函数，`Nothing` / `Release` / `Restore`），
+  **只有真的让出过才装回** —— 否则面板每次收起都会重注册一次全局热键。撤销必须按 action
+  定位，**不能**用 `unregister_all`（Windows 侧它会把消息泵线程 `Quit` 掉，等于永久失联）。
+  真机 AE7（按当前全局组合重绑）仍是人工步骤，见 plan 的 Verification Contract。
+- **测试基线**：app 232 passed + core 43 passed（合计 275），1 个 trigram 测试 ignored；
+  本轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
+  （`app/src/keymap.rs` 的 `recording_transition_releases_on_entry_only` —— 进录制必须让出、
+  收工才装回、其余空转；`set_recording_tracks_state` —— 标记与动作由同一次 `swap` 给出）、
+  前端 +6（`settings.test.ts` 的「录制态让出全局热键」6 例：进录制先让位 / `Esc` 也装回 /
+  改绑到别的组合 / 切行时让位与收工按调用顺序落地 / 没在录制时收工不发 IPC /
+  录到绑不了的键时录制态留着）。
+  上一轮增量是「快捷键冲突 → 弹框 → 强行换绑 + 未绑定」（plan R14 / R15）：core +6
   （`clipvault-core/src/keymap.rs` 的 `unbound_action_roundtrips_as_json_null` /
   `unbound_action_does_not_own_its_old_combo` / `entry_with_null_key_is_still_rejected` /
   `claim_takes_combo_and_unbinds_owner` / `claim_unbinds_every_other_holder_only` /
@@ -153,11 +169,12 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  前端 3 个文件共 63 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
+  前端 3 个文件共 69 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
   `Esc` 逃生口、命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs`
-  源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 22（其中 11 例钉住
+  源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 28（其中 11 例钉住
   「强行换绑」弹框的三条出口与「未绑定」的显示，4 例钉住录制态的收口路径 —— 关掉设置面板、
-  等 keymap 的轮询窗口内重绑、录制成功 / 失败，1 例钉住「1 全局 + 13 面板 = 14」的动作基数
+  等 keymap 的轮询窗口内重绑、录制成功 / 失败，6 例钉住「录制时让出全局热键」的时机与顺序，
+  1 例钉住「1 全局 + 13 面板 = 14」的动作基数
   与分组）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**

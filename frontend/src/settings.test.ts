@@ -251,6 +251,9 @@ let setHotkeyCalls: Array<{
   force: boolean | undefined;
 }>;
 
+/** `set_hotkey_recording` 收到的 `active`（时间序）—— 用来断言「让位 / 装回」的时机与顺序。 */
+let recordingCalls: boolean[];
+
 /** `get_hotkeys` 当前会返回的线格式状态；`set_hotkey` 成功时像后端一样改动它。 */
 let wire: { version: number; actions: Record<string, WireCombo> };
 
@@ -269,6 +272,7 @@ async function freshSettings(
 ): Promise<typeof import("./settings")> {
   vi.resetModules();
   setHotkeyCalls = [];
+  recordingCalls = [];
   wire = options.wire ?? (JSON.parse(JSON.stringify(DEFAULT_WIRE)) as typeof wire);
   const invoke = vi.fn(
     async (
@@ -277,6 +281,7 @@ async function freshSettings(
         action: string;
         combo: { mods: string[]; key: string };
         force?: boolean;
+        active?: boolean;
       },
     ) => {
       switch (cmd) {
@@ -284,6 +289,9 @@ async function freshSettings(
           return { os: "macos" };
         case "get_hotkeys":
           return JSON.stringify(wire);
+        case "set_hotkey_recording":
+          recordingCalls.push(args?.active ?? false);
+          return undefined;
         case "set_hotkey": {
           if (!args) return undefined;
           setHotkeyCalls.push({ action: args.action, combo: args.combo, force: args.force });
@@ -542,6 +550,125 @@ describe("录制失败：后端拒绝这次改绑", () => {
     expect(row.btn.textContent).toBe("重绑");
     expect(dom.keydownListeners()).toHaveLength(0);
     expect(dom.toast.textContent).toBe("重绑失败：unrecognised key '≈'，已回退到原绑定");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 录制态让出全局热键（快捷键 plan KTD9）
+// ---------------------------------------------------------------------------
+//
+// 用户报的 bug：设置里点「唤出主面板」那行的「重绑」，再按 ⌥⌘V，那一行停在
+// 「请按新键…」不动、什么都没发生。原因是 ⌥⌘V 已经作为**系统级**热键注册给了 OS
+// （`RegisterEventHotKey`），HIToolbox 在按键进入 WebView 派发链之前就把它截走 ——
+// 录制监听器收不到任何 keydown（Windows 同理：`RegisterHotKey` 只投 `WM_HOTKEY`，
+// 按键同样进不了 WebView）。
+//
+// 修法：进入录制态先让后端把热键摘掉（`set_hotkey_recording {active:true}`），录制
+// 收工再装回去（`{active:false}`）。「被 OS 吃掉的那一下」在 jsdom 里没法复现，但
+// 「有没有去摘、什么时候摘、收工时有没有装回」是可以钉死的 —— 这组用例就钉这些。
+
+describe("录制态让出全局热键", () => {
+  it("进录制先让位，采到键收工后装回", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "open_panel", "⌘+⌥+V");
+
+    startRecording("open_panel");
+    // 让位是 IPC，进录制态就发出去 —— 不能等用户按键，等就晚了（那一下已经被 OS 吃掉）。
+    await flush();
+    expect(recordingCalls).toEqual([true]);
+
+    // 录的就是「当前正被 OS 占着」的那个组合：修复后这一下必须能到监听器。
+    pressKey(dom, { key: "v", code: "KeyV", metaKey: true, altKey: true });
+    await flush();
+
+    expect(recordingCalls).toEqual([true, false]);
+    expect(row.classList.contains("recording")).toBe(false);
+    expect(row.btn.textContent).toBe("重绑");
+    // 绑定没变（录的就是当前值）→ 显式说一句：让「没改动」和「没收到按键」在界面上分得开，
+    // 这正是这次 bug 最难描述的地方。
+    expect(dom.toast.textContent).toBe("「唤出主面板」已经绑在 ⌘+⌥+V 上，未做改动");
+  });
+
+  it("Esc 取消也装回：不能把全局热键留在缺席状态", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+
+    startRecording("open_panel");
+    await flush();
+    pressKey(dom, { key: "Escape", code: "Escape" });
+    await flush();
+
+    expect(recordingCalls).toEqual([true, false]);
+    expect(dom.keydownListeners()).toHaveLength(0);
+  });
+
+  it("改绑到别的组合：装回，且不吐「未做改动」", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "open_panel", "⌘+⌥+V");
+
+    startRecording("open_panel");
+    await flush();
+    pressKey(dom, { key: "j", code: "KeyJ", metaKey: true, shiftKey: true });
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([
+      { action: "open_panel", combo: { mods: ["meta", "shift"], key: "j" }, force: false },
+    ]);
+    expect(recordingCalls).toEqual([true, false]);
+    expect(row.kbd.textContent).toBe("⌘+⇧+J");
+    expect(dom.toast.textContent).toBe("");
+  });
+
+  it("切到另一行：收工与让位按调用顺序落地，不会反过来", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+
+    startRecording("paste");
+    await flush();
+    startRecording("open_panel"); // 内部先 cancelRecording()（收工），再让位
+
+    await flush();
+    // 顺序反了的话最终会停在「已装回」——用户还在录键，OS 侧却已经把 ⌥⌘V 拿了回去。
+    // （两条 IPC 都是写绝对状态，Tauri 不保证发送顺序 = 执行顺序，所以要串行。）
+    expect(recordingCalls).toEqual([true, false, true]);
+  });
+
+  it("没在录制时收工不发 IPC：打开设置 / 重建行不该凭空多一次往返", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { cancelRecording } = await freshSettings();
+
+    cancelRecording();
+    cancelRecording();
+    await flush();
+
+    expect(recordingCalls).toEqual([]);
+  });
+
+  it("录到绑不了的键：说出「这个键不能用作快捷键」，录制态留着等下一个键", async () => {
+    const dom = makeDom();
+    vi.stubGlobal("document", dom.document);
+    const { startRecording } = await freshSettings();
+    const row = seedRow(dom, "paste", "↩");
+
+    startRecording("paste");
+    await flush();
+    pressKey(dom, { key: "F5", code: "F5" }); // 命名键：`parseKeyCombo` 认不出
+    await flush();
+
+    expect(setHotkeyCalls).toEqual([]);
+    expect(dom.toast.textContent).toBe("这个键不能用作快捷键：F5");
+    // 绑不了的键不该把录制态也一起丢掉：用户还在等，按下一个有效键就行。
+    // 所以全局热键**继续**处于让出状态（下一次收工才装回）。
+    expect(recordingCalls).toEqual([true]);
+    expect(row.classList.contains("recording")).toBe(true);
+    expect(row.kbd.textContent).toBe("请按新键…");
   });
 });
 
@@ -806,7 +933,9 @@ describe("重绑到已被占用的组合：弹框让用户选", () => {
     expect(setHotkeyCalls).toEqual([
       { action: "paste", combo: { mods: [], key: "enter" }, force: false },
     ]);
-    expect(dom.toast.textContent).toBe("");
+    // 不走「强行换绑」，但会走「未做改动」这句话：录到的就是当前绑定，写进去是 no-op，
+    // 无提示时用户看到的完全是「按了没反应」（快捷键 plan KTD9 的反馈）。
+    expect(dom.toast.textContent).toBe("「粘贴选中条目」已经绑在 ↩ 上，未做改动");
     expect(dom.confirmOverlay.classList.contains("hidden")).toBe(true);
   });
 });

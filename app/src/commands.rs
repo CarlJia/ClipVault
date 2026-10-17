@@ -261,7 +261,12 @@ pub fn platform_info() -> PlatformInfo {
 /// 手动 ⌘V（`pasteback::hide_panel_and_restore_focus`）。
 #[tauri::command]
 pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
-    crate::pasteback::hide_panel_and_restore_focus(&window)
+    let result = crate::pasteback::hide_panel_and_restore_focus(&window);
+    // 面板收起 = 录制态结束（快捷键 plan KTD9）：失焦自动收起那条走 `panel::handle_window_event`，
+    // Esc / 前端收起这条走这里 —— 两条都得让全局热键归位，否则「录制中把面板收起来」
+    // 会把 ⌥⌘V 留在缺席状态。
+    crate::keymap::restore_global_hotkey_after_leaving_panel(window.app_handle());
+    result
 }
 
 /// 打开「系统设置 → 隐私与安全性 → 辅助功能」深链(U8 首启引导主按钮)。
@@ -780,6 +785,41 @@ pub async fn set_hotkey(
     }
 
     Ok(())
+}
+
+/// 录制态开关（快捷键 plan KTD9）：设置面板等用户按键期间，让本进程**让出**全局热键。
+///
+/// 为什么必须让（本次 bug 的根因）：`open_panel` 的 ⌥⌘V 是用 `RegisterEventHotKey`
+/// 注册到 OS 的**系统级**热键，HIToolbox 在按键进入前台 App 的派发链之前就把它截走 ——
+/// 「点重绑 → 按 ⌥⌘V」时 WebView 里的录制监听器收不到任何 keydown，那一行永远停在
+/// 「请按新键…」，什么也不会被写（Windows 同理：`RegisterHotKey` 只投 `WM_HOTKEY`，
+/// 按键同样进不了 WebView）。
+///
+/// 让出是**有界**的：本命令 `active=false`、面板隐藏（`panel::handle_window_event` 与
+/// 本文件的 `hide_panel`）都会把热键装回来。装不回去时不静默 —— 返回 `Err` 让前端
+/// toast 出来，用户至少知道 ⌥⌘V 为什么失灵。
+///
+/// 只做「这一次切换真正该做的事」（判断在 `keymap::recording_transition` 里）：启动路径
+/// 那次 `active=false`、以及面板收起时本命令没被调过的情况，都落到 `Nothing` ——
+/// 既是空转，也免得把「组合被别的 App 占着」的注册失败报成「恢复失败」。
+///
+/// 与 `set_hotkey` 的先后：前端在调 `active=false` 之前先 `await setHotkey(...)`，所以
+/// 这里读到的 `state.keymap` 已经是新绑定，装回去的就是用户刚录的那个组合。
+#[tauri::command]
+pub async fn set_hotkey_recording(active: bool, state: State<'_, AppState>) -> Result<(), String> {
+    use crate::keymap::HotkeySync;
+
+    match crate::keymap::set_recording(active) {
+        HotkeySync::Nothing => Ok(()),
+        HotkeySync::Release => {
+            crate::keymap::release_global_hotkey();
+            Ok(())
+        }
+        HotkeySync::Restore => {
+            let map = state.keymap.read().unwrap().clone();
+            crate::keymap::apply_global_hotkey(&state.app, &map).map_err(|e| e.to_string())
+        }
+    }
 }
 
 /// 把全部 14 个热键重置为出厂默认(R4 之外的「恢复原状」入口)。

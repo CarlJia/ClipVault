@@ -9,11 +9,13 @@ import { WARN_SVG, type EntryDto } from "./panel";
 import { isWindows, isLinux, keys, whenPlatformReady } from "./platform";
 import {
   actionOwningCombo,
+  comboEquals,
   currentKeyMap,
   localizedCombo,
   parseKeyCombo,
   reloadKeymap,
   setHotkey,
+  setHotkeyRecording,
   type HotkeyAction,
   type KeyCombo,
 } from "./keymap";
@@ -370,6 +372,43 @@ let recordingAction: HotkeyAction | null = null;
 let recordingCleanup: (() => void) | null = null;
 
 // ---------------------------------------------------------------------------
+// 全局热键的「让位」（快捷键 plan KTD9）
+// ---------------------------------------------------------------------------
+
+/** 让位 / 装回 IPC 的串行队列。 */
+let recordingIpc: Promise<void> = Promise.resolve();
+
+/**
+ * 把「录制态」同步给后端：`true` = 让出全局热键，`false` = 装回。
+ *
+ * 为什么必须串行：两条 IPC 都是「写绝对状态」（后端按收到的值办事），而 Tauri 的异步
+ * 命令不保证按发送顺序执行完 —— 连续切行（先收一行、再开另一行）时若「装回」晚于
+ * 「让出」落地，最终状态就反了：用户还在录键，OS 侧却已经把 ⌥⌘V 装了回去。
+ * 串成一条链后，落地顺序就等于调用顺序。
+ *
+ * 失败不打断录制：让位失败只退回修复前的样子（按全局组合没反应，日志里有 warn），
+ * 装回失败更严重（⌥⌘V 会一直失灵），所以后者必须让用户看见。
+ */
+function setRecordingState(active: boolean): void {
+  recordingIpc = recordingIpc
+    .then(() => setHotkeyRecording(active))
+    .catch((e) => {
+      if (!active) showToast(`全局热键恢复失败：${String(e)}`);
+    });
+}
+
+/**
+ * 页面重新加载时的兜底：把全局热键装回去（调用点在 `main.ts` 的启动路径）。
+ *
+ * 页面一重载，前端这份录制态就凭空消失了（dev 期 HMR 每次改代码都会重载），而后端
+ * 可能还停在「已让出」—— 不补这一刀，⌥⌘V 会失灵到重启 App。幂等：后端按「有没有真的
+ * 让出过」决定动作（`keymap::recording_transition`），没让出过时这条 IPC 是空转。
+ */
+export function restoreGlobalHotkeys(): void {
+  setRecordingState(false);
+}
+
+// ---------------------------------------------------------------------------
 // 「强行换绑」确认弹框
 // ---------------------------------------------------------------------------
 
@@ -528,7 +567,18 @@ export function startRecording(action: HotkeyAction): void {
     ev.stopPropagation();
 
     const combo = parseKeyCombo(ev);
-    if (!combo) return;
+    if (!combo) {
+      // KTD5：解析不出的键要说出来，别静默吞掉（F5 这类命名键、无修饰的 ⌫ 都属于
+      // 这一类）。修复前这里是 `return`，用户按下去只看到「什么都没发生」。
+      showToast(`这个键不能用作快捷键：${ev.code || ev.key}`);
+      return;
+    }
+
+    // 采到的就是当前绑定：写进去是 no-op（后端对同一 `(action, combo)` 直接 Ok），
+    // 行上一个字都不会变 —— 「按了但什么都没发生」正是这次 bug 最难描述的地方，
+    // 所以显式说一句，让「没改动」和「没收到按键」在界面上分得开。
+    const bound = currentKeyMap?.actions[action];
+    const unchanged = bound ? comboEquals(bound, combo) : false;
 
     // 表内冲突：这个组合已经被另一条 action 占着。写进去不会报错（后端只查语法与
     // 全局热键的 OS 注册），但两条 action 同组合时 `matches()` 只会派发给排序靠前的
@@ -564,16 +614,24 @@ export function startRecording(action: HotkeyAction): void {
       cancelRecording();
       if (!result.ok) {
         showToast(`重绑失败：${result.err}，已回退到原绑定`);
+      } else if (unchanged) {
+        showToast(`「${ACTION_LABELS[action]}」已经绑在 ${comboLabel(combo)} 上，未做改动`);
       }
     })();
   };
 
   document.addEventListener("keydown", onKeyDown, { capture: true });
   recordingCleanup = () => document.removeEventListener("keydown", onKeyDown, { capture: true });
+
+  // 让出全局热键：不这么做的话，用户按「当前正被 OS 占着」的组合（默认就是 ⌥⌘V）时
+  // 按键根本到不了上面那个监听器 —— 那一行会永远停在「请按新键…」（快捷键 plan KTD9）。
+  // IPC 是异步的，但本地往返在微秒级，远早于用户抬手按键。
+  setRecordingState(true);
 }
 
 /** 取消当前录制态，清理监听器，恢复 UI（导出以便单测直接驱动，见 startRecording）。 */
 export function cancelRecording(): void {
+  const wasRecording = recordingCleanup !== null || recordingAction !== null;
   if (recordingCleanup) {
     recordingCleanup();
     recordingCleanup = null;
@@ -587,6 +645,10 @@ export function cancelRecording(): void {
     refreshRow(recordingAction);
     recordingAction = null;
   }
+  // 录制收工 → 让后端把全局热键装回 OS（快捷键 plan KTD9）。这里是录制态的**唯一收口**：
+  // 采到键、Esc、行内「取消」、切到别行、关设置、重建行都经过它，所以装回只需要写这
+  // 一处。只有真的收起过录制态才发 IPC —— 打开设置、重建行这类空转路径不该凭空多一次往返。
+  if (wasRecording) setRecordingState(false);
 }
 
 /** 键帽文本。三种状态：有绑定 → 平台化组合键；未绑定（`null`）→「未绑定」；
