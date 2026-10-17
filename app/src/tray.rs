@@ -127,7 +127,7 @@ pub fn build_tray(app: &AppHandle, guest_mode: bool) -> tauri::Result<()> {
     // U5：「查看日志…」—— 在系统文件管理器中显示日志文件(R10)。
     // 不打开主面板,只 reveal;同目录 .1 备份在 Finder/Explorer 中自然可见。
     let logs = MenuItem::with_id(app, "logs", "查看日志…", true, None::<&str>)?;
-    let about = MenuItem::with_id(app, "about", "关于 ClipVault", true, None::<&str>)?;
+    let about = MenuItem::with_id(app, "about", "关于", true, None::<&str>)?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
 
@@ -191,14 +191,18 @@ pub fn set_state(app: &AppHandle, state: TrayState) {
 
 /// 「借主面板画布」的托盘入口 → 需要发给前端的事件名。
 ///
-/// 托盘本身没有 UI，设置与关于只能先唤出面板、再让前端打开对应浮层。
-/// 单独抽出来是为了可单测：这条映射一断，用户点菜单就只剩「面板弹一下」，
-/// 而 Rust 侧其它测试（tooltip 文案）一条都不会红。
+/// 托盘本身没有 UI，加密区 / 设置 / 关于都只能先唤出面板、再让前端打开对应浮层。
+/// 这张表是**唯一**的入口清单：`on_menu_event` 先查它，命中就「唤面板 + 发事件」，
+/// 于是新增一个浮层入口只需在这里加一行，不存在「映射写了、分发忘了接」的形态。
+/// 抽成独立函数也是为了可单测：这条映射一断，用户点菜单就只剩「面板弹一下」，
+/// 而 Rust 侧其它测试（tooltip 文案）一条都不会红 —— 关于与加密区先后栽在这上面。
 fn panel_event_for(id: &str) -> Option<&'static str> {
     match id {
+        // U9：加密区管理浮层（⌘⇧V 的鼠标入口）。
+        "vault" => Some("open-vault"),
+        // U12：设置浮层。
         "settings" => Some("open-settings"),
-        // U13：此前 "about" 跟 "vault" 共用一个臂直接 `show_panel`，
-        // 于是「关于」只剩一次空弹面板 —— 关于浮层永远打不开。
+        // U13：关于浮层。
         "about" => Some("open-about"),
         _ => None,
     }
@@ -206,6 +210,16 @@ fn panel_event_for(id: &str) -> Option<&'static str> {
 
 /// 托盘菜单事件分发。
 fn on_menu_event(app: &AppHandle, event: MenuEvent) {
+    // 浮层入口统一在这里收口：唤出面板 + 发事件。放在 match 之前，是为了让
+    // `panel_event_for` 既是「入口清单」也是「分发行为」—— 否则两处各写一遍，
+    // 加了映射却漏加 match 臂时，点菜单就只剩面板弹一下（且没有测试会红）。
+    if let Some(name) = panel_event_for(event.id().as_ref()) {
+        crate::panel::show_panel(app);
+        // emit 失败不影响窗口已显示；前端 listen 见 §main.ts。
+        let _ = app.emit(name, ());
+        return;
+    }
+
     match event.id().as_ref() {
         "open" => crate::panel::show_panel(app),
         "skip_once" => {
@@ -237,17 +251,6 @@ fn on_menu_event(app: &AppHandle, event: MenuEvent) {
                         ::log::error!(target: "tray", "访客模式持久化失败：{e}");
                     }
                 });
-            }
-        }
-        // 加密区（U9）暂先打开主面板占位。
-        "vault" => crate::panel::show_panel(app),
-        // 设置(U12) / 关于(U13)：托盘没有 UI，唤出主面板后发事件让前端打开
-        // 对应浮层。两件事共用一条路径，差别只在事件名（见 `panel_event_for`）。
-        "settings" | "about" => {
-            crate::panel::show_panel(app);
-            // emit 失败不影响窗口已显示；前端 listen 见 §main.ts。
-            if let Some(name) = panel_event_for(event.id().as_ref()) {
-                let _ = app.emit(name, ());
             }
         }
         // U5：在系统文件管理器中显示日志文件。KTD6 走纯函数 reveal_argv，
@@ -307,14 +310,16 @@ mod tests {
         }
     }
 
-    /// 「设置 / 关于」必须带事件名：只 `show_panel` 等于点了没反应 ——
-    /// 关于面板最初的缺口正是这一条（"about" 与 "vault" 共用占位臂）。
+    /// 每个「借面板画布」的入口都必须带事件名：只 `show_panel` 等于点了没反应。
+    /// 关于与加密区先后栽在这条上 —— 两者原本都并进 `show_panel` 的占位臂，
+    /// 而托盘侧其它测试（tooltip 文案）一条都不会红。
     #[test]
     fn panel_entries_emit_their_layer_event() {
         assert_eq!(panel_event_for("about"), Some("open-about"));
         assert_eq!(panel_event_for("settings"), Some("open-settings"));
-        // 其它入口只打开面板，不该顺手弹浮层。
-        for id in ["open", "vault", "skip_once", "guest", "logs", "quit"] {
+        assert_eq!(panel_event_for("vault"), Some("open-vault"));
+        // 其它入口只打开面板（或压根不唤面板），不该顺手弹浮层。
+        for id in ["open", "skip_once", "guest", "logs", "quit"] {
             assert_eq!(panel_event_for(id), None, "{id} 不该发事件");
         }
     }
