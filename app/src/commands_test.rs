@@ -160,3 +160,43 @@ fn openable_url_is_case_sensitive_today() {
     // 钉住它，免得日后以为是随手写松了。
     assert!(openable_url("HTTPS://example.com").is_err());
 }
+
+// ----------------------------------------------------------------
+// 关于面板（U13）：仓库地址常量 + 外链命令的同一个白名单
+// ----------------------------------------------------------------
+
+use crate::commands::{REPOSITORY_URL, open_external_url, resolve_version};
+
+#[test]
+fn resolve_version_prefers_tauri_conf_and_falls_back_to_crate_version() {
+    // tauri.conf 的 version 是用户能对照的那一个（DMG / NSIS 文件名、Release tag）。
+    assert_eq!(resolve_version(Some("0.8.0")), "0.8.0");
+    // 两侧空白不该被原样渲染进关于面板。
+    assert_eq!(resolve_version(Some(" 0.8.0\n")), "0.8.0");
+    // 缺失 / 空串 / 纯空白都回退 crate 版本，而不是显示一个空键帽似的空白。
+    let crate_version = env!("CARGO_PKG_VERSION");
+    assert_eq!(resolve_version(None), crate_version);
+    assert_eq!(resolve_version(Some("")), crate_version);
+    assert_eq!(resolve_version(Some("   ")), crate_version);
+}
+
+#[test]
+fn repository_url_is_an_https_repo_link() {
+    // 关于面板把这条地址直接渲染给用户，写错 scheme 会让「点开」在系统层失败。
+    assert!(REPOSITORY_URL.starts_with("https://github.com/"));
+    assert!(openable_url(REPOSITORY_URL).is_ok());
+    // 不带 .git 后缀：那是给 git 用的克隆地址，不是给人看的仓库主页。
+    assert!(!REPOSITORY_URL.ends_with(".git"));
+}
+
+#[test]
+fn open_external_url_rejects_dangerous_schemes() {
+    // 与 open_url 共用 openable_url：这条命令的入参来自前端（可被改），
+    // 不能因为「调用方是我们自己的关于面板」就放宽。
+    for raw in ["file:///etc/passwd", "javascript:alert(1)", "example.com"] {
+        assert!(
+            open_external_url(raw.to_string()).is_err(),
+            "{raw} 不该通过白名单"
+        );
+    }
+}

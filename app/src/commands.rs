@@ -255,6 +255,45 @@ pub fn platform_info() -> PlatformInfo {
     }
 }
 
+/// ClipVault 仓库主页。关于面板既展示它，也用它作为「在浏览器打开」的目标。
+///
+/// 写成给人看的 https 主页，而不是 git 的 `git@github.com:…` 克隆地址：
+/// 它会被渲染进界面、也会被交给系统浏览器。
+pub const REPOSITORY_URL: &str = "https://github.com/CarlJia/ClipVault";
+
+/// 「关于 ClipVault」浮层展示的数据（U13）。
+#[derive(Debug, Clone, Serialize)]
+pub struct AppInfo {
+    /// 版本号，与安装包文件名、Release tag 同源（见 [`resolve_version`]）。
+    pub version: String,
+    /// 仓库主页。
+    pub repository: String,
+}
+
+/// 版本号解析：优先 `tauri.conf.json` 的 `version`，缺失时回退 crate 版本。
+///
+/// 为什么不直接 `env!("CARGO_PKG_VERSION")`：用户对照的是 Release 页的 tag 与
+/// 安装包文件名，那两者都由 `tauri.conf.json` 决定（`packaging/build.sh` 也从那里读）。
+/// 两份值在发版时一起改，但只有前者是「用户看到的那个版本」。
+pub(crate) fn resolve_version(config_version: Option<&str>) -> String {
+    match config_version.map(str::trim) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => env!("CARGO_PKG_VERSION").to_string(),
+    }
+}
+
+/// 「关于」面板数据：版本 + 仓库地址。
+///
+/// 版本号由后端给而不是前端写死：前端构建产物里没有版本信息，写死就要在发版时
+/// 同步改第二处（漏改时关于面板显示旧版本，比不显示更糟）。
+#[tauri::command]
+pub fn app_info(app: AppHandle) -> AppInfo {
+    AppInfo {
+        version: resolve_version(app.config().version.as_deref()),
+        repository: REPOSITORY_URL.to_string(),
+    }
+}
+
 /// 关闭（隐藏）主面板。前端 `Esc` 调用。
 ///
 /// Esc 是「我不贴了」：隐藏面板的同时必须把键盘焦点交还唤出面板前的前台 App，
@@ -1000,6 +1039,24 @@ pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
 
     let url = openable_url(&entry.content)?;
 
+    open_in_browser(url)
+}
+
+/// 「关于」面板里点仓库地址：在系统默认浏览器打开一条外链（U13）。
+///
+/// 与 [`open_url`] 的差别只有**入参来源**：那个从库里读条目，这个直接吃前端传入的
+/// 字符串。校验一点不少 —— 同一个 [`openable_url`] 白名单，因为前端参数同样可被改。
+#[tauri::command]
+pub fn open_external_url(url: String) -> Result<(), String> {
+    let url = openable_url(&url)?;
+    open_in_browser(url)
+}
+
+/// 在系统默认浏览器打开一条**已校验**的 URL（macOS `open` / Windows `ShellExecuteW`）。
+///
+/// 只接受已经过 [`openable_url`] 的地址：白名单只有一处，两个入口
+/// （条目 ⌘O 与关于面板的外链）共用它，避免平台移植时某一端悄悄写松。
+fn open_in_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         // `use` 放在分支内部：放在函数顶部的话，Windows 构建会因"未使用的导入"

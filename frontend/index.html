@@ -183,6 +183,33 @@
           </div>
         </div>
 
+        <!-- 关于（U13）。托盘「关于 ClipVault」触发（后端 emit("open-about")）。
+             内容只有三样：产品名、版本号、GitHub 地址 —— 版本由后端 app_info 给，
+             地址点击后在系统浏览器打开。数据落点见 about.ts 的 renderAbout()。 -->
+        <div id="about" class="editor hidden" role="dialog" aria-modal="true" aria-labelledby="about-title">
+          <div class="editor-card about-card">
+            <div class="editor-head">
+              <span class="editor-title" id="about-title">关于 ClipVault</span>
+              <button id="about-close" class="banner-btn">关闭</button>
+            </div>
+            <div class="about-body">
+              <div class="about-name">ClipVault</div>
+              <div class="about-desc">剪贴板历史 · 本地存储 · 默认离线</div>
+              <div class="settings-row">
+                <span class="editor-label">版本</span>
+                <span id="about-version" class="settings-value">—</span>
+              </div>
+              <div class="settings-row">
+                <span class="editor-label">GitHub</span>
+                <button id="about-github" class="about-link" type="button" title="在浏览器打开">—</button>
+              </div>
+            </div>
+            <div class="editor-foot">
+              <span class="editor-hint"><kbd>esc</kbd> 关闭 · 点地址在浏览器打开</span>
+            </div>
+          </div>
+        </div>
+
         <!-- 「强行换绑」确认弹框。录制到一个已被别的 action 占着的组合时弹出：
              确认则把它抢过来（原来占着的那条变成「未绑定」），取消则保持原绑定。
              可嵌套在 #settings 之上（z-index 40），只有这两个出口。 -->
