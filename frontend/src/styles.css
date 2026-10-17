@@ -508,7 +508,9 @@ body {
   white-space: nowrap;
 }
 
-/* Toast */
+/* Toast。z-index 必须盖过所有模态（`.editor` 20 / `#editor` 30）：设置与加密区里
+   的反馈都走 toast（复制日志路径、清空日志、清除不可解密条目），低于模态时会被
+   遮罩的 `backdrop-filter: blur` 糊掉 —— 用户操作完收不到任何反馈。 */
 .toast {
   position: absolute;
   bottom: 44px;
@@ -520,7 +522,7 @@ body {
   padding: 6px 14px;
   border-radius: 8px;
   border: 1px solid var(--border);
-  z-index: 10;
+  z-index: 40;
 }
 .toast.hidden {
   display: none;
