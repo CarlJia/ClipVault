@@ -215,7 +215,8 @@ async function loadPreview(entry: EntryDto): Promise<void> {
     const dto = await invoke<PreviewDto>("get_entry_preview", { id });
     const image = dto.kind === "image" ? dto.data_url : null;
     // 先入缓存再判「还是不是这一条」：迟到的响应也得留下，否则再转回来还要重解码一次。
-    if (image) cacheImage(id, image);
+    // 加密区条目例外：解密结果不留在模块级缓存里，只在栏内显示一次。
+    if (image && !entry.is_vault) cacheImage(id, image);
     if (!isCurrent(id)) return;
     if (image) {
       paint(imageHtml(image), "image");

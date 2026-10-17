@@ -42,9 +42,8 @@ pub struct PreviewImage {
 
 /// 预览栏的数据（与前端 `PreviewDto` 一一对应）。
 ///
-/// 定义在 preview 模块而不是 `commands.rs`：它是这条命令的**返回值契约**，
-/// 与缩放 / 解密逻辑放在一起才不会各改一半。`commands.rs` 用 `pub use` 把它
-/// 带到命令层（与 [`crate::commands::EntryDto`] 并列可见）。
+/// 定义在 preview 模块而不是 `commands.rs`：它是这条命令的**返回值契约**，与缩放 /
+/// 解密逻辑放在一起才不会各改一半。`commands.rs` 用 `use` 把它引进命令层。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PreviewDto {
     /// `"image"` | `"text"` | `"none"`。

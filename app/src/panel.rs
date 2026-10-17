@@ -281,6 +281,14 @@ fn take_restore_origin() -> Option<(f64, f64)> {
     RESTORE_ORIGIN.lock().ok().and_then(|mut slot| slot.take())
 }
 
+/// 是否还留着「上一次展开」的恢复点（不取走）。
+fn has_restore_origin() -> bool {
+    RESTORE_ORIGIN
+        .lock()
+        .map(|slot| slot.is_some())
+        .unwrap_or(false)
+}
+
 /// 逻辑尺寸 → `set_size`（Tauri 内部按窗口 `scale_factor` 换算成物理像素）。
 ///
 /// 两个平台适配层共用同一份：它不含平台语义，失败也只在日志里留痕。其余平台走
@@ -312,6 +320,18 @@ pub fn set_mode(window: &tauri::WebviewWindow, mode: PanelMode) {
             ::log::warn!(target: "panel", "set_panel_mode({mode:?}) 失败：{e}");
         }
     }
+}
+
+/// 关面板之前把窗口收回 normal（R12）。
+///
+/// 只有「上一次展开留下了恢复点」时才动窗口 —— 常规隐藏（面板本来就是 normal）多做
+/// 一次 `set_size` 只是让每次收起都慢一拍。Esc / 失焦自动收起都先走这里；回贴路径
+/// 由前端 `await closePreview()` 提前收过，走到这里时已经没有恢复点。
+pub fn restore_normal(window: &tauri::WebviewWindow) {
+    if !has_restore_origin() {
+        return;
+    }
+    set_mode(window, PanelMode::Normal);
 }
 
 /// 失焦时是否应当自动收起面板。抽成纯判定便于单测。
@@ -346,6 +366,11 @@ pub fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
     };
     if !should_auto_hide(visible, focused) {
         return;
+    }
+    // 预览栏开着时先把窗口收回 560×420，再隐藏（R12）：否则下一次唤出会带着 960 的
+    // 尺寸出现，而 `place()` 是按 normal 算的位置。
+    if let Some(panel) = window.app_handle().get_webview_window(PANEL_LABEL) {
+        restore_normal(&panel);
     }
     if let Err(e) = window.hide() {
         ::log::warn!(target: "panel", "面板失焦自动收起失败：{e}");
@@ -569,14 +594,20 @@ mod imp_macos {
             }
             PanelMode::Expanded => {
                 let frame = ns.frame();
-                super::remember_restore_origin((frame.origin.x, frame.origin.y));
+                // 存**左上角点**：`setFrameTopLeftPoint` 收回时吃的就是这个点，而
+                // `frame.origin` 是左下角，原样存回会让面板每次开合下沉一个窗口高。
+                super::remember_restore_origin((
+                    frame.origin.x,
+                    frame.origin.y + frame.size.height,
+                ));
                 let cur = Point {
                     x: frame.origin.x,
                     y: work.y + work.h - (frame.origin.y + frame.size.height),
                 };
                 let origin = expanded_origin(cur, work, size, panel_size_for(PanelMode::Normal));
-                let (x, y) =
-                    appkit_frame_origin((origin.x - work.x, origin.y - work.y), work, size);
+                // `expanded_origin` 的 y 已经是「距工作区顶边」的偏移（`cur.y` 就是这么算的），
+                // 与 `centered_offset` 同一种量，不能再减一次 `work.y`。
+                let (x, y) = appkit_frame_origin((origin.x - work.x, origin.y), work, size);
                 ns.setFrameTopLeftPoint(NSPoint::new(x, y));
             }
         }

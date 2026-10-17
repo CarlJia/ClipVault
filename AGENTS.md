@@ -138,17 +138,18 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   **只有真的让出过才装回** —— 否则面板每次收起都会重注册一次全局热键。撤销必须按 action
   定位，**不能**用 `unregister_all`（Windows 侧它会把消息泵线程 `Quit` 掉，等于永久失联）。
   真机 AE7（按当前全局组合重绑）仍是人工步骤，见 plan 的 Verification Contract。
-- **测试基线**：app 260 passed + core 44 passed（合计 304），1 个 trigram 测试 ignored；
-  本轮增量是「列表旁预览栏」（plan U1–U6）：app +29（`app/src/preview_test.rs` 的 19 例 ——
+- **测试基线**：app 261 passed + core 44 passed（合计 305），1 个 trigram 测试 ignored。
+  其中 1 例来自同期合入 main 的 `app/src/pasteback_test.rs` 增量，与本轮预览栏无关。
+  本轮增量是「列表旁预览栏」（plan U1–U6）：app +28（`app/src/preview_test.rs` 的 19 例 ——
   缩放算术 3 / 重编码 3 / 明文图片与文本 3 / 加密区 4（vault 文本、vault 图片、
   `is_decryptable=false` 不下发内容、错 key 走 undecryptable）/ 错误与边界 6；`app/src/panel.rs`
-  的 10 例 —— `panel_size_for` 两档、`PanelMode::parse`、`fitted_size` 窄屏收缩、
+  的 9 例 —— `panel_size_for` 两档、`PanelMode::parse`、`fitted_size` 窄屏收缩、
   `expanded_origin` 右侧够 / 翻左侧 / 两侧都不够居中 / 负原点）、core +1
   （`default_preview_is_space`，并把 `all_actions()` 迁到 15、`default_map_covers_every_action`
-  钉住基数）、前端 +24（`preview.test.ts` 18 例：开关状态机与尺寸 IPC、三种 kind 派发、
+  钉住基数）、前端 +23（`preview.test.ts` 18 例：开关状态机与尺寸 IPC、三种 kind 派发、
   图片缓存、跟随选中、迟到响应不覆盖、加密区「无法解密」、IPC 失败；`keymap.test.ts` 5 例：
   `default_preview_is_space` / 空查询命中 / 空格焦点门 / dispatch 到 `togglePreview` /
-  键帽渲染 `Space`；`settings.test.ts` 的 1 例基数迁移到 1 全局 + 14 面板）。
+  键帽渲染 `Space`；`settings.test.ts` 不新增用例，只把两处基数断言从 13/14 改成 14/15）。
   上一轮增量是「重绑时按当前全局组合没反应」的修复（plan R16 / AE7 / KTD9）：app +2
   （`app/src/keymap.rs` 的 `recording_transition_releases_on_entry_only` —— 进录制必须让出、
   收工才装回、其余空转；`set_recording_tracks_state` —— 标记与动作由同一次 `swap` 给出）、
@@ -185,13 +186,14 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   （1 个纯函数测试）与 `app/src/watcher_test.rs`（2 条：重复指纹文案的格式契约 +
   库层 `content_hash` 去重被吞掉）。Windows-only 的 `win_pump_tests` /
   `single_instance::win_tests` 只在 CI 的 `windows` job 与真机上跑，不计入本机基线。
-  前端 3 个文件共 69 例 + 1 todo（`keymap.test.ts` 34 + 1 todo（含加密区模态的重绑传导与
+  前端 4 个文件共 92 例 + 1 todo（`keymap.test.ts` 39 + 1 todo（含加密区模态的重绑传导与
   `Esc` 逃生口、命名键 token 的**跨语言对照** —— 用例直接读 `clipvault-core/src/keymap.rs`
   源码，经 Vite 的 `?raw`，不给前端引 `@types/node`）、`settings.test.ts` 28（其中 11 例钉住
   「强行换绑」弹框的三条出口与「未绑定」的显示，4 例钉住录制态的收口路径 —— 关掉设置面板、
   等 keymap 的轮询窗口内重绑、录制成功 / 失败，6 例钉住「录制时让出全局热键」的时机与顺序，
-  1 例钉住「1 全局 + 13 面板 = 14」的动作基数
-  与分组）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
+  1 例钉住「1 全局 + 14 面板 = 15」的动作基数
+  与分组）、`preview.test.ts` 18（预览栏开关状态机与尺寸 IPC、kind 派发、图片缓存、
+  跟随选中、迟到响应、加密区「无法解密」）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查

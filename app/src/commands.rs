@@ -262,6 +262,9 @@ pub fn platform_info() -> PlatformInfo {
 /// 手动 ⌘V（`pasteback::hide_panel_and_restore_focus`）。
 #[tauri::command]
 pub fn hide_panel(window: tauri::WebviewWindow) -> Result<(), String> {
+    // 预览栏开着就先收回 560×420 再隐藏（R12）：否则窗口以 960 宽留在隐藏态，
+    // 下一次唤出会与按 normal 算出来的落位对不上。
+    crate::panel::restore_normal(&window);
     let result = crate::pasteback::hide_panel_and_restore_focus(&window);
     // 面板收起 = 录制态结束（快捷键 plan KTD9）：失焦自动收起那条走 `panel::handle_window_event`，
     // Esc / 前端收起这条走这里 —— 两条都得让全局热键归位，否则「录制中把面板收起来」

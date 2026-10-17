@@ -316,8 +316,8 @@ async function load(preferId?: number): Promise<void> {
       }
       paintEntries();
       scrollToSelected();
-      syncPreview();
     }
+    syncPreview();
   } catch (e) {
     // 取消的请求不报错。
     if (myAbort.signal.aborted) return;
@@ -885,8 +885,8 @@ document.addEventListener("keydown", (ev) => {
     ev.preventDefault();
     // 键盘自动重复：按住 ⌘⌫ 会源源不断地送 keydown，而删除每次都要重拉整表、
     // 「顶上来的下一条」在按下期间就换了人 —— 一次长按会把后面的条目连着删掉。
-    // 只吞删除这一类（↑↓ 的自动重复是想要的连读行为）。
-    if (ev.repeat && action === "delete_entry") return;
+    // Space 同理：按住不放会让预览栏按输入重复率反复开合。↑↓ 的自动重复是想要的。
+    if (ev.repeat && (action === "delete_entry" || action === "preview")) return;
     dispatchHotkeyAction(action);
     return;
   }
