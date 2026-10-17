@@ -148,8 +148,9 @@ const aboutCloseEl = document.querySelector<HTMLButtonElement>("#about-close")!;
 const aboutVersionEl = document.querySelector<HTMLSpanElement>("#about-version")!;
 const aboutGithubEl = document.querySelector<HTMLButtonElement>("#about-github")!;
 
-// 最近一次渲染进关于面板的仓库地址。点「在浏览器打开」用的是它，而不是另一份
-// 写死的常量 —— 显示与打开必须是同一个地址。
+// 最近一次渲染进关于面板的仓库地址：后端 `app_info` 返回的 `repository` 可能与
+// TS 端的 `REPOSITORY_URL` 常量不同（地址不是常量，但默认一样），「在浏览器打开」
+// 必须用这个值，保证显示与打开一致。
 let aboutRepository: string = REPOSITORY_URL;
 
 const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
@@ -371,7 +372,7 @@ async function activateIndex(idx: number): Promise<void> {
   await pasteEntry(entries[idx]);
 }
 
-/** 回贴前收起所有浮层（加密区模态 / 备注编辑器）。
+/** 回贴前统一收起三个浮层：加密区模态、备注编辑器、预览栏。
  *
  *  回贴是「面板的一次性动作」：无论成功（后端直接隐藏面板）还是降级
  *  （内容已在剪贴板），用户都不会再回到模态里，留着它只会挡住下一次唤出，
@@ -729,8 +730,7 @@ function closeSettings(): void {
   // 之后照样会吞掉用户在主列表里敲下的第一个字符，并把它静默写成那个 action 的新绑定。
   // （`settings.ts` 的录制监听器里另有一道同义兜底，防别的路径隐藏模态。）
   cancelRecording();
-  settingsEl.classList.add("hidden");
-  searchEl.focus();
+  hideOverlay(settingsEl);
 }
 
 /**
@@ -756,9 +756,14 @@ async function openAbout(): Promise<void> {
   searchEl.focus();
 }
 
-function closeAbout(): void {
-  aboutEl.classList.add("hidden");
+/** 通用「隐藏浮层 + 把焦点交还搜索框」路径：closeAbout / closeSettings 复用。 */
+function hideOverlay(el: HTMLElement): void {
+  el.classList.add("hidden");
   searchEl.focus();
+}
+
+function closeAbout(): void {
+  hideOverlay(aboutEl);
 }
 
 settingsCloseEl.addEventListener("click", closeSettings);
@@ -942,7 +947,6 @@ document.addEventListener("keydown", (ev) => {
     }
     return;
   }
-  // 数据驱动匹配
   const action = matches(ev);
   if (action) {
     // 焦点门：搜索框常焦，而单行输入里 ⌘⌫ 是「删到行首」。文本框**有内容**时让位给
