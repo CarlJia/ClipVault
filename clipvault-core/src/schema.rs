@@ -10,6 +10,12 @@
 //!   by `entry_id` (`WHERE entry_id = ?` / `IN (SELECT id …)`) and the
 //!   `tags_fts_*` triggers read tags the same way, so without this index each
 //!   deleted entry full-scans `tags`.
+//! - V5 (性能优化 W1): adds 4 indexes covering hot paths
+//!   (`Storage::list_recent` / `tag_counts` / `category_counts` /
+//!   `verify_decryptable_on_startup` / `clear_undecryptable`) and gates
+//!   `entries_fts_update` with a `WHEN OLD.is_vault = 0 OR NEW.is_vault = 0`
+//!   so non-vault↔vault transitions no longer empty-delete / re-insert the
+//!   FTS row when nothing has actually changed for FTS.
 
 use rusqlite::{Connection, Result};
 
@@ -72,8 +78,15 @@ END;
 -- Sync trigger: UPDATE on entries (handle is_vault transitions and kind changes)
 -- U6: same kind-aware content extraction as the INSERT trigger so that
 -- kind transitions (e.g. file -> vault -> file) correctly re-index.
+-- V5 (性能优化): 加 `WHEN OLD.is_vault = 0 OR NEW.is_vault = 0` —— vault
+-- 条目本不在 FTS 里 (`entries_fts_insert` 的 WHEN 已短路), 纯 vault 内的
+-- UPDATE (pin 切换 / `verify_decryptable_on_startup` 翻 is_decryptable /
+-- `set_vault_flag` 推进 pending / `encrypt_into_vault` 写密文) 走到这里
+-- 会做一次空 DELETE 加一次空 INSERT, 既浪费又让 N 条 vault UPDATE 串成
+-- O(N) FTS 维护. vault↔plain 跨边界仍正确重索引 (任一端是明文就要重做).
 CREATE TRIGGER IF NOT EXISTS entries_fts_update
 AFTER UPDATE ON entries
+WHEN OLD.is_vault = 0 OR NEW.is_vault = 0
 BEGIN
     DELETE FROM entries_fts WHERE rowid = OLD.id;
     INSERT INTO entries_fts(rowid, content, note, tags_text)
@@ -173,12 +186,36 @@ pub const MIGRATION_V4: &str = r#"
 CREATE INDEX IF NOT EXISTS idx_tags_entry_id ON tags(entry_id);
 "#;
 
+/// DDL for schema version 5 (性能优化 W1).
+///
+/// 加 4 个索引覆盖热路径（KTD4）：
+/// - `idx_tags_tag` —— 「标签」tab / `Storage::tag_counts` 的 `GROUP BY tag` /
+///   `is_fts_hostile` 兜底里的 `tags.tag LIKE ?` 都靠它。
+/// - `idx_entries_auto_category` —— 「类别」tab / `Storage::category_counts`
+///   / `get_by_category` 的 `WHERE auto_category = ?`。
+/// - `idx_entries_vault_decryptable` —— `verify_decryptable_on_startup` 的
+///   `WHERE is_vault = 1` + `clear_undecryptable` 的子查询
+///   `is_vault = 1 AND is_decryptable = 0`。
+/// - `idx_entries_vault_created_at` —— `list_recent` 的
+///   `ORDER BY ... is_pinned DESC, ... pinned_at DESC, created_at DESC`
+///   配合 `WHERE is_vault = 0` 走 partial index 取消 sort。
+///
+/// 全部 `IF NOT EXISTS`, 老库升级与全新库同形; 与既有 V2/V3/V4 风格对齐:
+/// 一次 `execute_batch` + 一次 `PRAGMA user_version = 5`。
+pub const MIGRATION_V5: &str = r#"
+CREATE INDEX IF NOT EXISTS idx_tags_tag ON tags(tag);
+CREATE INDEX IF NOT EXISTS idx_entries_auto_category ON entries(auto_category);
+CREATE INDEX IF NOT EXISTS idx_entries_vault_decryptable ON entries(is_vault, is_decryptable);
+CREATE INDEX IF NOT EXISTS idx_entries_vault_created_at ON entries(is_vault, created_at DESC);
+"#;
+
 /// Run all schema migrations, bringing the database from whatever
 /// `user_version` it currently has up to date.
 ///
 /// Handles 0 → 1 (V1 base schema), 1 → 2 (add `nonce`), 2 → 3 (add
-/// content_kind / mime_type / payload / payload_nonce / metadata_json), and
-/// 3 → 4 (index `tags.entry_id`).
+/// content_kind / mime_type / payload / payload_nonce / metadata_json),
+/// 3 → 4 (index `tags.entry_id`), and 4 → 5 (4 hot-path indexes +
+/// `entries_fts_update` WHEN gate, in `SCHEMA_V1`).
 pub fn run_migrations(conn: &Connection) -> Result<()> {
     let mut user_version: i32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
 
@@ -211,6 +248,14 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
         tx.execute_batch(MIGRATION_V4)?;
         tx.execute("PRAGMA user_version = 4", [])?;
         tx.commit()?;
+        user_version = 4;
+    }
+
+    if user_version == 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(MIGRATION_V5)?;
+        tx.execute("PRAGMA user_version = 5", [])?;
+        tx.commit()?;
     }
 
     Ok(())
@@ -231,7 +276,7 @@ mod tests {
     use rusqlite::OpenFlags;
 
     /// 当前最新 schema 版本。加迁移时改这里一处，其余断言跟着走。
-    const LATEST_VERSION: i32 = 4;
+    const LATEST_VERSION: i32 = 5;
 
     fn in_memory_rw() -> Connection {
         Connection::open_in_memory_with_flags(
@@ -398,6 +443,64 @@ mod tests {
         // 幂等：再跑一次不报错（`IF NOT EXISTS`）。
         run_migrations(&old).unwrap();
         assert_eq!(index_count(&old), 1);
+    }
+
+    /// V5 的 4 个索引必须真的建出来：覆盖 `list_recent` /
+    /// `category_counts` / `tag_counts` / `verify_decryptable_on_startup` /
+    /// `clear_undecryptable`。若漏建，搜索/启动的热路径会回到全表扫。
+    #[test]
+    fn migration_v5_creates_hot_path_indexes() {
+        let index_names = [
+            "idx_tags_tag",
+            "idx_entries_auto_category",
+            "idx_entries_vault_decryptable",
+            "idx_entries_vault_created_at",
+        ];
+        let has_index = |conn: &Connection, name: &str| -> bool {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?1",
+                [name],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+                != 0
+        };
+
+        // 全新库：一次迁移到底就带上全部 4 个索引。
+        let fresh = in_memory_rw();
+        run_migrations(&fresh).unwrap();
+        for name in &index_names {
+            assert!(
+                has_index(&fresh, name),
+                "全新库应建出 {name}（V5 索引覆盖 list_recent / category_counts / tag_counts / verify_decryptable）"
+            );
+        }
+
+        // 老库升级（V4 → V5 这一段单独跑）：不是只有全新库才建索引。
+        let old = Connection::open_in_memory().unwrap();
+        old.execute_batch(SCHEMA_V1).unwrap();
+        old.execute_batch(MIGRATION_V2).unwrap();
+        old.execute_batch(MIGRATION_V3).unwrap();
+        old.execute_batch(MIGRATION_V4).unwrap();
+        old.execute("PRAGMA user_version = 4", []).unwrap();
+        for name in &index_names {
+            assert!(!has_index(&old, name), "V4 库在建索引前不该有 {name}");
+        }
+
+        run_migrations(&old).unwrap();
+        let uv: i32 = old
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(uv, LATEST_VERSION);
+        for name in &index_names {
+            assert!(has_index(&old, name), "V4 库升级到 V5 也要补上 {name}");
+        }
+
+        // 幂等：再跑一次不报错（`IF NOT EXISTS`），且不会重复建索引。
+        run_migrations(&old).unwrap();
+        for name in &index_names {
+            assert!(has_index(&old, name));
+        }
     }
 
     /// Helper: does `table` have a column named `col`?

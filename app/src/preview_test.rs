@@ -400,3 +400,83 @@ fn test_db_is_in_memory() {
         .expect_err("空库不该有 id=1");
     assert!(err.contains("不存在"), "实际错误：{err}");
 }
+
+// ---------------------------------------------------------------------------
+// 进程级预览缓存（W7 / R28）
+// ---------------------------------------------------------------------------
+//
+// 缓存按 `content_hash` 索引、只装非 vault 条目。下面两条分别钉住这两半：
+// 命中确实生效，以及 vault 条目**不**被缓存（否则换错 key 时会回放旧结果）。
+
+/// W7 / R28：同一张图第二次预览必须命中缓存。
+///
+/// 证明方式：第一次预览之后把库里的 `payload` 清掉 —— 若第二次仍然成功返回，
+/// 说明它没有再去 decode（重新 decode 一定会失败）。
+#[tokio::test]
+async fn preview_is_served_from_cache_after_payload_is_cleared() {
+    crate::preview::clear_preview_cache_for_tests();
+    let db = open_test_db();
+    let cipher = mock_cipher();
+    let id = db
+        .insert_entry_binary(
+            "cache-key-w7",
+            "image",
+            Some("image/png"),
+            &png_of(20, 10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let first = get_entry_preview_inner(&db, id, &cipher).await.unwrap();
+    assert_eq!(first.kind, "image");
+    assert!(first.data_url.is_some());
+
+    // 清掉 payload：重新 decode 必然失败。
+    db.with_conn(move |conn| {
+        conn.execute("UPDATE entries SET payload = NULL WHERE id = ?1", [id])?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let second = get_entry_preview_inner(&db, id, &cipher).await.unwrap();
+    assert_eq!(
+        second, first,
+        "payload 已清空却能返回同一结果 —— 第二次走的是缓存"
+    );
+}
+
+/// W7 / R28：vault 条目**不**进缓存。它的载荷是解密结果，而 `is_decryptable`
+/// 可能在运行期变化（Keychain 恢复 / 换机器）；缓存住「上一次解得开」的图会让
+/// 换错 key 时仍回放旧结果，UI 与实际可解密状态错位。
+#[tokio::test]
+async fn vault_image_preview_is_not_cached() {
+    crate::preview::clear_preview_cache_for_tests();
+    let db = open_test_db();
+    let cipher = mock_cipher();
+    let id = db
+        .insert_entry_binary(
+            "vault-cache-w7",
+            "image",
+            Some("image/png"),
+            &png_of(20, 10),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    db.move_to_vault(id, &cipher).await.unwrap();
+
+    let first = get_entry_preview_inner(&db, id, &cipher).await.unwrap();
+    assert_eq!(first.kind, "image", "正确 key 下应能解出预览");
+
+    // 换错 key 再预览：必须如实报「无法解密」，而不是回放上一次的结果。
+    let wrong = wrong_key_cipher();
+    let second = get_entry_preview_inner(&db, id, &wrong).await.unwrap();
+    assert!(
+        second.undecryptable,
+        "vault 条目不得命中缓存：换错 key 必须报「无法解密」，而不是回放旧结果"
+    );
+}

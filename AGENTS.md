@@ -141,6 +141,51 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   **只有真的让出过才装回** —— 否则面板每次收起都会重注册一次全局热键。撤销必须按 action
   定位，**不能**用 `unregister_all`（Windows 侧它会把消息泵线程 `Quit` 掉，等于永久失联）。
   真机 AE7（按当前全局组合重绑）仍是人工步骤，见 plan 的 Verification Contract。
+- **性能优化（W1–W7）**：一轮只读审计（4 个 Explore agent 分头扫存储 / 搜索、采集 / 图像、
+  前端、平台代码）定位的 30 条可改进项，按「收益 × 风险」分 7 个 wave 落地。
+  **W1 SQL**：`MIGRATION_V5` 加 4 个索引（`tags(tag)` / `entries(auto_category)` /
+  `entries(is_vault, is_decryptable)` / `entries(is_vault, created_at DESC)`）；
+  `Storage::open` 加 WAL + `synchronous=NORMAL` + `busy_timeout`；`entries_fts_update` 补
+  `WHEN OLD.is_vault = 0 OR NEW.is_vault = 0`（纯 vault 内 UPDATE 不再空写 FTS）；新增
+  `ENTRY_LIST_COLS`，列表查询不再把 `payload` / `payload_nonce` BLOB 拉进内存（30 条 × 2 MB
+  的 alloc 归零）；`update_note_and_tags` 走 `json_each` 多行 INSERT；`is_fts_hostile`
+  收窄到真 FTS5 元字符（搜 URL / 路径 / `client-acme` 从 LIKE 全表扫回到倒排）；
+  `insert_captured_with_metadata` 改成吃调用方传进来的指纹，不再对同一份 payload 算两遍
+  SHA-256。
+  **W2 并发**：watcher 的 `make_thumbnail` 与 `capture::poll_first_non_empty` 整段进
+  `tauri::async_runtime::spawn_blocking`（图像解码期间 executor worker 仍能接 IPC）。
+  `last_change_count` 随之改 `Arc<AtomicI64>`，让 blocking 闭包 move 一份进去完成 swap ——
+  `NSPasteboard` 是 `!Send`，读 + 探测必须整段关在闭包里。
+  **W3 启动**：`Storage::get_settings_batch` 把 setup 钩子里 4 次独立 `block_on` 合成一次
+  `SELECT … WHERE key IN (…)`；`crypto::with_keychain_timeout`（同步 `data_key` 的 2 秒预算，
+  超时不写 cache）+ `crypto::preload_spawn`（启动期后台预热数据密钥）；`log::read_tail` 改成
+  从末尾倒读 —— 多读 1 字节是为了让 `tail_lines` 能分辨「读到 cap」与「文件本来就这么长」，
+  从而正确丢掉被截断的首行半段。
+  **W4 读路径**：`search_entries_with_tags` / `list_recent_with_tags` 用 `LEFT JOIN tags` +
+  `GROUP_CONCAT(t.tag, CHAR(31))` 一次带回标签（分隔符用 ASCII US 而非逗号，含逗号的标签
+  不会被拆开），命令层原本的二次 `with_conn` 消失；`open_url` 改 async、去掉 `block_on`。
+  **W5 前端样式与节流**：`.progress` 改 `transform: scaleX()`（不再每帧触发布局）；
+  `scrollToSelected` 走 `requestAnimationFrame` 合帧；`.editor-card` 去掉大范围 `box-shadow`
+  （**保留** `.editor` 的 `backdrop-filter` —— 那是刻意留的，理由在 `styles.css` `.panel`
+  那段注释里）；`.preview-image` 写后端给的固有尺寸消除 CLS；`escapeHtml` 改单遍
+  `replace` + 映射表；`cancelAccessibilityRecheck` 在关设置时清掉 15 秒复检定时器；
+  `panel.ts` 的缩略图与 `preview.ts` 的 data URL 不再过 `escapeHtml`（base64 字母表天然安全）。
+  **W6 前端结构**：`renderEntryRow` 从 `renderEntries` 抽出，`editNote` 保存后只替换那**一行**
+  的 `outerHTML`（列表用事件委托，换行节点不丢事件；换完重取 `selectedEl`）。
+  **W7 后端**：`preview.rs` 加进程级 FIFO 预览缓存，按 **`content_hash`** 索引（内容变了
+  自然不命中、不需要失效逻辑；**vault 条目 bypass** —— 其可解密状态会变，缓存会让换错 key
+  时回放旧结果）；`commands::copy_log_path` 写剪贴板**前**把内容指纹登记到
+  `AppState::self_writes`，`Watcher::process` 第 3.5 步 `take()` 一次比对并跳过（不论匹配
+  与否都消费，且放在去重之前，自写内容不进 `last_hash`）。
+  **未做，各有实测理由**：`Storage` 拆 reader / writer 双连接（W2 的 R10，KTD8 已推迟）；
+  透明度 slider 前端 debounce（R15 —— 前端本来就把 `input`（只改 CSS）与 `change`（拖拽释放
+  才写库）分开绑定，每次拖拽只 1 次 SQLite 写，agent 报告的「每秒 30+ 次」是没看到这层绑定）；
+  `verify_decryptable_on_startup` 并发解密（R12 —— `KeychainKeyProvider::data_key` 先查进程内
+  `CACHE`，plan 的「N 条 vault = N 次 Keychain 访问」前提不成立，剩余每条是微秒级 AES-GCM）；
+  W6 的通用 keyed diff（R25 —— `paintEntries` 的另一个调用点是 `load()` 的全量数据替换，
+  diff 在那里没有收益；真正受益的 `editNote` 单条路径已由局部更新覆盖）；preview 改走
+  `Channel<Uint8Array>` / asset protocol（R27）与 thumb 提到独立 `entries.thumb` 列（R29）——
+  后两条经确认独立排期。
 - **测试基线**：app 261 passed + core 44 passed（合计 305），1 个 trigram 测试 ignored。
   其中 1 例来自同期合入 main 的 `app/src/pasteback_test.rs` 增量，与本轮预览栏无关。
   本轮增量是「列表旁预览栏」（plan U1–U6）：app +28（`app/src/preview_test.rs` 的 19 例 ——
@@ -199,6 +244,33 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   与分组）、`preview.test.ts` 18（预览栏开关状态机与尺寸 IPC、kind 派发、图片缓存、
   跟随选中、迟到响应、加密区「无法解密」）、`logview.test.ts` 7）由 `npm --prefix frontend test` 覆盖。
   （依赖编译期 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 标志，见 KTD3）。
+  **本轮「性能优化（W1–W7）」实测基线：app 292 passed + core 45 passed（合计 337）+ 1 ignored；
+  前端 135 例（7 个测试文件）**（上一轮记录的是 305 + 1 ignored / 92 + 1 todo）。新增用例按
+  wave：
+  W1 —— core `migration_v5_creates_hot_path_indexes`；app `list_recent_does_not_fetch_payload_blob`、
+  `update_note_and_tags_with_10_tags_uses_json_each`、`update_note_and_tags_source_uses_json_each`、
+  `entries_fts_update_trigger_has_when_clause_to_skip_pure_vault_updates`、
+  `is_fts_hostile_allows_slash_dot_dash_plus_equal_and_backslash`、`parse_tab_dispatches_to_recent_tag_and_category`、
+  `sanitize_query_strips_control_chars_and_trims`、
+  `insert_captured_with_metadata_uses_caller_hash_not_internal_fingerprint`（另把
+  `process_handles_binary_capture`、`schema_migration_zero_to_latest` 按新契约更新）。
+  W2 —— `watcher_process_runs_make_thumbnail_inside_spawn_blocking` +
+  `watcher_poll_change_async_macos_moves_pasteboard_into_spawn_blocking`（Windows 同源的那条只在 CI 的
+  `windows` job 跑，不计入本机基线；两条都用括号化字面量匹配源码，避免命中注释里的裸字样）。
+  W3 —— `read_tail_equals_full_read_semantics`、`read_tail_does_not_read_backup_when_current_is_large_enough`、
+  `get_settings_batch_reads_several_keys_and_omits_missing`、`get_settings_batch_with_empty_keys_returns_empty_map`、
+  `with_keychain_timeout_*` 3 条（透传结果 / 透传错误 / 超时返回 Err；超时用例用 50 ms 小预算，
+  不拖慢套件）。
+  W4 —— `list_recent_with_tags_returns_tags_alongside_entries`、
+  `tags_containing_commas_are_not_split_by_the_concat_delimiter`、`search_entries_with_tags_returns_tags_alongside_hits`、
+  `build_search_query_with_tags_adds_join_concat_and_group_by`、`with_tags_variant_binds_the_same_params`。
+  W5 —— 前端 `panel.test.ts` 3（`escapeHtml` 单遍实现与原 5 段链式逐字等价 / 5 个元字符的实体形式 /
+  base64 data URL 原样通过）+ `preview.test.ts` 4（`<img>` 固有尺寸 / 缺尺寸不写属性 / 0 不写属性 /
+  缓存命中路径也带尺寸）。
+  W6 —— 前端 `panel.test.ts` 3（`renderEntries` 输出 == 逐行 `renderEntryRow` 的拼接 / `data-id` /
+  `data-index` / selected 标记 / 空列表走空态）。
+  W7 —— `process_skips_self_written_content`、`self_write_slot_does_not_swallow_a_different_capture`、
+  `preview_is_served_from_cache_after_payload_is_cleared`、`vault_image_preview_is_not_cached`。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：

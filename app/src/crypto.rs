@@ -20,6 +20,56 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as B64;
 use clipvault_core::crypto::{self, CryptoError, KEY_LEN, KeyProvider, NONCE_LEN};
+use std::time::Duration;
+
+/// 系统凭据库访问预算（性能优化 W3 / R13）。
+///
+/// macOS `securityd` / Windows LSA RPC 一旦卡住，`data_key()` 会在 IPC 派发线程上
+/// 无期限地 hold 住 —— 前端此时连不上任何命令（含搜索）。2 秒预算让调用方退回
+/// 「凭据库不可用」，下次重试可能就快。2 秒既覆盖 securityd 冷启的常见量级，
+/// 也不会让 UI 冻太久。
+///
+/// 首次创建 Keychain 条目在慢机上可能超过这个预算 —— 但那正是 `preload_spawn`
+/// 要解决的问题：它在启动期后台预热，用户触发第一条加密命令时通常已经缓存命中。
+pub const KEYCHAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 在有限时间内跑一次阻塞式凭据库访问（W3 / R13）。
+///
+/// `data_key()` 是**同步** trait 方法（`KeyProvider` 定义），不能在它内部用
+/// `tokio::time::timeout`。这里起一个专职线程跑 `op`，主线程 `recv_timeout` 等它：
+/// - 有结果（无论 Ok/Err）就在预算内原样返回；
+/// - 超时返回 `Err(KeyUnavailable)`，调用方按「凭据库不可用」处理；
+/// - **超时后 worker 不会写进程内 `CACHE`** —— 缓存写入在调用方（`data_key`）
+///   收到 `Ok` 之后才发生，所以不会出现「已超时但 cache 却被填了」的错位。
+///
+/// `timeout` 显式传入：生产代码用 [`KEYCHAIN_TIMEOUT`]；单测传 50 ms 级的小预算，
+/// 让超时用例不会拖住测试套件 2 秒。
+fn with_keychain_timeout<F>(timeout: Duration, op: F) -> Result<[u8; KEY_LEN], CryptoError>
+where
+    F: FnOnce() -> Result<[u8; KEY_LEN], CryptoError> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let spawned = std::thread::Builder::new()
+        .name("clipvault-keychain".to_string())
+        .spawn(move || {
+            // send 失败 = 主线程已超时离开，这是预期路径，不算错误。
+            let _ = tx.send(op());
+        });
+    if spawned.is_err() {
+        return Err(CryptoError::KeyUnavailable(
+            "无法创建凭据库访问线程".to_string(),
+        ));
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(res) => res,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(CryptoError::KeyUnavailable(
+            format!("系统凭据库访问超时（{} 秒）", timeout.as_secs()),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(CryptoError::KeyUnavailable(
+            "凭据库访问线程异常终止".to_string(),
+        )),
+    }
+}
 
 /// `move_to_vault` 加密一条明文后的落盘表示。
 #[derive(Debug, Clone)]
@@ -192,7 +242,12 @@ mod keychain {
             if let Some(key) = *CACHE.lock().expect("key cache poisoned") {
                 return Ok(key);
             }
-            let key = load_or_create(&self.account)?;
+            // W3 / R13:带 2 秒超时,securityd 卡住时不让 IPC 派发线程无期限 hold。
+            // 缓存写入放在拿到 Ok 之后 —— 超时不会填 cache。
+            let account = self.account.clone();
+            let key = super::with_keychain_timeout(super::KEYCHAIN_TIMEOUT, move || {
+                load_or_create(&account)
+            })?;
             *CACHE.lock().expect("key cache poisoned") = Some(key);
             Ok(key)
         }
@@ -289,7 +344,11 @@ mod cred {
             if let Some(key) = *CACHE.lock().expect("key cache poisoned") {
                 return Ok(key);
             }
-            let key = load_or_create(&self.user)?;
+            // W3 / R13:带 2 秒超时,LSA RPC 卡住时不让 IPC 派发线程无期限 hold。
+            let user = self.user.clone();
+            let key = super::with_keychain_timeout(super::KEYCHAIN_TIMEOUT, move || {
+                load_or_create(&user)
+            })?;
             *CACHE.lock().expect("key cache poisoned") = Some(key);
             Ok(key)
         }
@@ -402,5 +461,91 @@ pub fn system_key_available() -> bool {
     #[cfg(target_os = "windows")]
     {
         CredentialKeyProvider::new().data_key().is_ok()
+    }
+}
+
+/// 后台预热数据密钥（性能优化 W3 / R13）。
+///
+/// `main::setup` 调一次，起一个 detached 线程去访问系统凭据库。冷启动首次访问
+/// 常要几百毫秒（`securityd` / LSA 冷启、首次创建条目），若撞上用户第一条加密 /
+/// 解密 IPC 就是白等一次（且在 2 秒超时下可能直接失败）。预热把它挪到启动期后台，
+/// 用户触发时基本都已 cache hit。
+///
+/// 失败静默：预热失败只影响本次；之后每次 `data_key` 都会重试，并会被
+/// `system_key_available` / `keychain_available` 如实报出。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn preload_spawn() {
+    std::thread::Builder::new()
+        .name("clipvault-key-preload".to_string())
+        .spawn(|| {
+            use clipvault_core::crypto::KeyProvider as _;
+            #[cfg(target_os = "macos")]
+            {
+                let _ = KeychainKeyProvider::new().data_key();
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let _ = CredentialKeyProvider::new().data_key();
+            }
+        })
+        .ok();
+}
+
+/// 非 macOS / 非 Windows：无系统凭据库，预热无事可做。
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn preload_spawn() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// W3 / R13:op 在预算内返回时,原样透传结果、不额外拖延。
+    #[test]
+    fn with_keychain_timeout_returns_result_when_op_finishes_in_budget() {
+        let start = std::time::Instant::now();
+        let res = with_keychain_timeout(Duration::from_millis(50), || Ok([7u8; KEY_LEN]));
+        assert_eq!(res.unwrap(), [7u8; KEY_LEN]);
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "立即返回的 op 不该等满预算,实际 {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// W3 / R13:op 自己返回 `Err`(例如读凭据库失败)时原样透传,不要变成超时错误。
+    #[test]
+    fn with_keychain_timeout_propagates_operation_error() {
+        let res = with_keychain_timeout(Duration::from_millis(50), || {
+            Err(CryptoError::KeyUnavailable("mock fail".to_string()))
+        });
+        assert_eq!(
+            res,
+            Err(CryptoError::KeyUnavailable("mock fail".to_string())),
+            "op 的 Err 必须原样透传"
+        );
+    }
+
+    /// W3 / R13 的核心:`op` 挂住超过预算时必须返回 `Err`(而不是无期限等)。
+    ///
+    /// 用 50 ms 的小预算 + 睡 500 ms 的 op,测试只耗 ~50 ms;这样超时路径既被
+    /// 覆盖,又不会拖慢测试套件。
+    #[test]
+    fn with_keychain_timeout_returns_err_when_op_exceeds_budget() {
+        let timeout = Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let res = with_keychain_timeout(timeout, move || {
+            std::thread::sleep(timeout * 10);
+            Ok([1u8; KEY_LEN])
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(res, Err(CryptoError::KeyUnavailable(_))),
+            "op 慢于预算必须超时返回 Err"
+        );
+        assert!(elapsed >= timeout, "应至少等满预算,实际 {elapsed:?}");
+        assert!(
+            elapsed < timeout * 5,
+            "必须在 op 完成前返回(不等 500ms),实际 {elapsed:?}"
+        );
     }
 }

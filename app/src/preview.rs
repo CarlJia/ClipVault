@@ -21,6 +21,10 @@
 //!
 //! 解密结果只经这条命令回到前端一次，不进任何持久化路径。
 
+use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::sync::{LazyLock, Mutex};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use clipvault_core::ContentKind;
@@ -38,6 +42,69 @@ pub struct PreviewImage {
     pub png: Vec<u8>,
     pub width: u32,
     pub height: u32,
+}
+
+// ----------------------------------------------------------------
+// 预览图缓存（W7 / R28）
+// ----------------------------------------------------------------
+
+/// 缓存条数上限。一张 ≤1600px 长边的 PNG 预览通常 200KB–2MB，32 条最坏约 60MB ——
+/// 与这个应用其它内存预算（列表查询不再把 payload BLOB 拉进内存）相称。
+const PREVIEW_CACHE_LIMIT: usize = 32;
+
+/// 进程级预览图缓存：`content_hash -> PreviewImage`，FIFO 淘汰。
+///
+/// 方向键扫过一串图、再回到某一张时，命中缓存直接走 `PreviewDto::image`
+/// （只做一次 base64），省掉 `decode + resize + PNG re-encode`（20MB 原图约 30-60ms）。
+///
+/// **按 `content_hash` 而不是 `id` 索引**：同一份内容换了 id 也能复用；内容变了
+/// （例如条目被覆盖）自然不命中旧缓存，不需要任何失效逻辑。
+///
+/// **只装非 vault 条目**：vault 的载荷是解密结果，而 `is_decryptable` 可能在运行期
+/// 变化（Keychain 恢复、换机器）；缓存住「上一次解得开」的图会让 UI 与真实可解密
+/// 状态错位。调用方负责这个判断（见 [`get_entry_preview_inner`]）。
+struct PreviewCache {
+    map: HashMap<String, PreviewImage>,
+    /// 插入顺序（FIFO）。重复 put 同一 key 会把它移到末尾。
+    order: VecDeque<String>,
+}
+
+static PREVIEW_CACHE: LazyLock<Mutex<PreviewCache>> = LazyLock::new(|| {
+    Mutex::new(PreviewCache {
+        map: HashMap::new(),
+        order: VecDeque::new(),
+    })
+});
+
+/// 取一条缓存；未命中返回 `None`。锁中毒（别的线程 panic 过）时按未命中处理 ——
+/// 缓存是纯加速层，任何异常都不该影响预览本身的可用性。
+fn preview_cache_get(key: &str) -> Option<PreviewImage> {
+    PREVIEW_CACHE.lock().ok()?.map.get(key).cloned()
+}
+
+/// 写入一条缓存并按 FIFO 淘汰。缓存写失败（锁中毒）静默忽略。
+fn preview_cache_put(key: String, img: PreviewImage) {
+    let Ok(mut guard) = PREVIEW_CACHE.lock() else {
+        return;
+    };
+    guard.map.insert(key.clone(), img);
+    guard.order.retain(|k| k != &key);
+    guard.order.push_back(key);
+    while guard.order.len() > PREVIEW_CACHE_LIMIT {
+        if let Some(old) = guard.order.pop_front() {
+            guard.map.remove(&old);
+        }
+    }
+}
+
+/// 清空缓存（仅供单测隔离用；生产代码没有清缓存的理由 —— 缓存按内容索引，
+/// 内容变了自然不命中）。
+#[cfg(test)]
+pub fn clear_preview_cache_for_tests() {
+    if let Ok(mut guard) = PREVIEW_CACHE.lock() {
+        guard.map.clear();
+        guard.order.clear();
+    }
 }
 
 /// 预览栏的数据（与前端 `PreviewDto` 一一对应）。
@@ -187,6 +254,13 @@ pub async fn get_entry_preview_inner(
             if locked {
                 return Ok(PreviewDto::undecryptable(ContentKind::Image));
             }
+            // W7 / R28：非 vault 图片的预览按 `content_hash` 缓存。命中时只剩一次
+            // base64，省掉 decode + resize + PNG re-encode（20MB 原图约 30-60ms）。
+            if !entry.is_vault
+                && let Some(hit) = preview_cache_get(&entry.content_hash)
+            {
+                return Ok(PreviewDto::image(&hit));
+            }
             // 非 vault 条目 `decrypt_payload` 原样返回 payload —— 与
             // `pasteback::perform_paste` 传的是同一种入参，不必在这里先分一次叉。
             let raw: &[u8] = entry.payload.as_deref().unwrap_or_default();
@@ -206,6 +280,10 @@ pub async fn get_entry_preview_inner(
                     .await
                     .map_err(|e| format!("entry {id} 的预览解码任务失败：{e}"))?;
                     let img = decoded.ok_or_else(|| format!("entry {id} 的图片数据无法解码"))?;
+                    // 只缓存非 vault 结果：vault 的可解密状态会变（见 `PreviewCache` 的说明）。
+                    if !entry.is_vault {
+                        preview_cache_put(entry.content_hash.clone(), img.clone());
+                    }
                     Ok(PreviewDto::image(&img))
                 }
                 Err(_) => Ok(PreviewDto::undecryptable(ContentKind::Image)),

@@ -387,6 +387,81 @@ fn read_tail_handles_missing_backup() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// W3 / R14：倒读实现必须与「读全量 + `tail_lines` 尾部切」语义**完全等价**。
+///
+/// 造两份各自都比 `max_bytes` 大的文件：旧实现读 `.1` 全量 + current 全量再切尾；
+/// 新实现先读 current 尾 `max_bytes`（此时已够），不再碰 `.1`。两者最终文本应一致。
+#[test]
+fn read_tail_equals_full_read_semantics() {
+    let dir = temp_log_dir("tail_equiv");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+
+    // 每行 10 字节整（含换行），共 1000 行 = 10_000 字节。
+    let mut backup_data = String::new();
+    for i in 0..1000 {
+        backup_data.push_str(&format!("backup-{i:03}\n"));
+    }
+    let mut current_data = String::new();
+    for i in 0..1000 {
+        current_data.push_str(&format!("current-{i:03}\n"));
+    }
+    std::fs::write(&backup, backup_data.as_bytes()).unwrap();
+    std::fs::write(&current, current_data.as_bytes()).unwrap();
+
+    // 旧式全量读 + tail_lines（语义基准）。
+    let mut full_combined = Vec::new();
+    full_combined.extend_from_slice(backup_data.as_bytes());
+    full_combined.extend_from_slice(current_data.as_bytes());
+
+    for (max_bytes, max_lines) in [(4096usize, 400usize), (1024, 50), (2048, 100)] {
+        let expected = tail_lines(&full_combined, max_bytes, max_lines);
+        let got = read_tail(&dir, max_bytes, max_lines).expect("read_tail");
+        assert_eq!(
+            got, expected,
+            "倒读必须与全量读 + tail_lines 等价（max_bytes={max_bytes}, max_lines={max_lines}）"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// W3 / R14 的**收益合约**：`current` 已超过 `max_bytes` 时，**不得**再去读 `.1`。
+///
+/// 造一份大 `current`（远超 `max_bytes`）+ 一份带哨兵行的 `.1`；断言返回文本里
+/// 不含 `.1` 的哨兵——这与「不再碰 `.1`」是同一事实的两个观察面。
+#[test]
+fn read_tail_does_not_read_backup_when_current_is_large_enough() {
+    let dir = temp_log_dir("tail_large");
+    let current = crate::log::log_path_in(&dir);
+    let backup = crate::log::backup_log_path(&dir);
+
+    // ~5 MB current（每行 22 字节 × 240_000 行），远超 64 KiB。
+    let mut current_data = String::with_capacity(5 * 1024 * 1024);
+    for i in 0..240_000 {
+        current_data.push_str(&format!("current-line-{i:06}\n"));
+    }
+    std::fs::write(&current, current_data.as_bytes()).unwrap();
+
+    // `.1` 放哨兵行：只要倒读实现不去读它，返回里就不该出现。
+    std::fs::write(&backup, b"BACKUP_SENTINEL_LINE\n").unwrap();
+
+    let tail = read_tail(&dir, 64 * 1024, 400).expect("read_tail");
+    assert!(
+        !tail.contains("BACKUP_SENTINEL"),
+        "current 已超过 max_bytes,倒读实现不该再读 .1(旧实现会读到)"
+    );
+    assert!(
+        tail.contains("current-line-239999"),
+        "必须包含 current 的最后一行"
+    );
+    assert!(
+        tail.lines().count() <= 400,
+        "行数必须受 max_lines 限制,实际 {}",
+        tail.lines().count()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn apply_log_level_persists_and_updates() {
     // 验证 KTD5 形状:clamp + 原子更新 + 持久化 + 重新读出一致。

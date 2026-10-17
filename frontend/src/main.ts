@@ -30,6 +30,7 @@ import {
   type TagInfo,
   renderCategories,
   renderEntries,
+  renderEntryRow,
   renderFilterHeader,
   renderTags,
   renderVaultList,
@@ -39,6 +40,7 @@ import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
   type LogInfoDto,
   type PasteResult,
+  cancelAccessibilityRecheck,
   cancelRecording,
   clearLog,
   clearUndecryptable,
@@ -254,8 +256,22 @@ function renderTabs(): void {
   ).join("");
 }
 
+/**
+ * 把选中行滚入视口（`block: "nearest"` 只滚最小距离）。
+ *
+ * W5 / R20：用 `requestAnimationFrame` 合帧。`scrollIntoView` 是**同步触发布局**
+ * 的操作；连按 ↓ 时每个 keydown 都会调一次，按 5 次就是 5 次同步 layout。
+ * rAF 把「本帧内要滚到哪」合并成一次 —— 只有最后一次真正执行，中间几次被
+ * `cancelAnimationFrame` 丢掉。选中态早在 `applySelectionPatch` 里改完了，
+ * 滚动晚一帧用户看不出来。
+ */
+let scrollRafId = 0;
 function scrollToSelected(): void {
-  selectedEl?.scrollIntoView({ block: "nearest" });
+  if (scrollRafId !== 0) cancelAnimationFrame(scrollRafId);
+  scrollRafId = requestAnimationFrame(() => {
+    scrollRafId = 0;
+    selectedEl?.scrollIntoView({ block: "nearest" });
+  });
 }
 
 /** 渲染条目列表；筛选态下在顶部补一行「‹ 返回」条。
@@ -432,13 +448,23 @@ function editNote(): void {
   const e = currentEntry();
   if (!e) return;
   openEditor(e, (dto) => {
-    // 保存成功：就地更新对应行并重绘，无需整表刷新。
     const idx = entries.findIndex((x) => x.id === dto.id);
-    if (idx >= 0) {
-      entries[idx] = dto;
+    if (idx < 0) return;
+    entries[idx] = dto;
+    // W6：只有这一条的内容变了（备注 / 标签），不必 50 行全量重画 —— 只把这一行的
+    // `outerHTML` 换掉。列表用的是事件委托（监听器挂在 `listEl` 上），换行节点不会
+    // 丢事件；换完要把 `selectedEl` 重新指一次 —— `outerHTML` 赋值移除了旧节点，
+    // 那个引用已经不在文档里了。
+    const row = listEl.querySelector<HTMLElement>(`.row[data-id="${dto.id}"]`);
+    if (row) {
+      row.outerHTML = renderEntryRow(dto, idx, selected);
+      selectedEl = listEl.querySelector<HTMLElement>(".row.selected");
+    } else {
+      // 理论上只可能是列表与 `entries[]` 失同步（那本身就是 bug）。退回整表重画，
+      // 宁可慢一帧也要保证界面与数据一致。
       paintEntries();
-      scrollToSelected();
     }
+    scrollToSelected();
   });
 }
 
@@ -730,6 +756,10 @@ function closeSettings(): void {
   // 之后照样会吞掉用户在主列表里敲下的第一个字符，并把它静默写成那个 action 的新绑定。
   // （`settings.ts` 的录制监听器里另有一道同义兜底，防别的路径隐藏模态。）
   cancelRecording();
+  // W5 / R23：顺手取消待执行的辅助功能自动复检。用户在设置里点了「打开系统设置」
+  // 之后关掉设置（或整个面板），那个 15 秒定时器会在横幅早已不可见时醒来，
+  // 白打一次 `check_accessibility` IPC。
+  cancelAccessibilityRecheck();
   hideOverlay(settingsEl);
 }
 

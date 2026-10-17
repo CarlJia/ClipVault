@@ -90,7 +90,18 @@ pub struct Watcher {
     /// 最近一次入库的指纹与时间戳,用于去重窗口。
     last_hash: Mutex<Option<(String, Instant)>>,
     /// 最近一次读到的 `changeCount`,用于判断剪贴板是否变化。
-    last_change_count: AtomicI64,
+    ///
+    /// W2 / KTD7:用 `Arc<AtomicI64>` 而不是 `AtomicI64`,让 `poll_change_async`
+    /// 的 `spawn_blocking` 闭包可以 move 一个 owned 句柄进去——`NSPasteboard`
+    /// 不是 `Send`, 不能直接 hold 进 executor 的 .await 边界, 必须把
+    /// 整个读取 + 探测都关进 blocking pool。swap 必须发生在同一个闭包里
+    /// (「序列号无论是否捕获成功都推进」这一既有语义),否则闭包返回后再
+    /// `store` 会与下一轮 `load` 错位。
+    last_change_count: Arc<AtomicI64>,
+    /// W7 / R30：自写抑制槽。ClipVault 自己写进剪贴板的内容（目前只有
+    /// 「复制日志路径」）的指纹登记在这里；下一轮 `process` 见到同一指纹就跳过。
+    /// 与 [`crate::commands::AppState::self_writes`] 是**同一个** `Arc`。
+    self_writes: Arc<Mutex<Option<String>>>,
 }
 
 /// 当前剪贴板序列号;读不到时返回 `None`。
@@ -140,13 +151,19 @@ impl Watcher {
         storage: Arc<Storage>,
         guest_mode: Arc<AtomicBool>,
         skip_next: Arc<AtomicBool>,
+        self_writes: Arc<Mutex<Option<String>>>,
     ) -> Self {
         Self {
             storage,
             guest_mode,
             skip_next,
             last_hash: Mutex::new(None),
-            last_change_count: AtomicI64::new(initial_change_count(current_change_count())),
+            // W2:Arc 包一层,让 `poll_change_async` 的 spawn_blocking 闭包可以 move.
+            last_change_count: Arc::new(AtomicI64::new(initial_change_count(
+                current_change_count(),
+            ))),
+            // W7 / R30:与 `AppState::self_writes` 是同一个 Arc。
+            self_writes,
         }
     }
 
@@ -156,51 +173,67 @@ impl Watcher {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
-            if let Some(captured) = self.poll_change() {
+            // W2 / R9:`capture::poll_first_non_empty`(读 NSPasteboard 数据 + 头字节
+            // 解析 + Dict 转换)是 CPU/IO 重活,在 blocking pool 跑,让 executor
+            // worker 在这一帧可以接 IPC(搜索框输入响应不再被吞)。
+            if let Some(captured) = self.poll_change_async().await {
                 self.process(captured).await;
             }
         }
     }
 
-    /// 读取剪贴板变化（macOS 实现 / 多类型扩展后）。
+    /// 异步读剪贴板变化（macOS 实现 / 多类型扩展后）。
     ///
-    /// 调用 `capture::poll_first_non_empty` 按 `filenames → image → rtf →
-    /// color → string` 顺序探测,首个非空胜出。`changeCount` 没增长则
-    /// 返回 `None`。
+    /// 整段读取与探测关进 `spawn_blocking`——`NSPasteboard.generalPasteboard()`
+    /// 返回的 `Retained<NSPasteboard>` 是 `!Send`,不能 hold 进 executor 的 .await
+    /// 边界。`last_change_count` 用 `Arc<AtomicI64>`,让闭包 move 一个 owned 句柄
+    /// 在内部完成 swap(语义上保留「序列号无论是否捕获都推进」)。executor 这一帧
+    /// 立即让出, IPC 在 spawn_blocking worker 跑 NSPasteboard 读取期间仍能跑。
     #[cfg(target_os = "macos")]
-    fn poll_change(&self) -> Option<Captured> {
-        use objc2_app_kit::NSPasteboard;
-        let pasteboard = NSPasteboard::generalPasteboard();
-        let change_count = pasteboard.changeCount() as i64;
-        let prev = self.last_change_count.swap(change_count, Ordering::SeqCst);
-        capture::poll_first_non_empty(change_count, prev)
+    async fn poll_change_async(&self) -> Option<Captured> {
+        let last_change_count = Arc::clone(&self.last_change_count);
+        let join = tauri::async_runtime::spawn_blocking(move || -> Option<Captured> {
+            use objc2_app_kit::NSPasteboard;
+            let pasteboard = NSPasteboard::generalPasteboard();
+            let change_count = pasteboard.changeCount() as i64;
+            let prev = last_change_count.swap(change_count, Ordering::SeqCst);
+            if change_count <= prev {
+                return None;
+            }
+            capture::poll_first_non_empty(change_count, prev)
+        });
+        // spawn_blocking panic / cancel 退回到「本轮无捕获」;`Option::default()` 即 `None`。
+        let captured: Option<Captured> = join.await.unwrap_or_default();
+        captured
     }
 
-    /// 非 macOS / 非 Windows 平台没有剪贴板序列号,始终返回 `None`。
+    /// 非 macOS / 非 Windows 平台没有剪贴板序列号, 始终返回 `None`。
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn poll_change(&self) -> Option<Captured> {
+    async fn poll_change_async(&self) -> Option<Captured> {
         None
     }
 
-    /// 读取剪贴板变化(Windows 实现 / U1)。
+    /// 异步读剪贴板变化(Windows 实现 / U1)。
     ///
-    /// `GetClipboardSequenceNumber()` 与 macOS 的 `NSPasteboard.changeCount` 是同一
-    /// 语义:一个单调递增的剪贴板序列号,任何进程写入剪贴板都会让它增长。因此下面
-    /// 的 `swap` 与判据与 macOS 版逐字对应(含「无论是否捕获成功序列号都推进」)。
-    ///
-    /// 两点差异值得写下来:
-    /// - 返回值是 `u32`,这里提升为 `i64` 以复用同一个 `last_change_count` 字段。
-    /// - 序列号拿不到时返回 `0`(如调用方不在交互式窗口站)。此时 [`current_change_count`]
-    ///   把它当作「读不到」,初值退回 `-1`,于是首轮被判为「增长了」并空跑一次
-    ///   `poll_first_non_empty`(读一次、什么都没有、返回 `None`),与 macOS 侧同样情形
-    ///   的行为一致,没有额外代价 —— 反过来若照抄成 `0`,「序列号不可用」就会被误读成
-    ///   「剪贴板永远没变」,整条采集链静默停摆。
+    /// 与 macOS 版逐字对应:`GetClipboardSequenceNumber` 与 `last_change_count.swap`
+    /// 整段都在 spawn_blocking 内。`OpenClipboard` + 探测 + DIB→PNG 转码都是
+    /// 阻塞调用，必须在 blocking pool。
     #[cfg(target_os = "windows")]
-    fn poll_change(&self) -> Option<Captured> {
-        let change_count =
-            unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() } as i64;
-        let prev = self.last_change_count.swap(change_count, Ordering::SeqCst);
-        capture::poll_first_non_empty(change_count, prev)
+    async fn poll_change_async(&self) -> Option<Captured> {
+        let last_change_count = Arc::clone(&self.last_change_count);
+        let join = tauri::async_runtime::spawn_blocking(move || -> Option<Captured> {
+            let change_count =
+                unsafe { windows::Win32::System::DataExchange::GetClipboardSequenceNumber() }
+                    as i64;
+            let prev = last_change_count.swap(change_count, Ordering::SeqCst);
+            if change_count <= prev {
+                return None;
+            }
+            capture::poll_first_non_empty(change_count, prev)
+        });
+        // spawn_blocking panic / cancel 退回到「本轮无捕获」;`Option::default()` 即 `None`。
+        let captured: Option<Captured> = join.await.unwrap_or_default();
+        captured
     }
 
     /// 处理一次多类型捕获:去重 + skip-once + 访客模式过滤 + 25MB 上限 +
@@ -232,6 +265,26 @@ impl Watcher {
         // 3. 指纹。
         let hash = captured.fingerprint();
         let now = Instant::now();
+
+        // 3.5 W7 / R30：自写抑制。ClipVault 自己刚写进剪贴板的内容（目前只有
+        //     「复制日志路径」）不该进历史。写侧（`commands::copy_log_path`）把
+        //     指纹登记在这个共享槽里；这里 `take()` 一次性取出并比对 —— **不论
+        //     匹配与否都消费掉**，所以它只对「紧随其后的那一次捕获」生效：写剪贴板
+        //     失败时也不会留成一颗日后误伤真实复制的定时炸弹。
+        //
+        //     放在去重之前：自写内容不该进入 `last_hash`，否则用户紧接着真复制
+        //     同样一段文字时，会被 5 秒去重窗口当成重复而丢掉。
+        {
+            let mut guard = self.self_writes.lock().await;
+            let pending = guard.take();
+            if pending.as_deref() == Some(hash.as_str()) {
+                ::log::debug!(
+                    target: "watcher::capture",
+                    "[capture] skipped: self-written content (R30)"
+                );
+                return;
+            }
+        }
 
         // 4. 去重判定:锁内比对并更新指纹,入库前释放锁(不跨 await 持锁)。
         {
@@ -266,22 +319,40 @@ impl Watcher {
             other => other.as_str().to_string(),
         };
 
-        // 8. 落库。图片走 thumbnail 生成（U3）。
+        // 8. 落库。图片走 thumbnail 生成(U3)—— CPU 重活搬到 blocking pool。
+        //
+        // W2 / R8:`image::load_from_memory` + resize + `PngEncoder::write_image`
+        // + base64 在 20 MB PNG 上约 50-100 ms,旧路径直接占在 executor worker
+        // 上,期间任何 `search_results` / `paste_entry` IPC 都要排队等这一帧
+        // 跑完。把「读 payload + 跑 `make_thumbnail`」搬进 spawn_blocking,
+        // executor worker 等到 join handle 后立即接 IPC;thumbnail 与 DB 写
+        // 顺序执行,但 IPC 不再被吞。
         let mut metadata_to_persist =
             serde_json::to_string(&captured.metadata).unwrap_or_else(|_| "{}".to_string());
-        if matches!(captured.kind, ContentKind::Image) {
-            let payload_for_thumb = captured.payload.as_deref().unwrap_or(&[]);
-            let mime_for_thumb = captured.mime.as_deref().unwrap_or("");
-            if let Some(t) = thumbnail::make_thumbnail(payload_for_thumb, mime_for_thumb) {
-                // 把 thumb base64 与 dim 拼进 metadata_json
-                let mut meta: serde_json::Value = serde_json::from_str(&metadata_to_persist)
-                    .unwrap_or_else(|_| serde_json::json!({}));
-                if let Some(obj) = meta.as_object_mut() {
-                    obj.insert("thumb".into(), serde_json::Value::String(t.b64));
-                    obj.insert("thumb_dim".into(), serde_json::Value::Number(t.dim.into()));
-                }
-                metadata_to_persist = meta.to_string();
+
+        let thumb: Option<crate::thumbnail::Thumbnail> =
+            if matches!(captured.kind, ContentKind::Image) {
+                // 把 owned 数据 move 进 'static 闭包。
+                let payload_for_thumb = captured.payload.clone().unwrap_or_default();
+                let mime_for_thumb = captured.mime.clone().unwrap_or_default();
+                let join: tauri::async_runtime::JoinHandle<Option<crate::thumbnail::Thumbnail>> =
+                    tauri::async_runtime::spawn_blocking(move || {
+                        thumbnail::make_thumbnail(&payload_for_thumb, &mime_for_thumb)
+                    });
+                join.await.unwrap_or_default() // spawn_blocking panic / cancel 退回到无 thumb
+            } else {
+                None
+            };
+
+        if let Some(t) = thumb {
+            // 把 thumb base64 与 dim 拼进 metadata_json
+            let mut meta: serde_json::Value = serde_json::from_str(&metadata_to_persist)
+                .unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = meta.as_object_mut() {
+                obj.insert("thumb".into(), serde_json::Value::String(t.b64));
+                obj.insert("thumb_dim".into(), serde_json::Value::Number(t.dim.into()));
             }
+            metadata_to_persist = meta.to_string();
         }
 
         match capture::insert_captured_with_metadata(
@@ -289,6 +360,7 @@ impl Watcher {
             &captured,
             &auto_category,
             &metadata_to_persist,
+            &hash,
         )
         .await
         {

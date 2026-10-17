@@ -8,6 +8,7 @@
 use clipvault_core::Entry;
 use clipvault_core::schema;
 use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use serde_json::to_string as json_to_string;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -22,10 +23,38 @@ const ENTRY_COLS: &str = "id, content_hash, content, note, auto_category, \
      is_pinned, pinned_at, is_vault, is_decryptable, created_at, \
      content_kind, mime_type, payload, payload_nonce, metadata_json";
 
+/// 列表查询专用列清单（性能优化 W1 / KTD2）。
+///
+/// 列表路径（`list_recent` / `get_by_category` / `search_entries`）从不消费
+/// `payload` 与 `payload_nonce`——`to_dtos` 只把 11 个轻字段拼成 DTO,大
+/// BLOB 在拿到 `Row` 那一刻被 `rusqlite` 拷成 `Vec<u8>` 之后立即丢弃。30
+/// 条 × 平均 2 MB payload ≈ 60 MB 一次性 alloc,无任何功能收益。
+///
+/// 把这两列写为 `NULL AS payload, NULL AS payload_nonce`,让 `Entry::from_sqlite_row`
+/// 索引 0..=14 仍对齐, 但 SQLite 不去 fetch BLOB 列——`Option<Vec<u8>>::get`
+/// 解 `NULL` 为 `None`, 零分配; `to_dtos` 行为不变。
+///
+/// 顺序与列名必须与 `ENTRY_COLS` 完全一致(`Entry::from_sqlite_row` 索引硬绑)。
+const ENTRY_LIST_COLS: &str = "id, content_hash, content, note, auto_category, \
+     is_pinned, pinned_at, is_vault, is_decryptable, created_at, \
+     content_kind, mime_type, NULL AS payload, NULL AS payload_nonce, metadata_json";
+
 /// `is_vault` 三态标记的原始整数值：明文 / 已加密 / 加密中（pending）。
 const VAULT_PLAINTEXT: i32 = 0;
 const VAULT_ENCRYPTED: i32 = 1;
 const VAULT_PENDING: i32 = 2;
+
+/// `GROUP_CONCAT(t.tag, CHAR(31))` 的结果串 → `Vec<String>`（W4 / R16）。
+///
+/// `LEFT JOIN tags` 下**没有标签**的条目该列为 `NULL` → 空 vec。
+/// `Some("")` 理论上不会出现（`GROUP_CONCAT` 对全 NULL 的组返回 NULL，对
+/// 有值的组至少一个非空元素），仍按空处理以防万一。
+fn split_tag_concat(raw: Option<String>) -> Vec<String> {
+    match raw {
+        Some(s) if !s.is_empty() => s.split('\x1f').map(String::from).collect(),
+        _ => Vec::new(),
+    }
+}
 
 /// Default database file location.
 ///
@@ -80,6 +109,21 @@ impl Storage {
 
         // Run migrations synchronously before wrapping.
         schema::run_migrations(&conn)?;
+
+        // 性能优化 W1 / KTD5:本地单文件 SQLite 的标准加速。
+        // - WAL:读写不再互相阻塞;即便仍是单连接, `search_entries` 在
+        //   `with_conn` 排队的窗口里 watcher 的写入不再让它堵。
+        // - synchronous=NORMAL 配 WAL:SQLite 文档推荐做法;崩溃时丢最后
+        //   一两个事务但已经持久化。本地单文件单机场景可接受。
+        // - busy_timeout=5s:遇到「另一个连接正持有锁」时(罕见,只在 WAL
+        //   多 connection 下出现) 等 5 秒。
+        //
+        // `journal_mode` 是「结果 pragma」,必须用 `pragma_update`(会读出旧
+        // 值并写新值),不能塞 `execute_batch`(后者丢弃结果)。rusqlite 0.32
+        // 的签名是 `(schema: Option<DatabaseName>, name: &str, value: V)`。
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "busy_timeout", 5000)?;
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -189,7 +233,7 @@ impl Storage {
     pub async fn list_recent(&self, limit: u32) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {ENTRY_COLS} FROM entries e ORDER BY {order} LIMIT ?1",
+                "SELECT {ENTRY_LIST_COLS} FROM entries e ORDER BY {order} LIMIT ?1",
                 order = crate::search::PIN_ORDER,
             ))?;
             let rows = stmt.query_map(params![limit], Entry::from_sqlite_row)?;
@@ -229,6 +273,14 @@ impl Storage {
     /// are deleted and the new set is inserted (set semantics, R7).  The
     /// FTS `tags_text` column is kept in sync by the database triggers.
     ///
+    /// # Performance (W1 / KTD3)
+    /// 旧版 N 个标签 = N 次单独 `INSERT INTO tags`,每次都触发一次
+    /// `tags_fts_insert` 重算 `tags_text`。新版用 `json_each` 把 N 行
+    /// 合到一条 SQL:`INSERT INTO tags (entry_id, tag) SELECT ?1, value
+    /// FROM json_each(?2)` —— `json1` 由 bundled SQLite 自带,零新依赖。
+    /// tags 触发器仍每次触发(FTS5 触发器的固有限制),但 SQLite 层写次数
+    /// 从 N 降到 1。
+    ///
     /// # Errors
     /// Rejects notes longer than [`MAX_NOTE_CHARS`] characters (R8) with
     /// [`rusqlite::Error::InvalidParameterName`]; nothing is written in
@@ -244,6 +296,11 @@ impl Storage {
                 "note exceeds {MAX_NOTE_CHARS}-char cap"
             )));
         }
+        // `json_each(?)` 接收合法 JSON 文本:把 `Vec<String>` 序列化成
+        // `["a","b"]`,每行产出 `value` 一列。空数组会让 `json_each`
+        // 输出 0 行,等价于"无标签可写"。
+        let tags_json = json_to_string(tags)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
         self.with_conn(|conn| {
             let tx = conn.transaction()?;
             tx.execute(
@@ -251,12 +308,15 @@ impl Storage {
                 params![note, id],
             )?;
             tx.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])?;
-            for tag in tags {
-                tx.execute(
-                    "INSERT INTO tags (entry_id, tag) VALUES (?1, ?2)",
-                    params![id, tag],
-                )?;
-            }
+            // 一次 INSERT 写完所有标签(可能 0 行)。`entry_id` 与 `tag`
+            // 都被 `idx_tags_entry_id`(V4)/ `idx_tags_tag`(V5) 覆盖;
+            // 唯一性由 `tags.id` 主键守护——同一 entry_id + tag 不会撞
+            // 冲突,DELETE FROM tags 已经把旧的全清。
+            tx.execute(
+                "INSERT INTO tags (entry_id, tag) \
+                 SELECT ?1, value FROM json_each(?2)",
+                params![id, tags_json],
+            )?;
             tx.commit()?;
             Ok(())
         })
@@ -297,7 +357,7 @@ impl Storage {
     pub async fn get_by_category(&self, category: &str) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {ENTRY_COLS} FROM entries e
+                "SELECT {ENTRY_LIST_COLS} FROM entries e
                  WHERE is_vault = 0 AND auto_category = ?1
                  ORDER BY {order}",
                 order = crate::search::PIN_ORDER,
@@ -323,6 +383,50 @@ impl Storage {
                 rusqlite::params_from_iter(plan.params.iter()),
                 Entry::from_sqlite_row,
             )?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// 执行带标签的 [`crate::search::SearchPlan`]（性能优化 W4 / R16）。
+    ///
+    /// 与 [`Storage::search_entries`] 同形，只是 SQL 里多了
+    /// `GROUP_CONCAT(t.tag, CHAR(31))` 一列（见
+    /// [`crate::search::build_search_query_with_tags`]）；标签串按 `\x1f`
+    /// 拆开后与 `Entry` 一起返回。命令层因此不必为同一批 id 二次
+    /// `with_conn` 拉标签（旧 `load_tags` 的 N+1 形状）。
+    pub async fn search_entries_with_tags(
+        &self,
+        plan: crate::search::SearchPlan,
+    ) -> SqliteResult<Vec<(Entry, Vec<String>)>> {
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&plan.sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(plan.params.iter()), |row| {
+                let entry = Entry::from_sqlite_row(row)?;
+                Ok((entry, split_tag_concat(row.get::<_, Option<String>>(15)?)))
+            })?;
+            rows.collect()
+        })
+        .await
+    }
+
+    /// 列表侧带标签变体（性能优化 W4 / R16）：`list_recent` 的 LEFT JOIN 版本。
+    pub async fn list_recent_with_tags(
+        &self,
+        limit: u32,
+    ) -> SqliteResult<Vec<(Entry, Vec<String>)>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {cols} FROM entries e \
+                 LEFT JOIN tags t ON t.entry_id = e.id \
+                 GROUP BY e.id ORDER BY {order} LIMIT ?1",
+                cols = crate::search::SELECT_COLS_WITH_TAGS,
+                order = crate::search::PIN_ORDER,
+            ))?;
+            let rows = stmt.query_map(params![limit], |row| {
+                let entry = Entry::from_sqlite_row(row)?;
+                Ok((entry, split_tag_concat(row.get::<_, Option<String>>(15)?)))
+            })?;
             rows.collect()
         })
         .await
@@ -404,6 +508,32 @@ impl Storage {
                 params![key, value],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// 一次读取多个 `settings` 键(性能优化 W3 / R11)。
+    ///
+    /// 启动路径(`main::setup`)原本对 4 个键各做一次 `SELECT value FROM settings
+    /// WHERE key = ?`,4 次独立 `block_on` 串行抢同一个 `conn` mutex。这里合并成
+    /// 一条 `WHERE key IN (?, ?, …)`,一次往返一次锁。返回值只含**实际存在**的键;
+    /// 调用方按 `Option<&str>` 处理缺失(与单键 `get_setting` 的 `None` 语义一致)。
+    pub async fn get_settings_batch(
+        &self,
+        keys: &[&str],
+    ) -> SqliteResult<std::collections::HashMap<String, String>> {
+        if keys.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let placeholders = vec!["?"; keys.len()].join(", ");
+        let sql = format!("SELECT key, value FROM settings WHERE key IN ({placeholders})");
+        let owned: Vec<String> = keys.iter().map(|s| (*s).to_string()).collect();
+        self.with_conn(move |conn| {
+            let mut stmt = conn.prepare(&sql)?;
+            let rows = stmt.query_map(rusqlite::params_from_iter(owned.iter()), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?;
+            rows.collect()
         })
         .await
     }
@@ -850,6 +980,327 @@ mod tests {
         assert!(tags.contains(&"tag2".to_string()));
     }
 
+    /// 性能优化 W1 / R5:`update_note_and_tags` 多行 INSERT 走 `json_each`,
+    /// 10 个 tag 应在**单条 SQL**里写完(旧版是 10 条独立 INSERT)。
+    ///
+    /// 这里**不**走 `Storage::update_note_and_tags`:Storage 在
+    /// `Arc<Mutex<Connection>>` 之上包装了一层 `tokio::sync::Mutex`,
+    /// 在外层挂 hook 后再让它进 `with_conn` 会嵌套死锁。
+    /// 直接拿裸 `Connection` 跑等价 SQL,验 SQL 层面的行为(W1 改的就是 SQL)。
+    ///
+    /// 关于**行级 vs. 语句级**计数:rusqlite 0.32 不暴露 `sqlite3_trace_v2`,
+    /// `update_hook` 是行级触发(`Insert` 多行被触发 N 次),两者都无法稳定
+    /// 区分新旧实现。这里采用**两条互补的契约**:
+    ///
+    /// 1. **等价 SQL 的 statement-level 计数**:`tx.execute(sql, params)` 返
+    ///    回值 = `changes()` = 受影响行数。多行 INSERT 一次 `execute()` 应
+    ///    返回 10。10 条独立 INSERT 会每次返回 1,合起来才 10——但 execute()
+    ///    调用次数不同。这里直接断言 `execute()` 返回 10,**且**只调用 1 次。
+    /// 2. **Storage 源码契约**:`Storage::update_note_and_tags` 内部必须用
+    ///    `json_each`,否则仍然是 N 个独立 `tx.execute("INSERT INTO tags")`。
+    ///    静态断言源码里有且仅有 1 处 `INSERT INTO tags` 字面量 —— 这是最直接
+    ///    的「这条改动真的落地了」的合约。
+    #[tokio::test]
+    async fn update_note_and_tags_with_10_tags_uses_json_each() {
+        use rusqlite::{Connection, params};
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        clipvault_core::schema::run_migrations(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO entries (content_hash, content) VALUES ('w1tags', 'hello')",
+            [],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        let tags: Vec<String> = (0..10).map(|i| format!("tag{i}")).collect();
+        let tags_json = serde_json::to_string(&tags).unwrap();
+
+        // 等价 SQL:一条 INSERT 写完所有标签。`tx.execute` 的返回值是受影响行数。
+        let tx = conn.transaction().unwrap();
+        tx.execute("DELETE FROM tags WHERE entry_id = ?1", params![id])
+            .unwrap();
+        let changes = tx
+            .execute(
+                "INSERT INTO tags (entry_id, tag) SELECT ?1, value FROM json_each(?2)",
+                params![id, tags_json],
+            )
+            .unwrap();
+        tx.commit().unwrap();
+
+        assert_eq!(
+            changes, 10,
+            "单条多行 INSERT 必须一次性报 10 行受影响(W1 / R5 合约)"
+        );
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tags WHERE entry_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 10, "10 个标签仍都进了库(语义不变)");
+    }
+
+    /// 性能优化 W1 / R5 的**静态合约**:`Storage::update_note_and_tags` 的实现
+    /// 字面包含 `json_each`,且只有 1 处 `INSERT INTO tags` 字面量。这条对应
+    /// 「改动落地」——读源码能直接看到 `for tag in tags { tx.execute(...) }`
+    /// 的旧路径已消失。
+    #[test]
+    fn update_note_and_tags_source_uses_json_each() {
+        let src = include_str!("storage.rs");
+        // 抓 `pub async fn update_note_and_tags` 函数体:平衡花括号。
+        let start = src
+            .find("pub async fn update_note_and_tags")
+            .expect("找不到 update_note_and_tags 函数");
+        let after_sig = &src[start..];
+        // 找第一个 `{` 之后的整段函数体。
+        let body_start = after_sig
+            .find('{')
+            .map(|idx| idx + start + 1)
+            .expect("找不到 {");
+        // 按 `{` 与 `}` 字节数配对(本函数内部没有字符串字面量含 `}` )。
+        let mut depth: i32 = 1;
+        let mut i = body_start;
+        let bytes = src.as_bytes();
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                _ => {}
+            }
+            i += 1;
+        }
+        let body = &src[body_start..i - 1];
+        assert!(
+            body.contains("json_each"),
+            "update_note_and_tags 必须用 `json_each` 多行 INSERT(W1 / R5)"
+        );
+        let literal_inserts = body.matches("INSERT INTO tags").count();
+        assert_eq!(
+            literal_inserts, 1,
+            "update_note_and_tags 函数体内必须只有 1 处 `INSERT INTO tags` 字面量, \
+             多于 1 即回到旧路径(N 次单 INSERT);实际看到 {literal_inserts}"
+        );
+    }
+
+    /// 性能优化 W1 / R6:`list_recent` 走 `ENTRY_LIST_COLS`,`payload` /
+    /// `payload_nonce` 列用 `NULL AS` 占位——rusqlite 读 `NULL` BLOB
+    /// 为 `None`,不 fetch 真实 BLOB。DTrace/Perf 上的直接观感是
+    /// 30 条 × 平均几 MB payload 从 ~60 MB 一次性 alloc 降到 0。
+    ///
+    /// 这条用例钉住列表侧的契约:`list_recent` 返回的 `Entry::payload`
+    /// 始终是 `None`,即便库里那一行有真实 BLOB。
+    #[tokio::test]
+    async fn list_recent_does_not_fetch_payload_blob() {
+        let db = open_test_db();
+        // 64 KiB 的 BLOB,够大,即便没有 30 条 × 几 MB 那么极端也能看出来
+        // 「读出来不为空」的对照。
+        let big_payload = vec![0xABu8; 64 * 1024];
+        let id = db
+            .insert_entry_binary(
+                "listreclo",
+                "image",
+                Some("image/png"),
+                &big_payload,
+                None,
+                Some(r#"{"width":1,"height":1}"#),
+            )
+            .await
+            .unwrap();
+
+        // 直接 read 一次验证真实 BLOB 写入了。
+        let raw: Vec<u8> = db
+            .with_conn(move |conn| {
+                conn.query_row("SELECT payload FROM entries WHERE id = ?1", [id], |row| {
+                    row.get(0)
+                })
+            })
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), big_payload.len(), "payload 列实际写入了 BLOB");
+
+        // list_recent 走 ENTRY_LIST_COLS,payload 列在 SELECT 层就是
+        // `NULL AS payload`——返回的 Entry.payload 必须恒为 None。
+        let entries = db.list_recent(10).await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].payload.is_none(),
+            "list_recent 走 ENTRY_LIST_COLS, payload 必须为 None（不 fetch BLOB）"
+        );
+        assert!(
+            entries[0].payload_nonce.is_none(),
+            "list_recent payload_nonce 必须为 None"
+        );
+        // 其他字段必须照常读出来——NULL AS 占位只针对 payload/payload_nonce。
+        assert_eq!(entries[0].content_kind, "image");
+        assert_eq!(entries[0].auto_category, "image");
+    }
+
+    /// 性能优化 W4 / R16:`list_recent_with_tags` 用一次 `LEFT JOIN + GROUP_CONCAT`
+    /// 把标签一起带回,有标签的条目给标签、无标签的给空 vec。
+    #[tokio::test]
+    async fn list_recent_with_tags_returns_tags_alongside_entries() {
+        let db = open_test_db();
+        let tagged = db.insert_entry("rt1", "first", "plain").await.unwrap();
+        db.update_note_and_tags(tagged, "", &["alpha".to_string(), "beta".to_string()])
+            .await
+            .unwrap();
+        let untagged = db.insert_entry("rt2", "second", "plain").await.unwrap();
+
+        let rows = db.list_recent_with_tags(10).await.unwrap();
+        assert_eq!(rows.len(), 2, "两条都应返回");
+
+        let (_, tags_of_tagged) = rows
+            .iter()
+            .find(|(e, _)| e.id == tagged)
+            .expect("有标签的条目必须在结果里");
+        assert_eq!(
+            tags_of_tagged,
+            &vec!["alpha".to_string(), "beta".to_string()],
+            "标签必须按 entry_id, tag 顺序一次带回"
+        );
+
+        let (_, tags_of_untagged) = rows
+            .iter()
+            .find(|(e, _)| e.id == untagged)
+            .expect("无标签的条目也必须在结果里");
+        assert!(
+            tags_of_untagged.is_empty(),
+            "LEFT JOIN 下无标签条目的 GROUP_CONCAT 为 NULL,必须解为空 vec"
+        );
+    }
+
+    /// 性能优化 W4 / R16:分隔符必须用 `CHAR(31)`(ASCII Unit Separator)而不是
+    /// 逗号 —— 标签本身可能含逗号,用逗号会把「一个 `a,b` 标签」错拆成
+    /// 「`a` 与 `b` 两个标签」。
+    #[tokio::test]
+    async fn tags_containing_commas_are_not_split_by_the_concat_delimiter() {
+        let db = open_test_db();
+        let id = db.insert_entry("comma", "x", "plain").await.unwrap();
+        db.update_note_and_tags(id, "", &["a,b".to_string(), "c,d".to_string()])
+            .await
+            .unwrap();
+
+        let rows = db.list_recent_with_tags(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].1,
+            vec!["a,b".to_string(), "c,d".to_string()],
+            "含逗号的标签必须原样保留,不被分隔符拆开"
+        );
+    }
+
+    /// 性能优化 W4 / R16:`search_entries_with_tags` 端到端 —— 一次查询把命中
+    /// 条目的标签也带回来。
+    #[tokio::test]
+    async fn search_entries_with_tags_returns_tags_alongside_hits() {
+        let db = open_test_db();
+        let hit = db
+            .insert_entry("st1", "git webhook endpoint", "code")
+            .await
+            .unwrap();
+        db.update_note_and_tags(hit, "", &["workflow".to_string()])
+            .await
+            .unwrap();
+        // 旁观条目:证明返回的标签属于命中条目,而不是「库里任何标签」。
+        let other = db.insert_entry("st2", "unrelated", "plain").await.unwrap();
+        db.update_note_and_tags(other, "", &["other".to_string()])
+            .await
+            .unwrap();
+
+        let plan = crate::search::build_search_query_with_tags(
+            "webhook",
+            &crate::search::parse_tab("all"),
+            10,
+        );
+        let rows = db.search_entries_with_tags(plan).await.unwrap();
+        assert_eq!(rows.len(), 1, "只有一条命中 'webhook'");
+        assert_eq!(rows[0].0.id, hit);
+        assert_eq!(
+            rows[0].1,
+            vec!["workflow".to_string()],
+            "命中条目必须带自己的标签,且不混入旁观条目的标签"
+        );
+    }
+
+    /// 性能优化 W1 / R4:`entries_fts_update` 触发器加了
+    /// `WHEN OLD.is_vault = 0 OR NEW.is_vault = 0`,纯 vault UPDATE
+    /// 不再触发空 DELETE + 空 INSERT。
+    ///
+    /// 这条用例直接从 `sqlite_master` 读触发器 SQL 文本,把契约钉死
+    /// ——「V5 之后这个 trigger 必须有 WHEN」是文档事实,文本是源头。
+    /// vault 不在 `entries_fts` 里(INSERT 触发器 WHEN 已短路),所以
+    /// 端到端的「FTS doc count 不变」无法区分 trigger 是否真生效;
+    /// 但「trigger 字符串里没有 WHEN」就能稳定地被打回去。
+    #[tokio::test]
+    async fn entries_fts_update_trigger_has_when_clause_to_skip_pure_vault_updates() {
+        use rusqlite::Connection;
+
+        let conn = Connection::open_in_memory().unwrap();
+        clipvault_core::schema::run_migrations(&conn).unwrap();
+
+        let trigger_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type='trigger' AND name='entries_fts_update'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            trigger_sql.contains("WHEN"),
+            "entries_fts_update 必须有 WHEN, 没有的话纯 vault UPDATE \
+             (pin toggle / verify_decryptable / set_vault_flag / encrypt_into_vault) \
+             都会空 DELETE + 空 INSERT —— 是 W1 / R4 要修掉的开销"
+        );
+    }
+
+    /// W3 / R11:`get_settings_batch` 一次读多个键,只返回实际存在的键。
+    ///
+    /// `main::setup` 原路径对 4 个键各做一次 `SELECT value FROM settings WHERE
+    /// key = ?`,4 次独立 `block_on` 串行抢同一把 `conn` mutex。改由这里一次
+    /// 往返;因此「缺键不在 map」与「多键一次读」两条语义都必须在测试里钉死:
+    /// 前者决定调用方要用 `Option<&str>` 处理缺键,后者是 R11 本身的收益。
+    #[tokio::test]
+    async fn get_settings_batch_reads_several_keys_and_omits_missing() {
+        let db = open_test_db();
+        db.set_setting("guest_mode", "1").await.unwrap();
+        db.set_setting("panel_opacity", "78").await.unwrap();
+        db.set_setting("hotkeys", r#"{"all":[]}"#).await.unwrap();
+        // `log_level` 故意不设 —— 启动路径上「用户没设过」是常见状态。
+
+        let batch = db
+            .get_settings_batch(&["guest_mode", "panel_opacity", "hotkeys", "log_level"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            batch.len(),
+            3,
+            "读了 3 个存在的键;缺失的 log_level 不在 map"
+        );
+        assert_eq!(batch.get("guest_mode").map(String::as_str), Some("1"));
+        assert_eq!(batch.get("panel_opacity").map(String::as_str), Some("78"));
+        assert_eq!(
+            batch.get("hotkeys").map(String::as_str),
+            Some(r#"{"all":[]}"#)
+        );
+        assert!(
+            !batch.contains_key("log_level"),
+            "缺失键必须不在 map 里(调用方用 Option<&str> 处理)"
+        );
+    }
+
+    /// `get_settings_batch` 空输入不进 SQL(`WHERE key IN ()` 是非法语法)。
+    #[tokio::test]
+    async fn get_settings_batch_with_empty_keys_returns_empty_map() {
+        let db = open_test_db();
+        let batch = db.get_settings_batch(&[]).await.unwrap();
+        assert!(batch.is_empty(), "空 keys 应直接返回空 map, 不构造非法 SQL");
+    }
+
     /// 删除单条：条目行消失、它的标签行同时清掉（连接没开 `PRAGMA foreign_keys`，
     /// `ON DELETE CASCADE` 不生效，必须显式删）、FTS 索引由触发器同步移除。
     #[tokio::test]
@@ -1188,7 +1639,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 4);
+        assert_eq!(uv, 5, "schema 已到 V5, 旧断言 4 与之一致更新");
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn

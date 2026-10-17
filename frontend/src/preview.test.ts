@@ -391,3 +391,73 @@ describe("IPC 失败", () => {
     expect(pane.innerHTML).not.toContain("&amp;lt;");
   });
 });
+
+// ---------------------------------------------------------------------------
+// 图片固有尺寸（W5 / R21）
+// ---------------------------------------------------------------------------
+//
+// 后端 `PreviewDto` 带解码后的真实像素宽高。写进 `<img width height>` 后，
+// 浏览器在图片字节到达前就能按正确比例预留空间，消除「正在加载图片…」→
+// `<img>` 切换时栏内的布局抖动（CLS）。两条边界都要钉：缺尺寸时不能写
+// `width="null"` / `width="0"`；缓存命中路径也必须带上尺寸。
+
+describe("图片 <img> 的固有尺寸属性", () => {
+  const imageDtoWith = (width: number | null, height: number | null) => ({
+    kind: "image",
+    mime: "image/png",
+    data_url: "data:image/png;base64,AAAA",
+    content: null,
+    width,
+    height,
+    undecryptable: false,
+  });
+
+  it("把后端给的宽高写进 width/height 属性", async () => {
+    const { mod, pane } = await freshPreview((cmd) =>
+      cmd === "get_entry_preview" ? imageDtoWith(800, 600) : undefined,
+    );
+    mod.openPreview(entry({ id: 1, content_kind: "image" }));
+    await flush();
+    expect(pane.innerHTML).toContain("<img");
+    expect(pane.innerHTML).toContain('width="800"');
+    expect(pane.innerHTML).toContain('height="600"');
+  });
+
+  it("宽高缺失时不写属性（不冒出 width=\"null\" / width=\"0\"）", async () => {
+    const { mod, pane } = await freshPreview((cmd) =>
+      cmd === "get_entry_preview" ? imageDtoWith(null, null) : undefined,
+    );
+    mod.openPreview(entry({ id: 1, content_kind: "image" }));
+    await flush();
+    expect(pane.innerHTML).toContain("<img");
+    expect(pane.innerHTML).not.toContain("width=");
+    expect(pane.innerHTML).not.toContain("height=");
+  });
+
+  it("宽高为 0 时不写属性（0 不是有意义的尺寸）", async () => {
+    const { mod, pane } = await freshPreview((cmd) =>
+      cmd === "get_entry_preview" ? imageDtoWith(0, 0) : undefined,
+    );
+    mod.openPreview(entry({ id: 1, content_kind: "image" }));
+    await flush();
+    expect(pane.innerHTML).toContain("<img");
+    expect(pane.innerHTML).not.toContain('width="0"');
+    expect(pane.innerHTML).not.toContain('height="0"');
+  });
+
+  it("缓存命中路径同样带固有尺寸（第二次打开不再打 IPC，但属性仍在）", async () => {
+    // 缓存现在存 `{ url, width, height }`（W5 / R21 的一部分）：命中缓存时
+    // 也要能把尺寸写回 `<img>`，否则命中路径缺了这两个数字、布局仍会抖。
+    const { mod, pane, calls } = await freshPreview((cmd) =>
+      cmd === "get_entry_preview" ? imageDtoWith(20, 30) : undefined,
+    );
+    const e = entry({ id: 1, content_kind: "image" });
+    mod.openPreview(e);
+    await flush();
+    await mod.closePreview();
+    mod.openPreview(e);
+    expect(previewCalls(calls).length, "第二次打开应命中缓存、不再打 IPC").toBe(1);
+    expect(pane.innerHTML).toContain('width="20"');
+    expect(pane.innerHTML).toContain('height="30"');
+  });
+});
