@@ -316,7 +316,6 @@ async function load(preferId?: number): Promise<void> {
       }
       paintEntries();
       scrollToSelected();
-      // 列表整体换过（搜索 / 切 tab / 置顶重排 / 删除）：栏里那条可能已经不在选中位上。
       syncPreview();
     }
   } catch (e) {
@@ -446,7 +445,6 @@ function moveSelection(delta: number): void {
   syncPreview();
 }
 
-/** 选中变了 → 预览栏跟着换内容（R3）。栏没开时是空转。 */
 function syncPreview(): void {
   updatePreviewForSelection(currentEntry());
 }

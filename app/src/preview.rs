@@ -79,42 +79,33 @@ impl PreviewDto {
     }
 
     /// 加密区条目解不开：**不带任何内容**，只报「无法解密」。
-    fn undecryptable(kind: &str) -> Self {
+    fn undecryptable(kind: ContentKind) -> Self {
         Self {
-            kind: kind.to_string(),
-            mime: None,
-            data_url: None,
-            content: None,
-            width: None,
-            height: None,
+            kind: kind.as_str().to_string(),
             undecryptable: true,
+            ..Self::none()
         }
     }
 
     fn image(img: &PreviewImage) -> Self {
         Self {
-            kind: "image".to_string(),
+            kind: ContentKind::Image.as_str().to_string(),
             mime: Some("image/png".to_string()),
             data_url: Some(format!(
                 "data:image/png;base64,{}",
                 STANDARD.encode(&img.png)
             )),
-            content: None,
             width: Some(img.width),
             height: Some(img.height),
-            undecryptable: false,
+            ..Self::none()
         }
     }
 
     fn text(content: String) -> Self {
         Self {
-            kind: "text".to_string(),
-            mime: None,
-            data_url: None,
+            kind: ContentKind::Text.as_str().to_string(),
             content: Some(content),
-            width: None,
-            height: None,
-            undecryptable: false,
+            ..Self::none()
         }
     }
 }
@@ -195,47 +186,44 @@ pub async fn get_entry_preview_inner(
     match ContentKind::parse(&entry.content_kind) {
         ContentKind::Image => {
             if locked {
-                return Ok(PreviewDto::undecryptable("image"));
+                return Ok(PreviewDto::undecryptable(ContentKind::Image));
             }
-            let raw = entry.payload.clone().unwrap_or_default();
-            let bytes = if entry.is_vault {
-                match crate::pasteback::decrypt_payload(
-                    &entry,
-                    &raw,
-                    entry.payload_nonce.as_deref(),
-                    decryptor,
-                ) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return Ok(PreviewDto::undecryptable("image")),
+            // 非 vault 条目 `decrypt_payload` 原样返回 payload —— 与
+            // `pasteback::perform_paste` 传的是同一种入参，不必在这里先分一次叉。
+            let raw: &[u8] = entry.payload.as_deref().unwrap_or_default();
+            match crate::pasteback::decrypt_payload(
+                &entry,
+                raw,
+                entry.payload_nonce.as_deref(),
+                decryptor,
+            ) {
+                Ok(bytes) => {
+                    let img = make_preview_image(&bytes, PREVIEW_MAX_DIM)
+                        .ok_or_else(|| format!("entry {id} 的图片数据无法解码"))?;
+                    Ok(PreviewDto::image(&img))
                 }
-            } else {
-                raw
-            };
-            let img = make_preview_image(&bytes, PREVIEW_MAX_DIM)
-                .ok_or_else(|| format!("entry {id} 的图片数据无法解码"))?;
-            Ok(PreviewDto::image(&img))
+                Err(_) => Ok(PreviewDto::undecryptable(ContentKind::Image)),
+            }
         }
         ContentKind::Text => {
             if locked {
-                return Ok(PreviewDto::undecryptable("text"));
+                return Ok(PreviewDto::undecryptable(ContentKind::Text));
             }
-            let text = if entry.is_vault {
-                // 文本密文的 nonce 在 `nonce` 列（`payload_nonce` 只保护 binary payload），
-                // 与 `commands::paste_entry` 取的是同一份。
-                let nonce = storage
+            // 文本密文的 nonce 在 `nonce` 列（`payload_nonce` 只保护 binary payload），
+            // 与 `commands::paste_entry` 取的是同一份。明文条目不必去读它。
+            let nonce = if entry.is_vault {
+                storage
                     .get_vault_nonce(id)
                     .await
-                    .map_err(|e| e.to_string())?;
-                match crate::pasteback::decrypt_content(&entry, nonce.as_deref(), decryptor) {
-                    Ok(text) => text,
-                    Err(_) => return Ok(PreviewDto::undecryptable("text")),
-                }
+                    .map_err(|e| e.to_string())?
             } else {
-                entry.content.clone()
+                None
             };
-            Ok(PreviewDto::text(text))
+            match crate::pasteback::decrypt_content(&entry, nonce.as_deref(), decryptor) {
+                Ok(text) => Ok(PreviewDto::text(text)),
+                Err(_) => Ok(PreviewDto::undecryptable(ContentKind::Text)),
+            }
         }
-        // file / rtf / color：本轮不做 Quick Look，前端只显示一句提示。
         _ => Ok(PreviewDto::none()),
     }
 }

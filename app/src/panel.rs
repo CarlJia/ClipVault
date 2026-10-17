@@ -257,7 +257,7 @@ pub(crate) fn expanded_origin(
         return Point { x: flipped, y };
     }
     Point {
-        x: work.x + ((work.w - w) / 2.0).max(0.0),
+        x: work.x + centered_offset(work, size).0,
         y,
     }
 }
@@ -279,6 +279,17 @@ fn remember_restore_origin(origin: (f64, f64)) {
 /// 取走「展开前」的位置（取一次即清空）。收回时调用。
 fn take_restore_origin() -> Option<(f64, f64)> {
     RESTORE_ORIGIN.lock().ok().and_then(|mut slot| slot.take())
+}
+
+/// 逻辑尺寸 → `set_size`（Tauri 内部按窗口 `scale_factor` 换算成物理像素）。
+///
+/// 两个平台适配层共用同一份：它不含平台语义，失败也只在日志里留痕。其余平台走
+/// [`set_mode`] 里的内联分支（那里连日志文案都不同），故在此门控掉。
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn set_size(window: &tauri::WebviewWindow, size: (f64, f64)) {
+    if let Err(e) = window.set_size(tauri::LogicalSize::new(size.0, size.1)) {
+        ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
+    }
 }
 
 /// 切换面板尺寸档位：先设尺寸，再按平台落位（macOS 见 [`imp_macos`]，Windows 见
@@ -419,7 +430,7 @@ mod imp_macos {
     use super::{
         Display, FocusSource, PanelMode, Point, Rect, appkit_frame_origin, centered_offset,
         expanded_origin, fitted_size, focused_source, log_skip_once, panel_size_for,
-        select_display, take_restore_origin,
+        select_display, set_size, take_restore_origin,
     };
 
     /// 面板的 NSWindow（`tauri::WebviewWindow::ns_window` 的稳定逃生口）。
@@ -575,13 +586,6 @@ mod imp_macos {
     fn set_size_only(window: &tauri::WebviewWindow, mode: PanelMode) {
         set_size(window, panel_size_for(mode));
     }
-
-    /// `set_size` 的失败只在日志里留痕：尺寸没变不影响面板可用。
-    fn set_size(window: &tauri::WebviewWindow, size: (f64, f64)) {
-        if let Err(e) = window.set_size(tauri::LogicalSize::new(size.0, size.1)) {
-            ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
-        }
-    }
 }
 
 /// Windows 定位适配层（U3）：全程**物理像素**，落位用 `set_position(PhysicalPosition)`。
@@ -608,7 +612,7 @@ mod imp_win {
 
     use super::{
         Display, FocusSource, PanelMode, Point, Rect, centered_offset, expanded_origin,
-        fitted_size, focused_source, log_skip_once, panel_size_for, select_display,
+        fitted_size, focused_source, log_skip_once, panel_size_for, select_display, set_size,
         take_restore_origin,
     };
 
@@ -688,18 +692,21 @@ mod imp_win {
         }
     }
 
-    /// 定位面板并在目标工作区内居中。
-    pub(super) fn place(window: &tauri::WebviewWindow) {
+    /// 目标显示器：`(scale_factor, 工作区)`，全程物理像素。`None` = 取不到，调用方
+    /// 各自走降级。
+    ///
+    /// 前台窗口 → 进程号 → 自指判定（R2 / R2a）；前台是别的应用时用前台窗口矩形，
+    /// 是 ClipVault 自己（托盘菜单弹出 / 面板已持焦点）或取不到进程号时退到鼠标屏。
+    ///
+    /// 判据选中的下标与 `monitors` 一一对应（两者同序同长），直接取该块：不用
+    /// `monitor_from_point` 再问一次系统——那条路要投递到事件循环并阻塞等应答，
+    /// 而调用方跑在热键消息泵线程上，多一次往返只会拖慢热键响应，结果却与直接索引
+    /// 完全相同。两个输入都取不到（`select_display` 为 `None`）时回退主屏（R3）。
+    fn target_display(window: &tauri::WebviewWindow) -> Option<(f64, Rect)> {
         // 取不到显示器列表与列表为空走同一条降级路径，故一并判定。
-        let monitors = window.available_monitors().unwrap_or_default();
-        if monitors.is_empty() {
-            log_skip_once("no-monitors", "取不到显示器列表，保留面板原位置");
-            return;
-        }
+        let monitors = window.available_monitors().ok().filter(|m| !m.is_empty())?;
         let displays: Vec<Display> = monitors.iter().map(display_of).collect();
 
-        // 前台窗口 → 进程号 → 自指判定（R2 / R2a）。前台是别的应用时用前台窗口矩形，
-        // 是 ClipVault 自己（托盘菜单弹出 / 面板已持焦点）或取不到进程号时退到鼠标屏。
         let self_pid = std::process::id() as i32;
         let front = foreground_window();
         let front_pid = front.and_then(window_process_id);
@@ -709,13 +716,7 @@ mod imp_win {
             FocusSource::Cursor => None,
         };
 
-        let selected = select_display(focused, cursor, &displays);
-
-        // 目标显示器：判据选中的下标与 `monitors` 一一对应（两者同序同长），直接取该块。
-        // 不用 `monitor_from_point` 再问一次系统：那条路要投递到事件循环并阻塞等应答，
-        // 而本函数跑在热键消息泵线程上，多一次往返只会拖慢热键响应，结果却与直接索引
-        // 完全相同。两个输入都取不到（`selected` 为 `None`）时回退主屏（R3）。
-        let target = match selected {
+        match select_display(focused, cursor, &displays) {
             Some(i) => monitors
                 .get(i)
                 .map(|m| (m.scale_factor(), displays[i].work)),
@@ -724,9 +725,16 @@ mod imp_win {
                 .ok()
                 .flatten()
                 .map(|m| (m.scale_factor(), display_of(&m).work)),
-        };
-        let Some((scale, work)) = target else {
-            log_skip_once("no-display", "解析不出目标显示器，保留面板原位置");
+        }
+    }
+
+    /// 定位面板并在目标工作区内居中。
+    pub(super) fn place(window: &tauri::WebviewWindow) {
+        let Some((scale, work)) = target_display(window) else {
+            log_skip_once(
+                "no-display",
+                "取不到显示器列表 / 解析不出目标显示器，保留面板原位置",
+            );
             return;
         };
 
@@ -747,32 +755,11 @@ mod imp_win {
     /// 切换尺寸档位（U2 / R1 / R4）。本适配层跑在热键消息泵线程上，只用线程安全的
     /// Tauri API；坐标全程**物理像素**（与 [`place`] 同一套）。
     pub(super) fn apply_mode(window: &tauri::WebviewWindow, mode: PanelMode) {
-        let monitors = window.available_monitors().unwrap_or_default();
-        if monitors.is_empty() {
-            log_skip_once("mode-no-monitors", "取不到显示器列表，只改物理尺寸不改位置");
-            set_size_only(window, mode);
-            return;
-        }
-        let displays: Vec<Display> = monitors.iter().map(display_of).collect();
-        let self_pid = std::process::id() as i32;
-        let front = foreground_window();
-        let cursor = cursor_point();
-        let focused = match focused_source(front.and_then(window_process_id), self_pid) {
-            FocusSource::Frontmost => front.and_then(window_rect),
-            FocusSource::Cursor => None,
-        };
-        let target = match select_display(focused, cursor, &displays) {
-            Some(i) => monitors
-                .get(i)
-                .map(|m| (m.scale_factor(), displays[i].work)),
-            None => window
-                .primary_monitor()
-                .ok()
-                .flatten()
-                .map(|m| (m.scale_factor(), display_of(&m).work)),
-        };
-        let Some((scale, work)) = target else {
-            log_skip_once("mode-no-display", "解析不出目标显示器，只改尺寸不改位置");
+        let Some((scale, work)) = target_display(window) else {
+            log_skip_once(
+                "mode-no-display",
+                "取不到显示器列表 / 解析不出目标显示器，只改尺寸不改位置",
+            );
             set_size_only(window, mode);
             return;
         };
@@ -797,8 +784,9 @@ mod imp_win {
                 }
             }
             PanelMode::Expanded => {
-                let cur = window
-                    .outer_position()
+                // 位置只问系统一次：`cur` 与「展开前位置」必须来自同一次读数。
+                let pos = window.outer_position().ok();
+                let cur = pos
                     .map(|p| Point {
                         x: f64::from(p.x) / scale,
                         y: f64::from(p.y) / scale,
@@ -807,8 +795,8 @@ mod imp_win {
                         x: work_logical.x,
                         y: work_logical.y,
                     });
-                if let Ok(pos) = window.outer_position() {
-                    super::remember_restore_origin((f64::from(pos.x), f64::from(pos.y)));
+                if let Some(p) = pos {
+                    super::remember_restore_origin((f64::from(p.x), f64::from(p.y)));
                 }
                 let origin =
                     expanded_origin(cur, work_logical, size, panel_size_for(PanelMode::Normal));
@@ -833,13 +821,6 @@ mod imp_win {
             (w * scale).round() as u32,
             (h * scale).round() as u32,
         )) {
-            ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
-        }
-    }
-
-    /// 逻辑尺寸 → `set_size`（Tauri 内部按窗口 `scale_factor` 换算成物理像素）。
-    fn set_size(window: &tauri::WebviewWindow, size: (f64, f64)) {
-        if let Err(e) = window.set_size(tauri::LogicalSize::new(size.0, size.1)) {
             ::log::warn!(target: "panel", "set_panel_mode 设置尺寸失败：{e}");
         }
     }

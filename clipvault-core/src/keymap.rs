@@ -623,14 +623,9 @@ mod tests {
             all_actions().len(),
             "默认映射出现了变体清单之外的条目"
         );
-        // 变体数（列表旁预览栏 plan U5 / KTD8）：三处基数一起迁移到 15。
         assert_eq!(all_actions().len(), 15, "动作数必须是 15");
     }
 
-    /// `preview` 的默认绑定钉在**单按 Space**（plan KTD2 / R8）。
-    ///
-    /// 它是「列表旁预览栏」的唯一键盘入口；改成了带修饰键的组合，用户就得先学会
-    /// 一个新键才能看到内容 —— 而 MVP plan 的关键流程第 3 步承诺的就是 Space。
     #[test]
     fn default_preview_is_space() {
         let map = HotkeyMap::default_map();

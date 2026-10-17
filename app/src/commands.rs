@@ -15,14 +15,9 @@ use rusqlite::Result as SqliteResult;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
+use crate::preview::PreviewDto;
 use crate::storage::Storage;
 use crate::tray::{self, TrayState};
-
-/// 预览栏的数据契约（列表旁预览栏 plan U1）。
-///
-/// 定义在 [`crate::preview`]（与缩放 / 解密逻辑同处），这里只把它带到命令层，
-/// 让「命令与其 DTO 放在一起」的既有读法在 `commands.rs` 里仍然成立。
-pub use crate::preview::PreviewDto;
 
 /// 进程内共享状态：存储句柄 + 与 watcher 共享的两个原子开关。
 ///
@@ -872,10 +867,6 @@ pub async fn reset_hotkeys(state: State<'_, AppState>) -> Result<(), String> {
 // ----------------------------------------------------------------
 
 /// 取一条条目的预览数据（图片按预览尺寸缩放 / 文本给全文 / 其它给 `none`）。
-///
-/// 为什么单独一条命令而不是复用 `search_results` 的 DTO：列表里的 `content`
-/// 对加密区条目是**空**的（密文不下发），图片更是只有 64×64 缩略图。预览需要
-/// 的是「这一条的原内容」，按需取一次即可 —— 为它给整个列表多带一份原图是大浪费。
 ///
 /// 错误语义（R5）：id 不存在、图片解不开 → `Err(String)`；「条目在、但这个类型
 /// 没有预览」→ `Ok(kind = "none")`。两种情形前端表现不同（前者 toast，后者显示提示）。

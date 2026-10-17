@@ -671,24 +671,11 @@ export function textFieldOwnsDeleteKey(target: EventTarget | null): boolean {
  * 而 `preview` 的默认键就是单按 Space。不加判据的话，用户想查 `foo bar` 时中间那个
  * 空格会被吞掉并弹出一个预览栏。
  *
- * 判据与 [`textFieldOwnsDeleteKey`] 同形（同一类「原生动作此刻有没有事可做」）：
- * - `<input>` / `<textarea>`：**里面有内容**才让位（空查询时原生只会打出一个没有
- *   意义的空格，此时 Space 用来开预览栏更符合直觉）；
- * - contenteditable：没法便宜地判断空不空，保守让位。
+ * 判据与 [`textFieldOwnsDeleteKey`] 完全一致（同一类「原生动作此刻有没有事可做」），
+ * 故直接复用；两个名字各自存在，只是为了让调用点读得出「这一次是谁在让位」。
  */
 export function textFieldOwnsSpace(target: EventTarget | null): boolean {
-  const el = target as (Partial<HTMLElement> & { type?: string; value?: string }) | null;
-  switch (el?.tagName?.toUpperCase()) {
-    case "TEXTAREA":
-      return (el.value ?? "").length > 0;
-    case "INPUT": {
-      const type = (el.type ?? "text").toLowerCase();
-      if (NON_TEXT_INPUT_TYPES.has(type)) return false;
-      return (el.value ?? "").length > 0;
-    }
-    default:
-      return el?.isContentEditable === true;
-  }
+  return textFieldOwnsDeleteKey(target);
 }
 
 // ---------------------------------------------------------------------------

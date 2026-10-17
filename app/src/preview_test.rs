@@ -335,7 +335,7 @@ impl Decryptor for PanickingDecryptor {
     }
 }
 
-/// `mock_cipher` 同时是 `Encryptor`：这里显式用一次，免得「测试只测了解密那一半」。
+/// `mock_cipher` 同时是 `Encryptor`：这里显式用一次。
 #[tokio::test]
 async fn mock_cipher_roundtrips_through_the_storage_columns() {
     let db = open_test_db();
@@ -387,8 +387,6 @@ fn plain_entry_stub() -> clipvault_core::Entry {
     }
 }
 
-/// `Storage` 只在这个文件里用作类型锚点（`open_test_db` 的返回值），
-/// 用它把「测试没有真的连一个文件库」这件事钉住。
 #[test]
 fn test_db_is_in_memory() {
     let db: Storage = open_test_db();

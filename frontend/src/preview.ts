@@ -38,6 +38,9 @@ export interface PreviewDto {
 /** 预览栏的 `<aside>`（`index.html` 的 `#preview`）。由 `main.ts` 在启动时注入。 */
 let pane: HTMLElement | null = null;
 
+/** 加密区解不开时栏里那句话（两条路径共用：前端已知解不开 / 后端回 `undecryptable`）。 */
+const UNDECRYPTABLE_HINT = "🔒 无法解密";
+
 /** 当前是否展开。 */
 let open = false;
 /** 栏内正在展示的条目 id；`null` 表示没有（栏关闭或列表空）。 */
@@ -51,6 +54,18 @@ let currentId: number | null = null;
  * 过期的图。
  */
 const imageCache = new Map<number, string>();
+
+/** 缓存条数上限：单条 data URL 可达数 MB，面板长时间开着不能无限攒。 */
+const IMAGE_CACHE_LIMIT = 16;
+
+/** 写缓存并按 FIFO 淘汰最旧的一条（`Map` 的迭代顺序就是插入顺序）。 */
+function cacheImage(id: number, url: string): void {
+  imageCache.delete(id);
+  imageCache.set(id, url);
+  if (imageCache.size <= IMAGE_CACHE_LIMIT) return;
+  const oldest = imageCache.keys().next().value;
+  if (oldest !== undefined) imageCache.delete(oldest);
+}
 
 /** 绑定 DOM 节点。重复调用是幂等的（HMR 重载时不会留下两个引用）。 */
 export function bindPreviewPane(el: HTMLElement): void {
@@ -102,7 +117,7 @@ export async function closePreview(): Promise<void> {
   if (!open) return;
   open = false;
   currentId = null;
-  paint('<div class="preview-hint">无预览</div>', "none");
+  paint(hintHtml("无预览"), "none");
   pane?.classList.add("hidden");
   await setPanelMode("normal");
 }
@@ -154,7 +169,7 @@ function renderEntry(entry: EntryDto): void {
   const kind = entry.content_kind ?? "text";
   // 加密区条目已知解不开：不必再跑一次 IPC（后端也会拒），直接说结果。
   if (entry.is_vault && !entry.is_decryptable) {
-    paint(hintHtml("🔒 无法解密"), kind);
+    paint(hintHtml(UNDECRYPTABLE_HINT), kind);
     return;
   }
   switch (kind) {
@@ -198,10 +213,12 @@ async function loadPreview(entry: EntryDto): Promise<void> {
   const id = entry.id;
   try {
     const dto = await invoke<PreviewDto>("get_entry_preview", { id });
+    const image = dto.kind === "image" ? dto.data_url : null;
+    // 先入缓存再判「还是不是这一条」：迟到的响应也得留下，否则再转回来还要重解码一次。
+    if (image) cacheImage(id, image);
     if (!isCurrent(id)) return;
-    if (dto.kind === "image" && dto.data_url) {
-      imageCache.set(id, dto.data_url);
-      paint(imageHtml(dto.data_url), "image");
+    if (image) {
+      paint(imageHtml(image), "image");
       return;
     }
     if (dto.kind === "text" && dto.content !== null) {
@@ -209,7 +226,7 @@ async function loadPreview(entry: EntryDto): Promise<void> {
       return;
     }
     if (dto.undecryptable) {
-      paint(hintHtml("🔒 无法解密"), dto.kind);
+      paint(hintHtml(UNDECRYPTABLE_HINT), dto.kind);
       return;
     }
     paint(hintHtml("无预览"), dto.kind);
