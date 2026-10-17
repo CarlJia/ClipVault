@@ -187,12 +187,45 @@ body {
   color: var(--muted);
 }
 
-/* Tab 栏 */
-.tabs {
+/* Tab 栏 + 右端设置入口（`index.html` 的 `.tabs-row`）。
+   行框（内边距 / 下边框）由 `.tabs-row` 承担，`.tabs` 只留 tab 排布 —— 否则两个
+   兄弟节点各带一条 `border-bottom`，会画成双线。`.tabs` 占满剩余宽度（flex:1），
+   齿轮被自然顶到最右；`margin-left: auto` 是兜底（`.tabs` 若因故不伸缩仍靠右）。 */
+.tabs-row {
   display: flex;
-  gap: 4px;
+  align-items: center;
+  gap: 6px;
   padding: 8px 12px;
   border-bottom: 1px solid var(--border);
+}
+.tabs {
+  display: flex;
+  flex: 1;
+  gap: 4px;
+}
+/* 设置入口：24×24 命中区 ≈ tab 按钮高度（13px 字号 + 4px 内边距），
+   与 tab 行居中对齐；默认 muted、hover 变主文本色 + 浅底，与 `.tab` 的 hover 一致。 */
+.tabs-action {
+  flex: none;
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.tabs-action:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+.tabs-action svg {
+  display: block;
 }
 .tab {
   border: none;

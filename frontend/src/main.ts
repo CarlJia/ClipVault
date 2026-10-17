@@ -113,6 +113,9 @@ let vaultSelectedEl: HTMLElement | null = null;
 // 设置模态元素（U12）。⌘, 唤出,托盘菜单也可触发。
 const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
 const settingsCloseEl = document.querySelector<HTMLButtonElement>("#settings-close")!;
+// Tab 行右端的设置入口（齿轮）。与 ⌘, / 托盘「设置…」走同一条 openSettings 路径，
+// 只是把入口摆到面板上看得见的地方。它不在 #tabs 里，故不受 renderTabs() 重画影响。
+const settingsOpenEl = document.querySelector<HTMLButtonElement>("#settings-open")!;
 const opacityEl = document.querySelector<HTMLInputElement>("#settings-opacity")!;
 const opacityValueEl = document.querySelector<HTMLSpanElement>("#settings-opacity-value")!;
 // 设置卡片内容区（透明度字段 + 快捷键区块）。超长时在此滚动，标题栏与底部提示
@@ -676,6 +679,10 @@ function closeSettings(): void {
 }
 
 settingsCloseEl.addEventListener("click", closeSettings);
+// 齿轮入口：点它等同 ⌘, / 托盘「设置…」。
+settingsOpenEl.addEventListener("click", () => {
+  void openSettings();
+});
 // `input` 事件即时改 CSS 变量 + 文本预览；`change` 事件再写库，
 // 避免拖动过程产生数十次 IPC。
 opacityEl.addEventListener("input", () => {
@@ -885,6 +892,9 @@ void getPanelOpacity().then(applyPanelOpacity);
 // `initPlatform()` 同时会遍历改写 `<kbd>` 键帽；三个 refresh 函数内部也会
 // `await whenPlatformReady()`，所以后续的 focus 路径同样安全。
 void initPlatform().then(() => {
+  // 齿轮入口的 hover 提示含键帽，`localizeKeycaps()` 只改写 `<kbd>`（静态 title 里的
+  // `⌘,` 在 Windows 上会留着 ⌘ 字形），故等平台标识就绪后由这里写入。
+  settingsOpenEl.title = `设置 ${keys("⌘,")}`;
   void refreshAccessibilityBanner(bannerEl);
   void refreshKeychainBanner(vaultBannerEl);
   void refreshGuestNotice();
