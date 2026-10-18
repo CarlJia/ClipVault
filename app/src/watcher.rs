@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
@@ -368,18 +368,53 @@ impl Watcher {
             Err(rusqlite::Error::SqliteFailure(e, _))
                 if e.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                // content_hash UNIQUE 冲突:该指纹此前已入库,视为重复,不入库
-                // (MVP plan「重复指纹去重(content_hash UNIQUE 触发冲突 → 视为同条)」)。
-                // 级别取 verbose(debug!)而非 WARN:这是**设计内的常见路径** —— 同一份内容
-                // 隔一会儿再复制一次很常见,in-process 的 5 秒去重窗口拦不住,库里那行还在,
-                // 于是由 `content_hash` UNIQUE 拦下。日志在设置面板里给用户看,每次都留一条
-                // WARN 会被读成故障(实测就是这样被报回来的)。
-                // 仍要留痕的理由:指纹算法一旦退化(如 binary 分支曾漏掉 payload,让同 kind
-                // 的所有内容共用一个指纹),真正的「重复」与「被误判为重复而丢弃的新内容」
-                // 在代码里完全无法区分,只有 verbose 日志能事后分辨。
-                // 打 `e` 而不是写死「duplicate content_hash」:这个分支按错误码匹配,将来
-                // 加了别的约束(NOT NULL / CHECK)进来时,日志会自己说明是哪个约束。
-                // 文案由 `duplicate_fingerprint_log` 组装(格式与 KTD4 的指纹截断有单测)。
+                // content_hash UNIQUE 冲突:该指纹此前已入库,**把已有行刷到顶**
+                // 而不是悄悄丢掉 ——「再次复制应在列表顶端」是用户对剪贴板历史
+                // 的标准期望(Alfred / 1Password / Raycast 都是这形态),悄悄丢
+                // 掉会导致用户在长历史里找不到刚才复制的内容。
+                //
+                // 我们选 `bump_to_top_by_content_hash`:只刷 `created_at`,
+                // 其余字段(`is_pinned` / `pinned_at` / 用户手动写的 note / tags
+                // / payload / metadata_json)全部不动 —— 复制语义不能改写用户状
+                // 态。`PIN_ORDER` = `is_pinned DESC, pinned_at DESC, created_at
+                // DESC`,刷新 `created_at` 后该行重新排到非 pinned 组的最顶;
+                // 若已 pinned,该行在 pinned 组内的位置由 `pinned_at` 决定,
+                // 刷新不改变组内顺序 —— 保留 pin 用户的意图。
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("system clock before UNIX epoch")
+                    .as_secs() as i64;
+                match self
+                    .storage
+                    .bump_to_top_by_content_hash(&hash, now_unix)
+                    .await
+                {
+                    Ok(1) => {
+                        ::log::debug!(
+                            target: "watcher::capture",
+                            "[capture] bumped existing entry to top (duplicate fingerprint, hash {}..)",
+                            hash.chars().take(LOG_HASH_PREFIX_LEN).collect::<String>()
+                        );
+                    }
+                    Ok(n) => {
+                        // 期望是 1,得到 0 / >1 都违反 UNIQUE 前提,值得 WARN。
+                        ::log::warn!(
+                            target: "watcher::capture",
+                            "[capture] UNIQUE conflict but bump affected {n} rows (hash {})",
+                            hash
+                        );
+                    }
+                    Err(e) => {
+                        ::log::error!(
+                            target: "watcher::capture",
+                            "[capture] bump_to_top failed after UNIQUE conflict: {e}"
+                        );
+                    }
+                }
+                // 仍保留 `duplicate_fingerprint_log` 这条线索 —— 即便分支不
+                // 再"丢",UNIQUE 撞到本身就值得在 verbose 里留痕,未来指纹算法
+                // 退化时仍能从日志分辨(同 commit message 的"W3 取消语义丢失"
+                // 段同理)。
                 ::log::debug!(
                     target: "watcher::capture",
                     "{}",

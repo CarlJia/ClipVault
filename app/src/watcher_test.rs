@@ -197,31 +197,61 @@ fn duplicate_fingerprint_log_keeps_prefix_and_truncates_hash() {
 }
 
 #[tokio::test]
-async fn process_swallows_duplicate_fingerprint_already_in_db() {
+async fn process_bumps_existing_entry_to_top_on_re_capture() {
     // 库层去重:换一个 Watcher(内存里没有指纹)再捕获同一内容,必然绕过 5 秒窗口去重、
-    // 走到 `content_hash` UNIQUE 冲突分支。该分支应把冲突当「同条」吞掉 —— 不报错、
-    // 不新增行、不 panic,只在 verbose 留一行日志(见 duplicate_fingerprint_log)。
+    // 走到 `content_hash` UNIQUE 冲突分支。该分支现在不再"丢",而是把已有行的
+    // `created_at` 刷到此刻 —— 不新增行,同时让 `PIN_ORDER` 把该行重新排到列表顶部
+    // (修复用户症状「相同内容再次粘贴还在原位置,找不到」)。
     let storage = Arc::new(open_test_db());
-    let first = Watcher::new(
-        storage.clone(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(tokio::sync::Mutex::new(None)),
-    );
-    first.process(Captured::text("same payload twice")).await;
+    let make = || {
+        Watcher::new(
+            storage.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(tokio::sync::Mutex::new(None)),
+        )
+    };
+
+    make().process(Captured::text("same payload twice")).await;
     assert_eq!(row_count(&storage).await, 1);
 
-    let second = Watcher::new(
-        storage.clone(),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(AtomicBool::new(false)),
-        Arc::new(tokio::sync::Mutex::new(None)),
-    );
-    second.process(Captured::text("same payload twice")).await;
+    let first_row = storage
+        .list_recent(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("first capture must produce an entry");
+    let first_created_at = first_row.created_at;
+
+    // `created_at` 用秒级 `strftime('%s','now')`,跨越 1100ms 才有可见差。
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    make().process(Captured::text("same payload twice")).await;
+
+    // 旧契约保留:行数仍 = 1 (不新增 entry)。
     assert_eq!(
         row_count(&storage).await,
         1,
-        "同一指纹已在库中时应视为同条,不新增行"
+        "二次复制必须仍走 UNIQUE 冲突分支,不 insert 新行"
+    );
+
+    // 新契约:已有行的 created_at 被刷到 > 原始时间。
+    let after = storage
+        .list_recent(10)
+        .await
+        .unwrap()
+        .into_iter()
+        .next()
+        .expect("row must still exist");
+    assert_eq!(
+        after.id, first_row.id,
+        "必须仍是同一行 —— bump_to_top 不该 insert"
+    );
+    assert!(
+        after.created_at > first_created_at,
+        "二次复制后 created_at 必须刷新:原 {first_created_at},现在 {}",
+        after.created_at
     );
 }
 

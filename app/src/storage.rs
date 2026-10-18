@@ -214,6 +214,34 @@ impl Storage {
         .await
     }
 
+    /// 把 `content_hash` 已存在的条目 "上浮到顶":仅刷 `created_at = now`,
+    /// 其余字段(`is_pinned` / `pinned_at` / `note` / `tags` / `payload` /
+    /// `metadata_json` / `auto_category`)一律不动 —— 复制的"再次见到"语义只
+    /// 影响排序,不该改写用户手动编辑的备注或置顶状态。
+    ///
+    /// 调用形态:watcher 命中 `content_hash UNIQUE` 冲突后,把已有行 `created_at`
+    /// 推到此刻,让 `PIN_ORDER` (clipvault-search.rs `is_pinned DESC, pinned_at
+    /// DESC, created_at DESC`) 把这条重新排到列表顶部 —— 修复用户症状
+    /// 「相同内容再次粘贴还在原位置,找不到」。
+    ///
+    /// `now` 用 Unix 秒（与 `entries.created_at` 列单位一致,见 `toggle_pin`
+    /// `SystemTime` 取秒的写法）。
+    /// 返回被刷的行数:0 = 没有此 fingerprint（不该发生,watcher 刚撞过
+    /// UNIQUE）,1 = 正常单条命中。
+    pub async fn bump_to_top_by_content_hash(
+        &self,
+        content_hash: &str,
+        now: i64,
+    ) -> SqliteResult<usize> {
+        self.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries SET created_at = ?1 WHERE content_hash = ?2",
+                params![now, content_hash],
+            )
+        })
+        .await
+    }
+
     /// Fetch a single entry by id.
     pub async fn get_by_id(&self, id: i64) -> SqliteResult<Option<Entry>> {
         self.with_conn(|conn| {
@@ -915,6 +943,77 @@ mod tests {
             matches!(err, rusqlite::Error::SqliteFailure(_, _)),
             "expected SqliteFailure (constraint violation), got {err}"
         );
+    }
+
+    /// `bump_to_top_by_content_hash` 的合约:仅刷目标行 `created_at = now`,
+    /// 不动 `is_pinned` / `pinned_at` / `note` / `payload` 等其它字段;
+    /// 不命中时返回 0。
+    #[tokio::test]
+    async fn bump_to_top_by_content_hash_only_updates_created_at() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let db = open_test_db();
+        let id_target = db
+            .insert_entry("target_hash", "tgt content", "plain")
+            .await
+            .unwrap();
+        let id_other = db
+            .insert_entry("other_hash", "other content", "plain")
+            .await
+            .unwrap();
+
+        // 给目标行加 note + pin,验证 bump 不动它们。
+        db.with_conn(move |conn| {
+            conn.execute(
+                "UPDATE entries SET note = ?1, is_pinned = 1, pinned_at = 12345 WHERE id = ?2",
+                rusqlite::params!["manual note", id_target],
+            )
+        })
+        .await
+        .unwrap();
+
+        let before_target = db.get_by_id(id_target).await.unwrap().unwrap();
+        let before_other = db.get_by_id(id_other).await.unwrap().unwrap();
+        assert_eq!(before_target.note, "manual note".to_string());
+        assert!(before_target.is_pinned);
+
+        // 找一个 fresh 的 `now`(比行默认的 strftime('%s','now') 更晚,避免
+        // 撞同秒边界)。
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 1000;
+        let affected = db
+            .bump_to_top_by_content_hash("target_hash", now)
+            .await
+            .unwrap();
+        assert_eq!(affected, 1, "命中一个 hash 应刷 1 行");
+
+        let after_target = db.get_by_id(id_target).await.unwrap().unwrap();
+        assert_eq!(after_target.created_at, now, "created_at 必须刷到 now");
+        assert_eq!(
+            after_target.note,
+            "manual note".to_string(),
+            "note 必须不被 bump 改写"
+        );
+        assert!(after_target.is_pinned, "is_pinned 必须不动");
+        assert_eq!(
+            after_target.pinned_at, before_target.pinned_at,
+            "pinned_at 必须不动 —— 这是 pin 时刻,不应被复制语义污染"
+        );
+        assert_eq!(after_target.content, before_target.content);
+
+        // 另一行完全不动。
+        let after_other = db.get_by_id(id_other).await.unwrap().unwrap();
+        assert_eq!(after_other.created_at, before_other.created_at);
+        assert_eq!(after_other.content, "other content");
+
+        // 不命中:返回 0。
+        let affected_zero = db
+            .bump_to_top_by_content_hash("nonexistent", now)
+            .await
+            .unwrap();
+        assert_eq!(affected_zero, 0);
     }
 
     #[tokio::test]
