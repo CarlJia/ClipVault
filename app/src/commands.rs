@@ -35,6 +35,13 @@ pub struct AppState {
     pub keymap: Arc<RwLock<clipvault_core::keymap::HotkeyMap>>,
     /// U2：日志级别原子,`set_log_level` / `get_log_level` 路径写入与读取。
     pub log_level: Arc<AtomicU8>,
+    /// W7 / R30：**自写抑制**。ClipVault 自己写进系统剪贴板的内容（目前只有
+    /// 「复制日志路径」）不该进历史。写侧把内容指纹登记在这里，`Watcher` 的下一轮
+    /// 捕获见到同一指纹就跳过（详见 [`crate::watcher::Watcher::process`] 的第 4.5 步）。
+    ///
+    /// 用**指纹比对**而不是时间窗：用户点了「复制日志路径」之后可能过很久才复制别的，
+    /// 时间窗会误伤；指纹比对只在内容真的一样时才跳过（那也只可能是我们刚写的那条）。
+    pub self_writes: Arc<tokio::sync::Mutex<Option<String>>>,
     /// U2：AppHandle，用于 apply_global_hotkey 和 hotkey::register。
     pub app: tauri::AppHandle,
 }
@@ -113,6 +120,10 @@ async fn load_tags(state: &AppState, ids: &[i64]) -> SqliteResult<HashMap<i64, V
 }
 
 /// 把 [`Entry`] 列表转换为带标签的 [`EntryDto`] 列表。
+///
+/// 旧路径：先一次 `with_conn` 拉标签（[`load_tags`]），再映射。W4 / R16 之后
+/// `search_results` / `list_recent` 改走 [`to_dtos_with_tags`]（标签与条目在
+/// 同一条 SQL 里带回），本函数只剩 `list_vault` 这一步不带 tags 列的旁路。
 async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>, String> {
     let ids: Vec<i64> = entries.iter().map(|e| e.id).collect();
     let mut tag_map = load_tags(state, &ids).await.map_err(|e| e.to_string())?;
@@ -120,34 +131,47 @@ async fn to_dtos(state: &AppState, entries: Vec<Entry>) -> Result<Vec<EntryDto>,
         .into_iter()
         .map(|e| {
             let tags = tag_map.remove(&e.id).unwrap_or_default();
-            // 解析 metadata_json 提取 thumb 字段;thumb 外的 width/height/paths/rgba
-            // 字段已嵌入 metadata JSON,前端 parseMeta 自行解析。
-            let thumb = e
-                .metadata_json
-                .as_deref()
-                .and_then(extract_thumb_from_metadata);
-            let is_vault = e.is_vault;
-            EntryDto {
-                id: e.id,
-                // 加密区条目的 `content` 是密文，一律不下发前端：UI 只按元数据
-                // （类别 / 标签 / 备注 / 时间）渲染，解密与回贴全程留在后端
-                // （`paste_entry` 解密后写剪贴板）。
-                content: if is_vault { String::new() } else { e.content },
-                note: e.note,
-                auto_category: e.auto_category,
-                tags,
-                is_pinned: e.is_pinned,
-                pinned_at: e.pinned_at,
-                is_vault,
-                is_decryptable: e.is_decryptable,
-                created_at: e.created_at,
-                content_kind: e.content_kind,
-                mime_type: e.mime_type,
-                thumb,
-                metadata: e.metadata_json,
-            }
+            entry_to_dto(e, tags)
         })
         .collect())
+}
+
+/// 存储层已带回标签时的 DTO 映射（W4 / R16）：不再二次 `with_conn`。
+fn to_dtos_with_tags(entries: Vec<(Entry, Vec<String>)>) -> Vec<EntryDto> {
+    entries
+        .into_iter()
+        .map(|(entry, tags)| entry_to_dto(entry, tags))
+        .collect()
+}
+
+/// 单条 `Entry` + 标签 → [`EntryDto`]（`to_dtos` 与 `to_dtos_with_tags` 共用）。
+fn entry_to_dto(e: Entry, tags: Vec<String>) -> EntryDto {
+    // 解析 metadata_json 提取 thumb 字段;thumb 外的 width/height/paths/rgba
+    // 字段已嵌入 metadata JSON,前端 parseMeta 自行解析。
+    let thumb = e
+        .metadata_json
+        .as_deref()
+        .and_then(extract_thumb_from_metadata);
+    let is_vault = e.is_vault;
+    EntryDto {
+        id: e.id,
+        // 加密区条目的 `content` 是密文，一律不下发前端：UI 只按元数据
+        // （类别 / 标签 / 备注 / 时间）渲染，解密与回贴全程留在后端
+        // （`paste_entry` 解密后写剪贴板）。
+        content: if is_vault { String::new() } else { e.content },
+        note: e.note,
+        auto_category: e.auto_category,
+        tags,
+        is_pinned: e.is_pinned,
+        pinned_at: e.pinned_at,
+        is_vault,
+        is_decryptable: e.is_decryptable,
+        created_at: e.created_at,
+        content_kind: e.content_kind,
+        mime_type: e.mime_type,
+        thumb,
+        metadata: e.metadata_json,
+    }
 }
 
 /// 从 metadata_json 提取 thumb 字段(U3 写入的 base64 PNG)。
@@ -179,24 +203,28 @@ pub async fn search_results(
     limit: u32,
     state: State<'_, AppState>,
 ) -> Result<Vec<EntryDto>, String> {
-    let plan = crate::search::build_search_query(&query, &crate::search::parse_tab(&tab), limit);
+    // W4 / R16:标签与条目在同一条 SQL 里带回(LEFT JOIN + GROUP_CONCAT),
+    // 从原来的「两次 with_conn」降到一次。
+    let plan =
+        crate::search::build_search_query_with_tags(&query, &crate::search::parse_tab(&tab), limit);
     let entries = state
         .storage
-        .search_entries(plan)
+        .search_entries_with_tags(plan)
         .await
         .map_err(|e| e.to_string())?;
-    to_dtos(&state, entries).await
+    Ok(to_dtos_with_tags(entries))
 }
 
 /// 「最近」tab：按 pin 优先 + 时间倒序返回最近 `limit` 条。
 #[tauri::command]
 pub async fn list_recent(limit: u32, state: State<'_, AppState>) -> Result<Vec<EntryDto>, String> {
+    // W4 / R16:同 `search_results`，标签与条目一次查询带回。
     let entries = state
         .storage
-        .list_recent(limit)
+        .list_recent_with_tags(limit)
         .await
         .map_err(|e| e.to_string())?;
-    to_dtos(&state, entries).await
+    Ok(to_dtos_with_tags(entries))
 }
 
 /// 「标签」tab：所有标签 + 条目数（排除加密区条目，R6）。
@@ -717,10 +745,19 @@ pub async fn clear_log() -> Result<(), String> {
 /// - 写完后 watcher 会把这条路径当成一次新复制入库(剪贴板历史多一条),与用户自己
 ///   复制任何内容无异;目前没有自写抑制。
 #[tauri::command]
-pub async fn copy_log_path(window: tauri::WebviewWindow) -> Result<(), String> {
+pub async fn copy_log_path(
+    window: tauri::WebviewWindow,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
     let path = crate::log::default_log_path()
         .to_string_lossy()
         .into_owned();
+
+    // W7 / R30：把这次要写的内容指纹登记为「自写」，watcher 下一轮捕获到同一指纹
+    // 就跳过，不让它变成一个剪贴板历史条目。**必须在写剪贴板之前**登记：watcher
+    // 每 100ms 轮询一次，写与登记谁先谁后不确定，先登记才能保证这一轮一定认得出来。
+    let fingerprint = crate::capture::Captured::text(&path).fingerprint();
+    *state.self_writes.lock().await = Some(fingerprint);
 
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
@@ -1024,9 +1061,13 @@ pub(crate) fn openable_url(raw: &str) -> Result<&str, String> {
 /// （本函数的文档此前声称失败时会"把 content 写入 NSPasteboard 并返回 clipboard_only"，
 /// 那从未实现过，已改正。）
 #[tauri::command]
-pub fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
-    // 同步读取（commands 在 Tauri 主线程跑;MVP 同模式入库读取已沿用）。
-    let entry = tauri::async_runtime::block_on(async { state.storage.get_by_id(id).await })
+pub async fn open_url(id: i64, state: State<'_, AppState>) -> Result<(), String> {
+    // W4 / R17:改成 async,不再用 `block_on` 把存储读取塞回同步命令体。
+    // 旧写法会让这次 `get_by_id` 把 IPC 派发线程堵住(它本来能去跑别的命令)。
+    let entry = state
+        .storage
+        .get_by_id(id)
+        .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| format!("entry {id} 不存在"))?;
 

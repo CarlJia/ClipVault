@@ -599,22 +599,67 @@ pub fn read_info(path: &Path, atomic: &AtomicU8) -> LogInfo {
     }
 }
 
+/// 从 `path` 末尾读最多 `max_bytes` 字节。
+///
+/// - 文件不存在 → `Ok(Vec::new())`（等同「该文件为空」,与旧实现
+///   `if let Ok(mut f) = File::open(...)` 静默忽略的语义一致）;
+/// - 其它 I/O 错误也退回空 vec —— `read_tail` 的契约是 best-effort（旧实现
+///   也是吞掉 open/read 错误）。
+/// - 文件长于 `max_bytes` 时从 `SeekFrom::End(-max_bytes)` 倒读,只拷所需
+///   的尾部,不再把整份读进内存。
+pub fn read_tail_bytes(path: &Path, max_bytes: usize) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return Vec::new(),
+    };
+    let len = match f.metadata() {
+        Ok(m) => m.len(),
+        Err(_) => return Vec::new(),
+    };
+    let take = max_bytes.min(len as usize);
+    if (len as usize) > take && f.seek(SeekFrom::End(-(take as i64))).is_err() {
+        return Vec::new();
+    }
+    let mut buf = Vec::with_capacity(take);
+    // 用 `take` 限长,即便 seek 没落好也不会越读。
+    let _ = f.take(take as u64).read_to_end(&mut buf);
+    buf
+}
+
 /// 读取尾部(`.1` + current 拼接,按时间顺序),复用 U1 的 `tail_lines` 做 cap。
 ///
 /// 仅 `.1` 存在或仅 current 存在时按各自情况退化;U2 测试覆盖。
+///
+/// 性能优化 W3 / R14:旧实现 `read_to_end` 把 `.1` 与 current 两份**全量**
+/// 读进内存再让 `tail_lines` 从末尾切——轮转刚发生时(实盘上 `.1` 是刚转走
+/// 的那一份)一次日志查看就是「O(整文件)」磁盘 I/O,而用户要的只是最后
+/// 64 KiB / 400 行。改为**从末尾倒读**:先读 current 尾 `max_bytes`,够就
+/// 不再碰 `.1`;不够才补 `.1` 的尾 `remaining` 字节,拼接顺序仍保证
+/// `tail_lines` 在末尾切到的是「.1 尾 + current 尾」的连续文本。
 pub fn read_tail(dir: &Path, max_bytes: usize, max_lines: usize) -> std::io::Result<String> {
     let current_path = log_path_in(dir);
     let backup_path = backup_log_path(dir);
-    // 读 .1(若有),再读 current(若有)。空文件 = 空 Vec。
-    let mut combined: Vec<u8> = Vec::new();
-    if let Ok(mut f) = std::fs::File::open(&backup_path) {
-        use std::io::Read;
-        let _ = f.read_to_end(&mut combined);
+
+    // read cap 故意 +1:`tail_lines` 用 `bytes.len() <= max_bytes` 判「无截断,首行
+    // 完整」,用 `len >` 判「有截断,丢掉首行半段」。恰好读满 `max_bytes` 时,它
+    // 无法区分「读到 cap」与「文件本来就这么长」,会把被截断的首行半段当完整行
+    // 留下 —— 多读 1 字节让两种情形在长度上分开,判据就准了。
+    let cap = max_bytes.saturating_add(1);
+
+    let current_tail = read_tail_bytes(&current_path, cap);
+    if current_tail.len() == cap {
+        // current 本身已能喂满字节 cap:不再碰 `.1`(R14 的收益点)。
+        return Ok(tail_lines(&current_tail, max_bytes, max_lines));
     }
-    if let Ok(mut f) = std::fs::File::open(&current_path) {
-        use std::io::Read;
-        let _ = f.read_to_end(&mut combined);
-    }
+    // current 不足:从 `.1` 补上还差的字节。两份拼起来后长度 ≤ cap,`tail_lines`
+    // 仍会按 `max_bytes` 做字节/行双 cap。
+    let remaining = cap - current_tail.len();
+    let backup_tail = read_tail_bytes(&backup_path, remaining);
+    let mut combined = Vec::with_capacity(backup_tail.len() + current_tail.len());
+    combined.extend_from_slice(&backup_tail);
+    combined.extend_from_slice(&current_tail);
     Ok(tail_lines(&combined, max_bytes, max_lines))
 }
 

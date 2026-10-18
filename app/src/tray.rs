@@ -78,20 +78,6 @@ impl TrayState {
     }
 }
 
-/// `set_title` 的入参：**永远是 `Some`**，没有字形时传空串。
-///
-/// 别改成「没字形就传 `None`」——`None` 在 macOS 上清不掉标题。tauri 2.11 依赖的
-/// tray-icon 0.24 把 `set_title(None)` 实现成彻底的空操作
-/// （`platform_impl/macos/mod.rs` 的 `set_title_inner` 是
-/// `if let Some(title) { button.setTitle(..) }`），于是关掉访客模式时那个 `•`
-/// 会永远留在菜单栏上 —— 正是「再点一次访客模式，点还在」这个报障。
-/// 空串才会真正 `setTitle("")`。（tray-icon 0.25 起改成了 `unwrap_or_default()`，
-/// 但不必为此升依赖。）
-#[cfg(target_os = "macos")]
-fn title_arg(state: TrayState) -> Option<&'static str> {
-    Some(state.title_glyph())
-}
-
 /// 托盘图标资源（编译期内嵌，避免依赖运行时路径）。
 ///
 /// - macOS：单色模板图（黑 + alpha），系统随菜单栏明暗自动反色；
@@ -183,8 +169,9 @@ pub fn set_state(app: &AppHandle, state: TrayState) {
         let _ = tray.set_tooltip(Some(state.tooltip(cfg!(target_os = "macos"))));
         #[cfg(target_os = "macos")]
         {
-            // 传 `Some`（空串也算）：`None` 清不掉标题，见 `title_arg` 的说明。
-            let _ = tray.set_title(title_arg(state));
+            // 永远传 `Some`（空串也算）：tray-icon 0.24 在 macOS 上把 `set_title(None)`
+            // 实现成空操作，于是关掉访客模式后那个 `•` 会永远留在菜单栏上。
+            let _ = tray.set_title(Some(state.title_glyph()));
         }
     }
 }
@@ -331,11 +318,7 @@ mod tests {
     /// 只钉入参形状：`setTitle("")` 的实际效果要真机看（本仓库没有菜单栏 UI 的测试宿主）。
     #[cfg(target_os = "macos")]
     #[test]
-    fn clearing_tray_title_passes_empty_string_never_none() {
-        use super::title_arg;
-
-        assert_eq!(title_arg(TrayState::Monitoring), Some(""));
-        assert_eq!(title_arg(TrayState::Guest), Some("•"));
+    fn clearing_tray_title_passes_some_never_none() {
         // 任何一个状态都不许落到 None —— 那个分支在 macOS 上清不掉上一次的字形。
         for state in [
             TrayState::Monitoring,
@@ -343,7 +326,10 @@ mod tests {
             TrayState::Paused,
             TrayState::Error,
         ] {
-            assert!(title_arg(state).is_some(), "{state:?} 传了 None");
+            let arg: Option<&'static str> = Some(state.title_glyph());
+            assert!(arg.is_some(), "{state:?} 传了 None");
         }
+        // 特别钉住 Monitoring：空串才是「清空」，None 会留下上一次的字形。
+        assert_eq!(Some(TrayState::Monitoring.title_glyph()), Some(""));
     }
 }

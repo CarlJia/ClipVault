@@ -52,21 +52,34 @@ let inflightId: number | null = null;
 let queuedEntry: EntryDto | null = null;
 
 /**
- * 图片预览缓存：`id -> data URL`。
+ * 图片预览缓存：`id -> { data URL, 固有宽高 }`。
  *
  * **关闭时不清**（R3：方向键来回切不该反复向 IPC 要同一张大图），只在面板重新被
  * 唤出时清（`resetPreviewCache`）—— 用户离开又回来，看到的不该是上次那份可能已经
  * 过期的图。
+ *
+ * 缓存宽高（W5 / R21）：命中缓存时也要能把 `width` / `height` 属性写进 `<img>`，
+ * 否则命中路径缺了这两个数字、布局仍会抖。
  */
-const imageCache = new Map<number, string>();
+interface CachedImage {
+  url: string;
+  width: number | null;
+  height: number | null;
+}
+const imageCache = new Map<number, CachedImage>();
 
 /** 缓存条数上限：单条 data URL 可达数 MB，面板长时间开着不能无限攒。 */
 const IMAGE_CACHE_LIMIT = 16;
 
 /** 写缓存并按 FIFO 淘汰最旧的一条（`Map` 的迭代顺序就是插入顺序）。 */
-function cacheImage(id: number, url: string): void {
+function cacheImage(
+  id: number,
+  url: string,
+  width: number | null,
+  height: number | null,
+): void {
   imageCache.delete(id);
-  imageCache.set(id, url);
+  imageCache.set(id, { url, width, height });
   if (imageCache.size <= IMAGE_CACHE_LIMIT) return;
   const oldest = imageCache.keys().next().value;
   if (oldest !== undefined) imageCache.delete(oldest);
@@ -171,7 +184,7 @@ function renderEntry(entry: EntryDto): void {
     case "image": {
       const cached = imageCache.get(entry.id);
       if (cached) {
-        paint(imageHtml(cached));
+        paint(imageHtml(cached.url, cached.width, cached.height));
         return;
       }
       paint(hintHtml("正在加载图片…"));
@@ -228,10 +241,10 @@ async function loadPreview(entry: EntryDto): Promise<void> {
     const image = dto.kind === "image" ? dto.data_url : null;
     // 先入缓存再判「还是不是这一条」：迟到的响应也得留下，否则再转回来还要重解码一次。
     // 加密区条目例外：解密结果不留在模块级缓存里，只在栏内显示一次。
-    if (image && !entry.is_vault) cacheImage(id, image);
+    if (image && !entry.is_vault) cacheImage(id, image, dto.width, dto.height);
     if (isCurrent(id)) {
       if (image) {
-        paint(imageHtml(image));
+        paint(imageHtml(image, dto.width, dto.height));
       } else if (dto.kind === "text" && dto.content !== null) {
         paint(textHtml(dto.content));
       } else if (dto.undecryptable) {
@@ -256,8 +269,25 @@ function isCurrent(id: number): boolean {
   return open && currentId === id;
 }
 
-function imageHtml(src: string): string {
-  return `<img class="preview-image" src="${escapeHtml(src)}" alt="图片预览">`;
+/**
+ * 预览图的 `<img>`（W5 / R21 / R22）。
+ *
+ * - **宽高属性**：后端 `PreviewDto` 给的是解码后的真实像素尺寸。写进 `width` /
+ *   `height` 属性后，浏览器在图片字节解码完成前就能按正确比例预留空间，
+ *   消除「正在加载图片…」提示 → `<img>` 切换时栏内的布局抖动（CLS）。
+ *   与 CSS 的 `object-fit: contain` + `max-width/height: 100%` 不冲突：
+ *   那两个属性只决定**渲染框**，固有尺寸决定的是**比例**。
+ * - **不做 `escapeHtml`**：`src` 是后端拼的 `data:image/png;base64,…`，前缀是固定
+ *   字面量、载荷只有 base64 字母表（`A-Za-z0-9+/=`），**不含任何 HTML 元字符**。
+ *   对一条可达数百 KB 的字符串跑 5 段正则替换纯属白扫。前提是这里只接后端 data URL；
+ *   若将来有别的 src 来源，必须重新评估。
+ */
+function imageHtml(src: string, width: number | null, height: number | null): string {
+  const dims =
+    width !== null && height !== null && width > 0 && height > 0
+      ? ` width="${width}" height="${height}"`
+      : "";
+  return `<img class="preview-image" src="${src}"${dims} alt="图片预览">`;
 }
 
 function textHtml(content: string): string {

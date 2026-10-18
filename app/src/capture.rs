@@ -150,34 +150,43 @@ impl Captured {
 ///
 /// `auto_category` 对非文本类型取 `content_kind.as_str()`;文本类型
 /// 走 `classify()` 启发式（URL/Email/path/code/JSON/plain）。
+///
+/// 性能优化 W1 / R7:`fingerprint` 由调用方算一次后传入,这里不再算——
+/// 同一份大 payload 走两次 SHA-256(20MB PNG ≈ 30-50ms 纯浪费)是审计
+/// 找出来的最大纯收益之一。watcher 在第 233 行已经算过一次,直接传进来。
 pub async fn insert_captured(
     storage: &Storage,
     captured: &Captured,
     auto_category: &str,
 ) -> Result<i64, rusqlite::Error> {
     let metadata = captured.metadata.to_string();
-    insert_captured_with_metadata(storage, captured, auto_category, &metadata).await
+    let fingerprint = captured.fingerprint();
+    insert_captured_with_metadata(storage, captured, auto_category, &metadata, &fingerprint).await
 }
 
 /// Like [`insert_captured`] but takes a pre-rendered metadata JSON string,
 /// letting the caller splice in derived fields (e.g. `thumb` from U3).
+///
+/// `fingerprint` 由调用方算好后传入(W1 / R7):整条 watcher 流水线里
+/// `captured.fingerprint()` 必须只调一次。
 pub async fn insert_captured_with_metadata(
     storage: &Storage,
     captured: &Captured,
     auto_category: &str,
     metadata_json: &str,
+    fingerprint: &str,
 ) -> Result<i64, rusqlite::Error> {
-    let hash = captured.fingerprint();
+    let hash = fingerprint;
     match captured.kind {
         ContentKind::Text => {
             let text = captured.text.as_deref().unwrap_or("");
-            storage.insert_entry(&hash, text, auto_category).await
+            storage.insert_entry(hash, text, auto_category).await
         }
         _ => {
             let payload = captured.payload.as_deref().unwrap_or(&[]);
             storage
                 .insert_entry_binary(
-                    &hash,
+                    hash,
                     captured.kind.as_str(),
                     captured.mime.as_deref(),
                     payload,
@@ -1149,5 +1158,53 @@ mod tests {
     fn poll_first_non_empty_returns_none_when_change_count_decreased() {
         let result = poll_first_non_empty(3, 5);
         assert!(result.is_none());
+    }
+
+    /// 性能优化 W1 / R7:`insert_captured_with_metadata` 不再自己算
+    /// `fingerprint()`,完全由调用方传入。watcher 在第 233 行已经算过
+    /// 一次再传进来;这是一条端到端契约——`hash == "caller-provided"`
+    /// 才说明我们没有偷跑一次 SHA-256。
+    #[tokio::test]
+    async fn insert_captured_with_metadata_uses_caller_hash_not_internal_fingerprint() {
+        let storage = crate::storage::test_helpers::open_test_db();
+
+        // 抓一个普通文本捕获。
+        let captured = Captured::text("caller-supplied hash test");
+        let caller_fingerprint = "callerprovided"; // 16 hex chars 风格, 长度任意
+        let id = insert_captured_with_metadata(
+            &storage,
+            &captured,
+            "plain",
+            r#"{"note":"test"}"#,
+            caller_fingerprint,
+        )
+        .await
+        .unwrap();
+        assert!(id > 0);
+
+        // 直接读 entries.content_hash:必须等于调用方传入的值,**不应**
+        // 等于 captured.fingerprint() 的实际结果(那是另一次 SHA-256)。
+        let stored_hash: String = storage
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT content_hash FROM entries WHERE id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            stored_hash, caller_fingerprint,
+            "rows.content_hash 必须严格等于调用方传入的 fingerprint, 等于就说明没偷跑 fingerprint()"
+        );
+
+        // 反向证明:captured.fingerprint() 的实际结果必须跟 stored_hash 不同——
+        // 否则我们可能只是偷跑了一个等于传值的 fingerprint(), 仍算偷跑。
+        let real_fp = captured.fingerprint();
+        assert_ne!(
+            stored_hash, real_fp,
+            "rows.content_hash 绝不能等于 captured.fingerprint() 的真实结果（说明函数真的用 caller 值）"
+        );
     }
 }

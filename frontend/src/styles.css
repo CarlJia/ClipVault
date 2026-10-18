@@ -72,19 +72,25 @@ body {
   top: 0;
   left: 0;
   height: 3px;
-  width: 0;
+  /* W5 / R19：用 `transform: scaleX()` 而不是 `width` 做增长动画。
+     `width` 每帧触发 layout（重排整条 panel 的 flex 布局）；`transform`
+     只走合成层，零 layout。视觉一致（纯色 3px 条从左向右铺满），
+     `transform-origin: left` 保证从左侧起算。 */
+  width: 100%;
+  transform: scaleX(0);
+  transform-origin: left center;
   background: var(--accent);
   opacity: 0;
   transition:
-    width 0.4s ease,
+    transform 0.4s ease,
     opacity 0.2s ease;
   z-index: 5;
 }
 .progress.active {
-  width: 100%;
+  transform: scaleX(1);
   opacity: 1;
   transition:
-    width 1.2s ease,
+    transform 1.2s ease,
     opacity 0.1s ease;
 }
 
@@ -649,7 +655,12 @@ body {
   background: rgba(40, 40, 46, 0.96);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+  /* W5 / R18：不加大范围 box-shadow。`0 12px 40px` 这种尺寸的阴影每帧都要参与
+     合成，而卡片背后本来就是一层 `rgba(0,0,0,0.4)` 蒙层 —— 阴影几乎看不出来。
+     卡片与蒙层的边界由上面那条 `1px solid var(--border)` 与近乎不透明的背景提供。
+     注：**不**动 `.editor` 的 `backdrop-filter: blur(6px)` —— 顶上 `.panel` 那段注释
+     说明过，blur 在 `.panel` 上会被 WebKit 的透明根窗口捕获层 bug 打掉，但
+     `.editor` 模糊的是面板内容、不受影响，是刻意保留的毛玻璃。 */
 }
 
 .editor-head {

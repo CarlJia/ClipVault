@@ -42,14 +42,24 @@ export interface CategoryInfo {
   count: number;
 }
 
-/** HTML 转义，防止内容注入。 */
+/** HTML 转义表（key 是字符，值是实体）。 */
+const HTML_ESCAPE_MAP: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+/**
+ * HTML 转义，防止内容注入（W5 / R24）。
+ *
+ * 单遍 `replace` + 映射表，取代原来的 5 段链式 `.replace(/x/g, …)`：
+ * 原来最坏情况要扫 5 遍同一个字符串（每段正则各一次），现在一遍扫完。
+ * 语义完全等价 —— 每个字符独立映射，替换顺序不影响结果。
+ */
 export function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#39;");
+  return s.replace(/[&<>"']/g, (ch) => HTML_ESCAPE_MAP[ch]);
 }
 
 /** 把多行内容压成单行预览。 */
@@ -107,6 +117,46 @@ export const EYE_SVG =
   '<path d="M1.4 8S4 3.6 8 3.6 14.6 8 14.6 8 12 12.4 8 12.4 1.4 8 1.4 8Z"/>' +
   '<circle cx="8" cy="8" r="1.9"/></svg>';
 
+/**
+ * 渲染**单行**（`i` 是它在 `entries` 里的下标 —— 决定 `data-index` 与 ⌘1-9 角标）。
+ *
+ * W6：从 `renderEntries` 里抽出来，让「只有一条变了」的路径（编辑备注保存后）
+ * 能只替换那一行的 `outerHTML`，而不必重画整个列表。与 `renderEntries` 共用
+ * 同一份行渲染逻辑是刻意的 —— 两处各写一份必然会漂移。
+ *
+ * 模板字面量里的前导空白保持与抽取前一致（多一层缩进会改输出字节）。
+ */
+export function renderEntryRow(e: EntryDto, i: number, selected: number): string {
+  const pin = e.is_pinned ? PIN_SVG : "";
+  const cat = `<span class="chip chip-cat">${escapeHtml(e.auto_category)}</span>`;
+  const tags = e.tags
+    .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
+    .join("");
+  const vault = e.is_vault
+    ? `<span class="chip chip-vault" title="加密区条目">🔒 加密</span>`
+    : "";
+  const undec =
+    e.is_vault && !e.is_decryptable
+      ? `<span class="chip chip-undec" title="密钥缺失，无法解密">⚠ 无法解密</span>`
+      : "";
+  const kind = e.content_kind ?? "text";
+  const kindBadge = kind === "text" ? "" : `<span class="chip chip-kind" data-kind="${escapeHtml(kind)}">${escapeHtml(kind.toUpperCase())}</span>`;
+  const previewHtml = renderKindPreview(e, kind, pin);
+  const idxBadge =
+    i < 9
+      ? `<span class="row-index" title="${escapeHtml(keys(`⌘${i + 1}`))} 直接选中">${escapeHtml(keys(`⌘${i + 1}`))}</span>`
+      : "";
+  return `
+      <div class="row row-kind-${escapeHtml(kind)}${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}" data-kind="${escapeHtml(kind)}">
+        ${idxBadge}
+        <div class="row-main">
+          ${previewHtml}
+          <div class="row-meta">${cat}${kindBadge}${tags}${vault}${undec}</div>
+        </div>
+        <div class="row-time">${formatTime(e.created_at)}</div>
+      </div>`;
+}
+
 /** 渲染平铺记录列表。`selected` 为高亮行索引。 */
 export function renderEntries(
   container: HTMLElement,
@@ -118,36 +168,7 @@ export function renderEntries(
     return;
   }
   container.innerHTML = entries
-    .map((e, i) => {
-      const pin = e.is_pinned ? PIN_SVG : "";
-      const cat = `<span class="chip chip-cat">${escapeHtml(e.auto_category)}</span>`;
-      const tags = e.tags
-        .map((t) => `<span class="chip chip-tag">${escapeHtml(t)}</span>`)
-        .join("");
-      const vault = e.is_vault
-        ? `<span class="chip chip-vault" title="加密区条目">🔒 加密</span>`
-        : "";
-      const undec =
-        e.is_vault && !e.is_decryptable
-          ? `<span class="chip chip-undec" title="密钥缺失，无法解密">⚠ 无法解密</span>`
-          : "";
-      const kind = e.content_kind ?? "text";
-      const kindBadge = kind === "text" ? "" : `<span class="chip chip-kind" data-kind="${escapeHtml(kind)}">${escapeHtml(kind.toUpperCase())}</span>`;
-      const previewHtml = renderKindPreview(e, kind, pin);
-      const idxBadge =
-        i < 9
-          ? `<span class="row-index" title="${escapeHtml(keys(`⌘${i + 1}`))} 直接选中">${escapeHtml(keys(`⌘${i + 1}`))}</span>`
-          : "";
-      return `
-      <div class="row row-kind-${escapeHtml(kind)}${i === selected ? " selected" : ""}" data-id="${e.id}" data-index="${i}" data-kind="${escapeHtml(kind)}">
-        ${idxBadge}
-        <div class="row-main">
-          ${previewHtml}
-          <div class="row-meta">${cat}${kindBadge}${tags}${vault}${undec}</div>
-        </div>
-        <div class="row-time">${formatTime(e.created_at)}</div>
-      </div>`;
-    })
+    .map((e, i) => renderEntryRow(e, i, selected))
     .join("");
 }
 
@@ -164,7 +185,11 @@ function renderKindPreview(e: EntryDto, kind: string, pin: string): string {
         : "";
       const ariaLabel = `图片: ${dims || "未知尺寸"}, ${size || "未知大小"}`;
       const imgHtml = thumb
-        ? `<img class="row-thumb" src="data:image/png;base64,${escapeHtml(thumb)}" alt="${escapeHtml(ariaLabel)}" aria-label="${escapeHtml(ariaLabel)}" role="img">`
+        ? // W5 / R22:`thumb` 是后端 `thumbnail.rs` 生成的 base64 PNG，字母表只有
+          // `A-Za-z0-9+/=`，**不含任何 HTML 元字符** —— 对它跑 `escapeHtml` 只是
+          // 白扫一遍最多 10 KB 的字符串。前提是它只来自后端；若将来有别的来源
+          // （用户可控），必须改回 `escapeHtml`。
+          `<img class="row-thumb" src="data:image/png;base64,${thumb}" alt="${escapeHtml(ariaLabel)}" aria-label="${escapeHtml(ariaLabel)}" role="img">`
         : `<div class="row-thumb row-thumb-placeholder" aria-label="${escapeHtml(ariaLabel)}" role="img">${escapeHtml(size || "图片")}</div>`;
       const titleHtml = hasNote
         ? `<div class="row-content row-note-title" title="${escapeHtml(e.note)}">${pin}📝 ${escapeHtml(previewOf(e.note, 80))}</div>`

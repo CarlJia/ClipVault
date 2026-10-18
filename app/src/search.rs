@@ -46,7 +46,21 @@ pub enum SearchTab {
 
 const SELECT_COLS: &str = "e.id, e.content_hash, e.content, e.note, e.auto_category, \
      e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at, \
-     e.content_kind, e.mime_type, e.payload, e.payload_nonce, e.metadata_json";
+     e.content_kind, e.mime_type, NULL AS payload, NULL AS payload_nonce, e.metadata_json";
+
+/// 带标签的查询列清单（性能优化 W4 / R16）。
+///
+/// 在第 16 列（索引 15）追加 `GROUP_CONCAT(t.tag, CHAR(31))` —— 用 ASCII
+/// Unit Separator（0x1F）作分隔符，而不是逗号：标签本身可能含逗号，
+/// 用逗号会让「一个含逗号的标签」与「两个标签」无法区分。
+///
+/// 第一段 15 列与 [`SELECT_COLS`] 逐字相同，`Entry::from_sqlite_row` 的
+/// 索引 0..=14 不受影响；调用方（`Storage::search_entries_with_tags`）从
+/// 索引 15 取标签串。
+pub(crate) const SELECT_COLS_WITH_TAGS: &str = "e.id, e.content_hash, e.content, e.note, e.auto_category, \
+     e.is_pinned, e.pinned_at, e.is_vault, e.is_decryptable, e.created_at, \
+     e.content_kind, e.mime_type, NULL AS payload, NULL AS payload_nonce, e.metadata_json, \
+     GROUP_CONCAT(t.tag, CHAR(31))";
 
 /// Pin 优先 + 时间倒序（R17）。`pinned_at` nulls-last 手工兜底。
 pub(crate) const PIN_ORDER: &str = "e.is_pinned DESC, \
@@ -94,28 +108,18 @@ pub fn sanitize_query(raw: &str) -> String {
 /// NOT `-`、前缀 `*`、分组 `()` 等），未加转义直接送入会触发
 /// parse error。降级到 LIKE 既不崩溃，又能对 `client-acme` 之类
 /// 带连字符的标签做子串命中。
+///
+/// 性能优化 W1 / KTD1:把 `-` / `+` / `=` / `.` / `/` / `\` 从降级列表里
+/// 拿掉。它们不是 FTS5 的语法字符,但**仍是 token 的一部分**:unicode61
+/// tokenizer 在它们两侧会照常用作词边界,搜 `k=v` / `client-acme` /
+/// `https://example.com/path` 时走 FTS5 比走 LIKE 三表全表扫快几个数量级。
+/// 真正会让 FTS5 报错的字符(`'` / `"` / `*` / `^` / `:` / `(` / `)` /
+/// `[` / `]` / `{` / `}` / `~` / `<` / `>`)保留降级。
 fn is_fts_hostile(q: &str) -> bool {
     q.chars().any(|c| {
         matches!(
             c,
-            '"' | '\''
-                | ':'
-                | '('
-                | ')'
-                | '*'
-                | '^'
-                | '-'
-                | '+'
-                | '{'
-                | '}'
-                | '['
-                | ']'
-                | '/'
-                | '\\'
-                | '~'
-                | '<'
-                | '>'
-                | '='
+            '\'' | '"' | ':' | '(' | ')' | '*' | '^' | '{' | '}' | '[' | ']' | '~' | '<' | '>'
         )
     })
 }
@@ -127,6 +131,25 @@ fn fts_match_string(q: &str) -> String {
 
 /// 构建搜索计划：拼装 `WHERE` / `ORDER BY` / `LIMIT` 与绑定参数。
 pub fn build_search_query(raw_query: &str, tab: &SearchTab, limit: u32) -> SearchPlan {
+    build_search_query_impl(raw_query, tab, limit, false)
+}
+
+/// 带标签的搜索计划（性能优化 W4 / R16）。
+///
+/// 与 [`build_search_query`] 的 `WHERE` / `ORDER BY` / `LIMIT` 完全相同，只是在
+/// `SELECT` 后追加 `GROUP_CONCAT(t.tag, CHAR(31))` 并 `LEFT JOIN tags`：
+/// 一次 SQLite round-trip 就把每条条目的标签带回，命令层不再为同一批 id
+/// 二次 `with_conn`（旧 `load_tags` 的 N+1 形状）。
+pub fn build_search_query_with_tags(raw_query: &str, tab: &SearchTab, limit: u32) -> SearchPlan {
+    build_search_query_impl(raw_query, tab, limit, true)
+}
+
+fn build_search_query_impl(
+    raw_query: &str,
+    tab: &SearchTab,
+    limit: u32,
+    with_tags: bool,
+) -> SearchPlan {
     let query = sanitize_query(raw_query);
     let mut params: Vec<String> = Vec::new();
     // 加密区条目永不进入普通搜索（R + U9）。
@@ -171,10 +194,147 @@ pub fn build_search_query(raw_query: &str, tab: &SearchTab, limit: u32) -> Searc
         _ => limit,
     };
 
-    let sql = format!(
-        "SELECT {SELECT_COLS} FROM entries e WHERE {filters} ORDER BY {PIN_ORDER} LIMIT {effective_limit}",
-        filters = filters.join(" AND "),
-    );
+    let filters_sql = filters.join(" AND ");
+    let sql = if with_tags {
+        // `GROUP BY e.id`:e.id 是主键,每组只有一行 entries;SQLite 的 bare-column
+        // 扩展允许 SELECT 里出现非聚合列(取该组任意一行,这里只有一行)。
+        format!(
+            "SELECT {SELECT_COLS_WITH_TAGS} FROM entries e \
+             LEFT JOIN tags t ON t.entry_id = e.id \
+             WHERE {filters_sql} GROUP BY e.id ORDER BY {PIN_ORDER} LIMIT {effective_limit}"
+        )
+    } else {
+        format!(
+            "SELECT {SELECT_COLS} FROM entries e WHERE {filters_sql} ORDER BY {PIN_ORDER} LIMIT {effective_limit}"
+        )
+    };
 
     SearchPlan { sql, params }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 性能优化 W1 / KTD1:`is_fts_hostile` 必须把**真正会让 FTS5 parse error** 的字符
+    /// 留下,把可作为 token 一部分的字符(`- + = . / \`)放走,让 URL / 路径 / `k=v` /
+    /// `client-acme` 走 FTS5 而不是 LIKE。
+    ///
+    /// 这条单测纯粹钉字符集——`build_search_query` 的端到端验证由 `app/src/storage.rs`
+    /// 的 `like_fallback_short_query` / `fts5_hit_on_content` 等用例覆盖。
+    #[test]
+    fn is_fts_hostile_allows_slash_dot_dash_plus_equal_and_backslash() {
+        // 放开:`- + = . / \`
+        for c in ['-', '+', '=', '.', '/', '\\'] {
+            let q = format!("client{c}acme");
+            assert!(
+                !is_fts_hostile(&q),
+                "字符 {c:?} 不应触发 LIKE 降级（走 FTS5 倒排更快）"
+            );
+        }
+
+        // 真 FTS5 敏感字符保留降级（任挑几个代表）
+        for c in ['\'', '"', '*', '^', ':', '(', ')', '[', ']', '~', '<', '>'] {
+            let q = format!("query{c}suffix");
+            assert!(
+                is_fts_hostile(&q),
+                "字符 {c:?} 必须触发 LIKE 降级（送进 FTS5 会 parse error）"
+            );
+        }
+    }
+
+    /// 5s 内的同内容重复只入一次 + `content_hash` UNIQUE 兜底去掉后到的同指纹——这条
+    /// 路径只由 storage 层覆盖(`process_dedups_within_window` /
+    /// `process_swallows_duplicate_fingerprint_already_in_db`)。search.rs 自身只断言
+    /// `parse_tab` 把 `recent` / `tag:x` / `category:x` 翻译正确,以及
+    /// `sanitize_query` 把控制字符剥掉、首尾空白 trim。这两条之前从未有人单测——这两
+    /// 条是从 search.rs 抽出来后的纯函数,远比底层 SQL 更易回归。
+    #[test]
+    fn parse_tab_dispatches_to_recent_tag_and_category() {
+        assert_eq!(parse_tab("recent"), SearchTab::Recent);
+        assert_eq!(parse_tab("tag:work"), SearchTab::Tag("work".to_string()));
+        assert_eq!(
+            parse_tab("category:URL"),
+            SearchTab::Category("URL".to_string())
+        );
+        // 未带前缀 / 未知 → All。这条降级是有意的(`search_results` 只在「已选中
+        // 标签/类别」时被调用,「全部」由 `tag` 或 `category` 返回的列表项触发)。
+        assert_eq!(parse_tab("all"), SearchTab::All);
+        assert_eq!(parse_tab(""), SearchTab::All);
+    }
+
+    #[test]
+    fn sanitize_query_strips_control_chars_and_trims() {
+        // 控制字符被过滤、首尾空白 trim。
+        assert_eq!(sanitize_query("  \thello\n  "), "hello");
+        // NUL 等控制字符滤掉,普通字符保留。
+        let raw = "foo bar";
+        let cleaned = sanitize_query(raw);
+        assert!(!cleaned.contains('\0'));
+        assert!(cleaned.contains("foobar"));
+        assert_eq!(
+            sanitize_query("foo bar"),
+            "foo bar",
+            "中间空格不是控制字符，必须保留"
+        );
+    }
+
+    /// W4 / R16:带标签版本必须 `LEFT JOIN tags` 加 `GROUP_CONCAT(t.tag, CHAR(31))`
+    /// 再加 `GROUP BY e.id`。无标签的原版本必须保持不变——不能让改动顺手扩大
+    /// 到 `list_vault` 之类还在用原路径的调用点。
+    #[test]
+    fn build_search_query_with_tags_adds_join_concat_and_group_by() {
+        let with_tags = build_search_query_with_tags("q", &SearchTab::All, 10);
+        assert!(
+            with_tags
+                .sql
+                .contains("LEFT JOIN tags t ON t.entry_id = e.id"),
+            "带标签版本必须 LEFT JOIN tags:{}",
+            with_tags.sql
+        );
+        assert!(
+            with_tags.sql.contains("GROUP_CONCAT(t.tag, CHAR(31))"),
+            "带标签版本必须用 CHAR(31) 作分隔符(不是逗号):{}",
+            with_tags.sql
+        );
+        assert!(
+            with_tags.sql.contains("GROUP BY e.id"),
+            "带标签版本必须 GROUP BY e.id:{}",
+            with_tags.sql
+        );
+        // WHERE / ORDER BY 与无标签版本一致（只差 SELECT 段）。
+        assert!(with_tags.sql.contains("e.is_vault = 0"));
+        assert!(with_tags.sql.contains(PIN_ORDER));
+
+        let plain = build_search_query("q", &SearchTab::All, 10);
+        assert!(
+            !plain.sql.contains("GROUP_CONCAT"),
+            "无标签版本不得被顺带改成带 JOIN 的形状:{}",
+            plain.sql
+        );
+        assert!(
+            !plain.sql.contains("JOIN"),
+            "无标签版本不该有 JOIN:{}",
+            plain.sql
+        );
+    }
+
+    /// 两种版本的绑定参数必须逐字一致(同一查询、同一 tab → 同样的 params);
+    /// 否则命令层切到 with_tags 之后会立刻因参数错位而静默查错。
+    #[test]
+    fn with_tags_variant_binds_the_same_params() {
+        for tab in [
+            SearchTab::All,
+            SearchTab::Recent,
+            SearchTab::Tag("work".to_string()),
+            SearchTab::Category("URL".to_string()),
+        ] {
+            let plain = build_search_query("client-acme", &tab, 25);
+            let tagged = build_search_query_with_tags("client-acme", &tab, 25);
+            assert_eq!(
+                plain.params, tagged.params,
+                "同一输入下两种版本的绑定参数必须一致（tab = {tab:?}）"
+            );
+        }
+    }
 }

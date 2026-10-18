@@ -91,37 +91,62 @@ fn main() {
             let skip_next = Arc::new(AtomicBool::new(false));
             let panel_opacity = Arc::new(AtomicU32::new(privacy::DEFAULT_PANEL_OPACITY));
             let keymap = Arc::new(RwLock::new(clipvault_core::keymap::HotkeyMap::default_map()));
+            // W7 / R30：自写抑制槽。`Watcher` 与 `AppState` 共享同一份 ——
+            // 「复制日志路径」写剪贴板前登记指纹，watcher 下一轮认出并跳过。
+            let self_writes: Arc<tokio::sync::Mutex<Option<String>>> =
+                Arc::new(tokio::sync::Mutex::new(None));
 
-            // 3.5 U10：spawn watcher 前，从 settings 表把持久化的访客模式载入原子，
-            //      使重启后 watcher / 托盘 / 前端与上次状态一致。
-            let initial_guest = tauri::async_runtime::block_on(
-                clipvault::privacy::boot_load_guest_mode(&storage, &guest_mode),
-            )
-            .unwrap_or(false);
+            // 3.5 W3 / R11:一次 `SELECT key, value FROM settings WHERE key IN (…)` 把
+            //      guest_mode / panel_opacity / hotkeys / log_level 四个键全取回来,
+            //      替代原先四次独立 `block_on`(每次都要重新拿 `Storage::conn` 的
+            //      tokio mutex)。读回后在内存里分发给各模块的 parse + apply。
+            let boot_settings = tauri::async_runtime::block_on(storage.get_settings_batch(&[
+                clipvault::privacy::GUEST_MODE_KEY,
+                clipvault::privacy::PANEL_OPACITY_KEY,
+                clipvault::keymap::HOTKEYS_KEY,
+                log::LOG_LEVEL_KEY,
+            ]))
+            .unwrap_or_default();
 
-            // 3.6 U12：从 settings 表加载持久化的面板透明度到原子，
-            //      使重启后前端启动即把 `--panel-alpha` CSS 变量对齐到上次状态。
-            let _initial_opacity = tauri::async_runtime::block_on(
-                clipvault::privacy::boot_load_panel_opacity(&storage, &panel_opacity),
-            )
-            .unwrap_or(privacy::DEFAULT_PANEL_OPACITY);
+            // 3.5a 访客模式 → 原子(托盘图标 / 前端 / watcher 共享)。
+            let initial_guest = clipvault::privacy::parse_guest_value(
+                boot_settings
+                    .get(clipvault::privacy::GUEST_MODE_KEY)
+                    .map(String::as_str),
+            );
+            clipvault::privacy::apply_guest_mode(&guest_mode, initial_guest);
 
-            // 3.7 U1：从 settings 表加载持久化的快捷键映射到 slot，
-            //      使重启后 panel 内热键与全局热键与上次一致。
-            let initial_keymap = tauri::async_runtime::block_on(
-                clipvault::keymap::boot_load_hotkeys(&storage, &keymap),
-            )
-            .unwrap_or_else(|e| {
-                ::log::warn!(target: "main", "boot_load_hotkeys 失败：{e}，使用默认映射");
-                clipvault_core::keymap::HotkeyMap::default_map()
-            });
+            // 3.5b 面板透明度 → 原子(前端启动时一次性对齐 `--panel-alpha`)。
+            let _initial_opacity = clipvault::privacy::parse_panel_opacity(
+                boot_settings
+                    .get(clipvault::privacy::PANEL_OPACITY_KEY)
+                    .map(String::as_str),
+            );
+            clipvault::privacy::apply_panel_opacity(&panel_opacity, _initial_opacity);
 
-            // 3.8 U2：从 settings 表加载持久化的日志级别到原子 + 同步全局
-            //      `log::set_max_level` 过滤器(必须在 spawn watcher 前,让
-            //      后续 `log::*!` 都按用户选择过滤)。
+            // 3.5c 快捷键映射 → slot(全局热键与 panel 内热键)。
+            let initial_keymap = match clipvault::keymap::parse_hotkeys(
+                boot_settings
+                    .get(clipvault::keymap::HOTKEYS_KEY)
+                    .map(String::as_str),
+            ) {
+                Ok(map) => map,
+                Err(e) => {
+                    ::log::warn!(target: "main", "boot_load_hotkeys 失败：{e}，使用默认映射");
+                    clipvault_core::keymap::HotkeyMap::default_map()
+                }
+            };
+            clipvault::keymap::apply_hotkeys(&keymap, &initial_keymap);
+
+            // 3.5d 日志级别 → 原子。注意:与旧路径等价 —— 旧 `boot_load_log_level`
+            //      也只 `atomic.store`,不在这里调 `log::set_max_level`(那由
+            //      `log::init` 与运行时 `set_log_level` 负责)。
             let _initial_log_level =
-                tauri::async_runtime::block_on(log::boot_load_log_level(&storage, &log_level))
-                    .unwrap_or(Level::Info);
+                log::parse_level(boot_settings.get(log::LOG_LEVEL_KEY).map(String::as_str));
+            log_level.store(
+                _initial_log_level as u8,
+                std::sync::atomic::Ordering::SeqCst,
+            );
 
             // 注册 IPC 共享状态（在 apply_global_hotkey 之前，因为 apply 需要 AppState.app）。
             app.manage(AppState {
@@ -131,10 +156,11 @@ fn main() {
                 panel_opacity: panel_opacity.clone(),
                 keymap: keymap.clone(),
                 log_level: log_level.clone(),
+                self_writes: self_writes.clone(),
                 app: app.handle().clone(),
             });
 
-            // 4.5 U9：启动时校验加密区条目的可解密性
+            // 4.4 U9：启动时校验加密区条目的可解密性
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if clipvault::crypto::system_key_available() {
@@ -152,7 +178,7 @@ fn main() {
             }
 
             // 5. 后台剪贴板 watcher（U3），与上面共享同一批开关。
-            let watcher = Watcher::new(storage, guest_mode, skip_next);
+            let watcher = Watcher::new(storage, guest_mode, skip_next, self_writes);
             tauri::async_runtime::spawn(watcher.run());
 
             // 6. 菜单栏托盘（反映启动时加载到的访客模式状态）。

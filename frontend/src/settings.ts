@@ -37,6 +37,20 @@ const RECHECK_DELAY_MS = 15_000;
 
 let recheckTimer: number | undefined;
 
+/**
+ * 取消待执行的辅助功能自动复检（W5 / R23）。
+ *
+ * 用户点「打开系统设置」后离开 ClipVault（关设置 / 面板隐藏 / 关面板）时调用：
+ * 那 15 秒的复检定时器若还挂着，会在横幅早已不可见时醒来、白打一次
+ * `check_accessibility` IPC。幂等 —— 没有待执行的复检时是 no-op。
+ */
+export function cancelAccessibilityRecheck(): void {
+  if (recheckTimer !== undefined) {
+    window.clearTimeout(recheckTimer);
+    recheckTimer = undefined;
+  }
+}
+
 /** 查询后端 `check_accessibility()`（即 `AXIsProcessTrusted()`）。 */
 async function isTrusted(): Promise<boolean> {
   try {
