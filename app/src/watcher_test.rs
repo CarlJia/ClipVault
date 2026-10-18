@@ -348,7 +348,9 @@ fn watcher_process_runs_make_thumbnail_inside_spawn_blocking() {
 #[test]
 fn watcher_poll_change_async_macos_moves_pasteboard_into_spawn_blocking() {
     let src = include_str!("watcher.rs");
-    let body = function_body_after(src, "async fn poll_change_async(&self) -> Option<Captured>");
+    // 用 macOS 块前的独有 doc 注释作 marker —— source 中另有
+    // cfg(not(...)) 与 cfg(windows) 两份同名函数,通用 marker 会抓到错的那份。
+    let body = function_body_after(src, "异步读剪贴板变化（macOS 实现 / 多类型扩展后）");
     let pb_pos = body
         .find("generalPasteboard")
         .expect("macOS poll_change_async 仍应读 NSPasteboard");
@@ -369,7 +371,8 @@ fn watcher_poll_change_async_macos_moves_pasteboard_into_spawn_blocking() {
 #[test]
 fn watcher_poll_change_async_windows_moves_clipboard_io_into_spawn_blocking() {
     let src = include_str!("watcher.rs");
-    let body = function_body_after(src, "async fn poll_change_async(&self) -> Option<Captured>");
+    // 同上:用 Windows 块前的独有 doc 注释作 marker,避免抓到 macOS 版。
+    let body = function_body_after(src, "异步读剪贴板变化(Windows 实现 / U1)");
     let seq_pos = body
         .find("GetClipboardSequenceNumber")
         .expect("Windows poll_change_async 应仍读 sequence number");
