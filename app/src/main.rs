@@ -160,12 +160,7 @@ fn main() {
                 app: app.handle().clone(),
             });
 
-            // 4.4 W3 / R13:后台预热系统凭据库的数据密钥 —— 冷启动首次访问常要几百
-            //      毫秒(securityd / LSA 冷启、首次创建条目)。预热成后台线程,
-            //      用户触发第一条加密 / 解密 IPC 时基本都走缓存命中。
-            clipvault::crypto::preload_spawn();
-
-            // 4.5 U9：启动时校验加密区条目的可解密性
+            // 4.4 U9：启动时校验加密区条目的可解密性
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             {
                 if clipvault::crypto::system_key_available() {
