@@ -255,24 +255,35 @@ retryEl.addEventListener("click", () => {
   runSave();
 });
 
-// 编辑器自身的键盘处理（⌘S 保存 / Esc 关闭）。用捕获阶段确保先于
-// main.ts 的全局 keydown 处理，且只在编辑器打开时生效。
-rootEl.addEventListener("keydown", (ev) => {
-  if (!open) return;
-  if ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S")) {
-    ev.preventDefault();
-    ev.stopPropagation();
-    if (state === "error") runSave();
-    else flushSave();
-    return;
-  }
-  if (ev.key === "Escape") {
-    ev.preventDefault();
-    ev.stopPropagation();
-    closeEditor();
-    onCloseCb?.();
-  }
-});
+// 编辑器自身的键盘处理（⌘S 保存 / Esc 关闭）。挂到 `document` + 捕获阶段，
+// 确保先于 main.ts 的全局 keydown（main.ts:947 在编辑器开着时早 return）；
+// **不**挂到 `#editor` 根元素上 —— 那样要求焦点必须是 `#editor` 后代，而
+// main.ts:1015 的 window focus 处理器会把焦点拽到搜索框，编辑器模态仍开着、
+// 但 Esc 与 ⌘S 都收不到键（见 #30）。
+//
+// `ev.isComposing`（中文输入法候选词正在编辑）是早 return —— 让 IME 优先处理 Esc
+//（中文 IME 的「取消输入」语义），而不是被算法退化成「关闭编辑器」。
+document.addEventListener(
+  "keydown",
+  (ev) => {
+    if (!open) return;
+    if (ev.isComposing) return;
+    if ((ev.metaKey || ev.ctrlKey) && (ev.key === "s" || ev.key === "S")) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (state === "error") runSave();
+      else flushSave();
+      return;
+    }
+    if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      closeEditor();
+      onCloseCb?.();
+    }
+  },
+  true,
+);
 
 // Esc 关闭后把焦点交还列表：由 main.ts 注入回调。
 let onCloseCb: (() => void) | null = null;
