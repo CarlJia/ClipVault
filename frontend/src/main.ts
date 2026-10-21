@@ -36,6 +36,7 @@ import {
   renderVaultList,
 } from "./panel";
 import { createOverlayGate } from "./overlay-intent";
+import { waitForKeyRelease } from "./gesture";
 import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
   type LogInfoDto,
@@ -386,6 +387,19 @@ async function activateIndex(idx: number): Promise<void> {
   applySelectionPatch(selected);
   scrollToSelected();
   await pasteEntry(entries[idx]);
+}
+
+/** ⌘1–9：等这次按键手势完全抬起后再回贴（为什么必须等，见 `gesture.ts` 顶部）。
+ *
+ *  回贴会隐藏面板、把键盘焦点交还目标应用。若此刻用户还按着 ⌘+数字，交还之后
+ *  系统发出的按键自动重复会落到目标应用上 —— Edge / Chrome 把 ⌘1–9 当作
+ *  「切到第 N 个标签页」，于是这次回贴变成切标签页，随后注入的 ⌘V 也落到被切走
+ *  的那一页（现象：按 ⌘1 没贴出内容，浏览器却切了标签页）。
+ *  手势中途面板失焦 / 超时未松开 → 放弃这次回贴。 */
+async function pasteIndexAfterGesture(ev: KeyboardEvent): Promise<void> {
+  const end = await waitForKeyRelease(ev.key, window);
+  if (end !== "released") return;
+  await activateIndex(Number(ev.key) - 1);
 }
 
 /** 回贴前统一收起三个浮层：加密区模态、备注编辑器、预览栏。
@@ -1005,7 +1019,11 @@ document.addEventListener("keydown", (ev) => {
     ev.key <= "9"
   ) {
     ev.preventDefault();
-    void activateIndex(Number(ev.key) - 1);
+    // 键盘自动重复：按住不放会源源不断地送 keydown，只认第一次。重复仍然吞掉 ——
+    // 手势期间面板保持 key window，重复按键不能漏给目标应用（见
+    // `pasteIndexAfterGesture`）。
+    if (ev.repeat) return;
+    void pasteIndexAfterGesture(ev);
   }
 });
 

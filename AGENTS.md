@@ -271,6 +271,17 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `data-index` / selected 标记 / 空列表走空态）。
   W7 —— `process_skips_self_written_content`、`self_write_slot_does_not_swallow_a_different_capture`、
   `preview_is_served_from_cache_after_payload_is_cleared`、`vault_image_preview_is_not_cached`。
+- **⌘1–9 回贴与浏览器的标签页快捷键冲突**：在 Edge / Chrome 里**按住** ⌘1–9 回贴时，面板先隐藏、
+  焦点交还浏览器，而按键**自动重复**仍在继续（默认约 500ms 后起）—— 重复出来的 `⌘+数字` 于是落到
+  已经回到前台的浏览器上，被它当成自己的「切到第 N 个标签页」。用户看到的是「按 ⌘1 没贴出内容、
+  浏览器却切了标签页」，随后注入的合成 ⌘V 也落到被切走的那一页（快速轻点不复现，正是因为
+  交还焦点前系统还没开始重复）。
+  修法：`main.ts` 的 ⌘1–9 分支先按 `ev.repeat` 只认第一次（其余仍然吞掉），再等**触发键松开**
+  （`gesture.ts` 的 `waitForKeyRelease`）才走 `activateIndex` —— 手势期间面板一直是 key window，
+  重复按键由 WebView 吞掉，目标应用只会看到合成的 ⌘V。面板失焦 / 1s 内未松开 → 放弃这次回贴，
+  **不**照常回贴：照常回贴等于把仍被按着的 ⌘+数字原样漏给目标应用，正是要修的 bug。
+  只等触发键、不等修饰键：自动重复由「键仍被按着」驱动，修饰键自身不会重复。
+  本轮新增前端 5 例（`gesture.test.ts`）→ 前端 **140 例（8 个测试文件）**。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：
