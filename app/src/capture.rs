@@ -99,13 +99,26 @@ impl Captured {
 
     /// 构造 RTF 捕获：原始 RTF 字节;无结构化 metadata（R22: RTF 不入
     /// FTS,只需 raw bytes 用于 pasteback 写 `.rtf`）。
-    pub fn rtf(bytes: Vec<u8>) -> Self {
+    ///
+    /// `text` 是随 RTF 一起给出的**纯文本兜底**，存进 `metadata_json.text` 而不是
+    /// `content`：`entries_fts` 的 INSERT 触发器对非 file 的二进制条目收的就是
+    /// `NEW.content`（`clipvault-core/src/schema.rs`），文本一旦进了 `content` 就会被
+    /// 顺手变成可搜索内容，与 R22「rtf 不入 FTS」冲突。`metadata_json` 才是二进制类型
+    /// 放描述性内容的地方 —— color 的 `rgba` 就在那里。
+    ///
+    /// 没有它会怎样：回贴时剪贴板上只有 `Rich Text Format`，而 Win32 剪贴板没有 macOS
+    /// 那种格式自动转换，记事本、终端这些只认 `CF_UNICODETEXT` 的接收方拿到的就是空。
+    pub fn rtf(bytes: Vec<u8>, text: Option<String>) -> Self {
+        let mut metadata = serde_json::Map::new();
+        if let Some(t) = text.as_deref().filter(|t| !t.is_empty()) {
+            metadata.insert("text".into(), Value::String(t.to_string()));
+        }
         Self {
             kind: ContentKind::Rtf,
             mime: Some("application/rtf".into()),
             text: None,
             payload: Some(bytes),
-            metadata: json!({}),
+            metadata: Value::Object(metadata),
         }
     }
 
@@ -234,9 +247,10 @@ pub fn poll_first_non_empty(change_count: i64, prev_change_count: i64) -> Option
         return Some(Captured::image("image/tiff", bytes, w, h));
     }
 
-    // 3. rtf
+    // 3. rtf（顺带取一份纯文本兜底：RTF 只对富文本接收方有用）
     if let Some(bytes) = unsafe { pb.dataForType(NSPasteboardTypeRTF) }.map(|d| d.to_vec()) {
-        return Some(Captured::rtf(bytes));
+        let plain = unsafe { pb.stringForType(NSPasteboardTypeString) }.map(|s| s.to_string());
+        return Some(Captured::rtf(bytes, plain));
     }
 
     // 4. color: 反归档取出真实 sRGB 分量（U2 的长度占位实现已由 U2 收口单元替换）。
@@ -433,18 +447,24 @@ mod win {
     }
 
     /// RTF:注册格式 `Rich Text Format`(Word / WordPad / 多数富文本编辑器)。
+    ///
+    /// 顺带读一份 `CF_UNICODETEXT` 作为纯文本兜底:Word 这类富文本应用总是两种格式
+    /// 一起挂,而纯文本那份才是记事本 / 终端这类接收方认的东西(见 `Captured::rtf`)。
+    /// 只挂 RTF 的复制源(理论存在)拿不到文本,`text` 留 `None`,行为与修复前一致。
     fn read_rtf() -> Option<Captured> {
         let format = rtf_format()?;
         let bytes = read_bytes(format, MAX_BINARY_READ_BYTES)?;
         if bytes.is_empty() {
             return None;
         }
-        Some(Captured::rtf(bytes))
+        Some(Captured::rtf(bytes, read_plain_text()))
     }
 
     /// 纯文本兜底。`CF_UNICODETEXT` 一定存在:系统会在 `CF_TEXT` / `CF_OEMTEXT` /
     /// `CF_UNICODETEXT` 之间自动转换,所以只挂旧格式的复制源也能读到。
-    fn read_text() -> Option<Captured> {
+    ///
+    /// RTF 分支与纯文本分支共用它 —— 两边读的是同一份 `CF_UNICODETEXT`。
+    fn read_plain_text() -> Option<String> {
         let bytes = read_bytes(CF_UNICODETEXT.0 as u32, MAX_BINARY_READ_BYTES)?;
         // `as_chunks` 而不是 `chunks_exact`：后者在 clippy 1.99 起会报
         // chunks_exact_to_as_chunks。两者都会丢掉末尾不足一组的字节，语义一致
@@ -456,8 +476,16 @@ mod win {
             .map(|pair| u16::from_le_bytes(*pair))
             .collect();
         // 结尾的 NUL 是格式的一部分,不是内容。
-        let text = String::from_utf16_lossy(&units);
-        Some(Captured::text(text.trim_end_matches('\0')))
+        Some(
+            String::from_utf16_lossy(&units)
+                .trim_end_matches('\0')
+                .to_string(),
+        )
+    }
+
+    /// 纯文本兜底分支(优先级最低)。见 [`read_plain_text`]。
+    fn read_text() -> Option<Captured> {
+        Some(Captured::text(read_plain_text()?))
     }
 
     /// 读一个剪贴板格式的全部字节。
@@ -894,7 +922,7 @@ mod tests {
         let text = Captured::text("identical-bytes");
         let file = Captured::file(vec!["identical-bytes".into()], false);
         let image = Captured::image("image/png", bytes.clone(), 1, 1);
-        let rtf = Captured::rtf(bytes);
+        let rtf = Captured::rtf(bytes, None);
         assert_ne!(text.fingerprint(), file.fingerprint());
         assert_ne!(file.fingerprint(), image.fingerprint());
         assert_ne!(image.fingerprint(), rtf.fingerprint());
@@ -918,8 +946,8 @@ mod tests {
         let file_b = Captured::file(vec!["/tmp/b.txt".into()], true);
         assert_ne!(file_a.fingerprint(), file_b.fingerprint());
 
-        let rtf_a = Captured::rtf(b"{\\rtf1 a}".to_vec());
-        let rtf_b = Captured::rtf(b"{\\rtf1 b}".to_vec());
+        let rtf_a = Captured::rtf(b"{\\rtf1 a}".to_vec(), None);
+        let rtf_b = Captured::rtf(b"{\\rtf1 b}".to_vec(), None);
         assert_ne!(rtf_a.fingerprint(), rtf_b.fingerprint());
 
         // 指纹必须仍然是 payload 的确定函数:5 秒去重窗口靠它判「同一条内容」,
@@ -1206,5 +1234,68 @@ mod tests {
             stored_hash, real_fp,
             "rows.content_hash 绝不能等于 captured.fingerprint() 的真实结果（说明函数真的用 caller 值）"
         );
+    }
+
+    /// rtf 捕获必须带一份纯文本兜底，且它落在 `metadata_json` 而不是 `content`：
+    /// `entries_fts` 的 INSERT 触发器对非 file 的二进制条目收的就是 `NEW.content`
+    /// （`clipvault-core/src/schema.rs`），文本进了 `content` 就会被顺手变成可搜索
+    /// 内容，与 R22「rtf 不入 FTS」冲突。
+    #[test]
+    fn rtf_capture_keeps_plain_text_in_metadata_not_content() {
+        let captured = Captured::rtf(b"{\\rtf1 hi}".to_vec(), Some("hi".into()));
+
+        assert_eq!(captured.kind, ContentKind::Rtf);
+        assert!(
+            captured.text.is_none(),
+            "Captured.text 是条目的 content 位，必须留空"
+        );
+        assert_eq!(captured.metadata["text"], "hi");
+    }
+
+    /// 没有纯文本（只挂 RTF 的复制源）或空串时，metadata 里不留 `text` 键 ——
+    /// 回贴侧据此只挂 RTF，行为与修复前一致。
+    #[test]
+    fn rtf_capture_omits_empty_text_fallback() {
+        for text in [None, Some(String::new())] {
+            let captured = Captured::rtf(b"{\\rtf1 hi}".to_vec(), text);
+            assert!(
+                captured.metadata.get("text").is_none(),
+                "没有可用文本兜底时不该写一个空 text 键"
+            );
+        }
+    }
+
+    /// 端到端：rtf 捕获落库后 `content` 仍是空（不污染 FTS），纯文本在 metadata 里。
+    #[tokio::test]
+    async fn rtf_capture_round_trips_through_insert() {
+        let storage = crate::storage::test_helpers::open_test_db();
+        let captured = Captured::rtf(b"{\\rtf1 hi}".to_vec(), Some("hi".into()));
+        let metadata_json = serde_json::to_string(&captured.metadata).unwrap();
+
+        let id = insert_captured_with_metadata(
+            &storage,
+            &captured,
+            "rtf",
+            &metadata_json,
+            &captured.fingerprint(),
+        )
+        .await
+        .unwrap();
+
+        let (content, stored_metadata): (String, Option<String>) = storage
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT content, metadata_json FROM entries WHERE id = ?1",
+                    [id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(content, "", "rtf 条目的 content 必须留空（R22：不入 FTS）");
+        let meta: serde_json::Value =
+            serde_json::from_str(stored_metadata.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(meta["text"], "hi", "纯文本兜底应随条目一起入库");
     }
 }

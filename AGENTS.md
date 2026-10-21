@@ -282,6 +282,18 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   **不**照常回贴：照常回贴等于把仍被按着的 ⌘+数字原样漏给目标应用，正是要修的 bug。
   只等触发键、不等修饰键：自动重复由「键仍被按着」驱动，修饰键自身不会重复。
   本轮新增前端 5 例（`gesture.test.ts`）→ 前端 **140 例（8 个测试文件）**。
+- **RTF 条目补上纯文本兜底**：富文本应用（Word 等）复制时同时提供 RTF 与纯文本，采集侧此前
+  **只留 RTF**（`capture.rs` 的 `read_rtf` 早于 `read_text`，Word 的内容因此被录成 rtf 条目而非
+  文本条目），回贴侧也**只挂 RTF** —— Win32 剪贴板没有 macOS 那种格式自动转换，于是记事本、
+  终端这些只认 `CF_UNICODETEXT` 的接收方拿到的就是空（现象：从 Word 复制的条目回贴出来是空白）。
+  改法与 File 条目同构：采集时顺带读一份纯文本，回贴时 RTF + 纯文本一起挂。纯文本存
+  **`metadata_json.text`** 而不是 `entries.content` —— 后者非空会被 `entries_fts` 的 INSERT
+  触发器收进 FTS（`clipvault-core/src/schema.rs` 的触发器对非 file 二进制条目收的就是
+  `NEW.content`），与 R22「rtf 不入 FTS」冲突；`metadata_json` 才是二进制类型放描述性内容的地方
+  （color 的 `rgba` 就在那里）。旧库里的 rtf 条目没有兜底，行为与修复前一致，重新复制一次即可。
+  本轮新增后端 7 例（`perform_paste` 的 rtf 双写 / 旧条目降级 / 加密区 rtf 三条 +
+  `rtf_paste_text` 边界 1 条 + 采集侧 metadata 落点 3 条）→ 后端实测 **348 passed + 1 ignored**
+  （上一轮 341）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：

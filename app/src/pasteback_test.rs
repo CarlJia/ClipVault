@@ -15,8 +15,8 @@ use crate::crypto::Decryptor;
 use crate::pasteback::{
     AccessibilityChecker, InjectError, PasteBackend, PasteError, PasteOutcome, cgevent_fail_msg,
     color_paste_text, copy_text_to_clipboard, file_paths, file_text_fallback, modifier_label,
-    no_accessibility_msg, perform_paste, should_replace_target, vault_decrypt_fail_msg,
-    wait_for_frontmost, window_switched_msg,
+    no_accessibility_msg, perform_paste, rtf_paste_text, should_replace_target,
+    vault_decrypt_fail_msg, wait_for_frontmost, window_switched_msg,
 };
 
 /// 固定返回布尔的 Accessibility mock。
@@ -893,5 +893,194 @@ fn pastebackend_file_vault_decrypts_payload_first() {
         *backend.wrote_payload_len.borrow(),
         Some(plaintext.len()),
         "交出去的应是解密后的明文路径 JSON，不是密文"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rtf 条目的纯文本兜底
+// ---------------------------------------------------------------------------
+
+/// RTF 原始字节（测试里只需要「是一段 RTF」这个形状）。
+const RTF_BYTES: &[u8] = br"{\rtf1\ansi hello}";
+
+/// 构造一条非加密 rtf 条目：RTF 原始字节在 `payload`，纯文本兜底在
+/// `metadata_json.text`（与 color 的 `metadata_json.rgba` 同构）。
+fn rtf_entry_with_text(text: &str) -> Entry {
+    Entry::from_row(
+        7,
+        "rtfhash".to_string(),
+        String::new(), // content 留空：非空会被 entries_fts 触发器收进 FTS（R22：rtf 不入 FTS）
+        String::new(),
+        "rtf".to_string(),
+        0,
+        None,
+        0,
+        1,
+        0,
+        "rtf".to_string(),
+        Some("application/rtf".to_string()),
+        Some(RTF_BYTES.to_vec()),
+        None,
+        Some(format!(r#"{{"text":"{text}"}}"#)),
+    )
+}
+
+/// 构造一条**旧库里**的 rtf 条目：只有 payload，`metadata_json` 里没有文本兜底。
+fn legacy_rtf_entry() -> Entry {
+    Entry::from_row(
+        8,
+        "legacypath".to_string(),
+        String::new(),
+        String::new(),
+        "rtf".to_string(),
+        0,
+        None,
+        0,
+        1,
+        0,
+        "rtf".to_string(),
+        Some("application/rtf".to_string()),
+        Some(RTF_BYTES.to_vec()),
+        None,
+        Some("{}".to_string()),
+    )
+}
+
+/// RTF 必须与纯文本**一起**挂上剪贴板：Win32 剪贴板没有 macOS 那种格式自动转换，
+/// 只挂 `Rich Text Format` 的话，记事本、终端这类只认 `CF_UNICODETEXT` 的接收方
+/// 拿到的就是空 —— 用户看到的是「按了回贴什么都没贴出来」。
+#[test]
+fn rtf_entry_writes_plain_text_together_with_rtf() {
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend::default();
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &rtf_entry_with_text("从 Word 复制的正文"),
+        None,
+        None,
+        None,
+        &NeverDecryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Rtf));
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some("从 Word 复制的正文"),
+        "RTF 必须带一份纯文本，否则纯文本接收方（记事本 / 终端）贴出来是空的"
+    );
+    assert_eq!(
+        *backend.wrote_payload_len.borrow(),
+        Some(RTF_BYTES.len()),
+        "RTF 原始字节仍要原样写出（富文本接收方靠它）"
+    );
+}
+
+/// 旧条目没有文本兜底时不能出事：只写 RTF，文本位留空。
+#[test]
+fn legacy_rtf_entry_without_text_fallback_still_writes_rtf() {
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend::default();
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &legacy_rtf_entry(),
+        None,
+        None,
+        None,
+        &NeverDecryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Rtf));
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some(""),
+        "没有兜底文本时写空串（后端据此只挂 RTF），不得编造内容"
+    );
+    assert_eq!(*backend.wrote_payload_len.borrow(), Some(RTF_BYTES.len()));
+}
+
+/// 构造一条加密区 rtf 条目：payload 是密文（走 `decrypt_payload`），纯文本兜底在
+/// **明文** `metadata_json` 里（metadata 不参与加密，与 color 同构）。
+fn vault_rtf_entry() -> Entry {
+    Entry::from_row(
+        9,
+        "vrtfhash".to_string(),
+        String::new(),
+        String::new(),
+        "rtf".to_string(),
+        0,
+        None,
+        1, // is_vault
+        1,
+        0,
+        "rtf".to_string(),
+        Some("application/rtf".to_string()),
+        Some(b"encrypted rtf bytes".to_vec()),
+        Some(vec![0u8; 12]), // payload_nonce
+        Some(r#"{"text":"加密区里的正文"}"#.to_string()),
+    )
+}
+
+/// 加密区 rtf 条目同样要带纯文本兜底 —— `metadata_json` 不参与加密（color 早已依赖
+/// 这点），所以文本走 `rtf_paste_text` 直接读，不该被 payload 解密那一步卡住。
+#[test]
+fn vault_rtf_entry_also_writes_plain_text_from_metadata() {
+    let checker = MockChecker { trusted: true };
+    let backend = MockBackend::default();
+    let decryptor = MockDecryptor {
+        text: Ok(String::new()),
+        bytes: Ok(RTF_BYTES.to_vec()),
+    };
+    let payload_nonce = [0u8; 12];
+
+    let result = perform_paste(
+        &checker,
+        &backend,
+        &vault_rtf_entry(),
+        None,
+        None,
+        Some(&payload_nonce),
+        &decryptor,
+    );
+
+    assert_eq!(result, Ok(PasteOutcome::Pasted));
+    assert_eq!(*backend.wrote_kind.borrow(), Some(ContentKind::Rtf));
+    assert_eq!(
+        backend.wrote_content.borrow().as_deref(),
+        Some("加密区里的正文"),
+        "加密区 rtf 条目的纯文本兜底也要贴出来（metadata 不加密）"
+    );
+    assert_eq!(
+        *backend.wrote_payload_len.borrow(),
+        Some(RTF_BYTES.len()),
+        "RTF 字节仍应是解密后的明文"
+    );
+}
+
+/// `rtf_paste_text` 的边界：取不到就返回空串，**不得编造内容** —— 空串让后端
+/// 只挂 RTF（修复前的行为），编造出来的文本会让用户贴出错误内容。
+#[test]
+fn rtf_paste_text_reads_metadata_and_degrades_to_empty() {
+    assert_eq!(
+        rtf_paste_text(Some(r#"{"text":"正文"}"#)),
+        "正文",
+        "正常路径：从 metadata_json.text 取回纯文本"
+    );
+    assert_eq!(rtf_paste_text(Some("{}")), "", "旧条目没有 text 字段");
+    assert_eq!(rtf_paste_text(None), "", "没有 metadata");
+    assert_eq!(
+        rtf_paste_text(Some("not json")),
+        "",
+        "metadata 不是合法 JSON"
+    );
+    assert_eq!(
+        rtf_paste_text(Some(r#"{"text":42}"#)),
+        "",
+        "text 不是字符串（不该被强转成乱码）"
     );
 }
