@@ -1030,12 +1030,16 @@ document.addEventListener("keydown", (ev) => {
 // 面板每次被唤出（窗口获得焦点）时：回到主列表、聚焦搜索框、复检权限、刷新列表。
 // 收起加密区模态：面板被隐藏（热键 / 托盘）时模态可能仍处于打开态，而搜索框已获焦点，
 // 保持模态会让「看得见的是加密区、敲进去的是搜索框」，故每次唤出都从主列表开始。
+// 收起编辑器模态：同上 —— `panel::handle_window_event` 只 hide 窗口、不动 WebView DOM，
+// 编辑器仍开着（备注 / 标签未提交 + `#editor` 仍显示）的话，焦点被拽回搜索框后用户按
+// Esc 收不到、且「编辑器模态挡住主列表」看着像 Esc 失灵（#30）。
 window.addEventListener("focus", () => {
   // 托盘「加密区」刚点名要打开它时跳过这一次重置：`openVault()` 与这次 focus 谁先
   // 到取决于平台事件循环，不豁免的话浮层刚打开就被收回 —— 与「点了没功能」同貌。
   // 必须叠加 `isVaultOpen()`：focus 先到的顺序里浮层还没开，那时不需要豁免
   // （关的只是空气），也不该把这份豁免借给之后不相干的 focus。
   if (!(isVaultOpen() && overlayGate.isFresh())) closeVault();
+  if (isEditorOpen()) closeEditor();
   // 面板重新被唤出（R12）：预览栏一律收起、窗口回 normal，图片缓存也清掉 ——
   // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
   void closePreview();
