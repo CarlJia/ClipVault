@@ -241,6 +241,29 @@ pub fn color_paste_text(metadata_json: Option<&str>) -> String {
         .unwrap_or_default()
 }
 
+/// rtf 条目的**纯文本兜底**：从 `metadata_json.text` 取（与 [`Captured::rtf`] 同源，
+/// 也与 color 的 [`color_paste_text`] 同一形状 —— 二进制类型的描述性内容一律放
+/// `metadata_json`，**不放** `entries.content`）。
+///
+/// 为什么必须有它：`entries_fts` 的 INSERT 触发器对非 file 的二进制条目收的是
+/// `NEW.content`（`clipvault-core/src/schema.rs`），所以 `content` 必须留空，rtf 文本
+/// 才不会被顺手变成可搜索内容（R22 契约）。但回贴侧不能只挂 RTF：Win32 剪贴板没有
+/// macOS 那种格式自动转换，记事本、终端这些只认 `CF_UNICODETEXT` 的接收方会拿到空 —
+/// 与 [`file_text_fallback`] 是同一条道理，只是载体从 payload 换成了 metadata。
+///
+/// 旧条目（修复前入库的 rtf）没有这个字段，取不到时返回空串，后端据此只挂 RTF，
+/// 与修复前行为一致。
+pub fn rtf_paste_text(metadata_json: Option<&str>) -> String {
+    metadata_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|meta| {
+            meta.get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
 /// file 条目的 payload(JSON 编码的 `Vec<String>`,与 `Captured::file` 同源)解出路径数组。
 ///
 /// 抽成纯函数是为了让「payload 缺失 / 不是 JSON / 不是字符串数组」这些边界能在任意平台
@@ -298,12 +321,16 @@ pub fn perform_paste<C: AccessibilityChecker, B: PasteBackend>(
     // 1. 内容解析(vault 接缝)。在写剪贴板前失败,保证 vault 条目不落盘剪贴板。
     //    - text kind: 走 `decrypt_content`(base64 解码 entry.content 配 nonce)。
     //    - color kind: 色值在 `metadata_json.rgba`,由 `color_paste_text` 取出(无 payload)。
+    //    - rtf kind: 纯文本兜底在 `metadata_json.text`,由 `rtf_paste_text` 取出
+    //      (RTF 字节本身走下面的 payload 分支) —— 少了它,只挂 RTF 的剪贴板在
+    //      记事本 / 终端这类纯文本接收方那里就是空的。
     //    - 其余非 text kind: entry.content 留空;vault 条目需要 `decrypt_payload` 解密
     //      payload BLOB;非 vault 条目 payload 是明文,直接用。
     let kind = ContentKind::parse(&entry.content_kind);
     let text = match kind {
         ContentKind::Text => decrypt_content(entry, nonce, decryptor)?,
         ContentKind::Color => color_paste_text(entry.metadata_json.as_deref()),
+        ContentKind::Rtf => rtf_paste_text(entry.metadata_json.as_deref()),
         _ => String::new(),
     };
     let payload_bytes: Option<Vec<u8>> = if matches!(kind, ContentKind::Text | ContentKind::Color) {
@@ -668,6 +695,14 @@ mod imp {
                     let nsdata = objc2_foundation::NSData::from_vec(bytes.to_vec());
                     let _ =
                         unsafe { pasteboard.setData_forType(Some(&nsdata), NSPasteboardTypeRTF) };
+                    // 纯文本兜底（`rtf_paste_text` 从 metadata 取）：终端等不吃 RTF 的
+                    // 接收方只能靠它。与 File 分支同一条道理 —— 「挂引用 + 挂文本」两种
+                    // 表示一起给，由接收方各取所需。旧条目没有兜底文本时什么都不写。
+                    if !content.is_empty() {
+                        let ns = NSString::from_str(content);
+                        let _ =
+                            unsafe { pasteboard.setString_forType(&ns, NSPasteboardTypeString) };
+                    }
                 }
                 ContentKind::Color => {
                     // color 走 rgba() 文本字符串写入 .string 类型。
@@ -1015,6 +1050,16 @@ mod imp_win {
                         && let Some(format) = crate::capture::rtf_format()
                     {
                         set_format(format, bytes);
+                    }
+                    // 纯文本兜底（`rtf_paste_text` 从 metadata 取）。Win32 剪贴板
+                    // **没有**格式自动转换：记事本、终端、绝大多数编辑器只认
+                    // `CF_UNICODETEXT`，只挂 RTF 的剪贴板在它们那里等于空 —— 与上面
+                    // File 分支「`CF_HDROP` + `CF_UNICODETEXT` 一起挂」同一条道理。
+                    if !content.is_empty() {
+                        set_format(
+                            CF_UNICODETEXT.0 as u32,
+                            &utf16_le_bytes(&crate::winclip::utf16_nul(content)),
+                        );
                     }
                 }
             }
