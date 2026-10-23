@@ -294,6 +294,28 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   本轮新增后端 7 例（`perform_paste` 的 rtf 双写 / 旧条目降级 / 加密区 rtf 三条 +
   `rtf_paste_text` 边界 1 条 + 采集侧 metadata 落点 3 条）→ 后端实测 **348 passed + 1 ignored**
   （上一轮 341）。
+- **v0.10.1 发布：并入两条此前未进 main 的分支**（`release/v0.10.1`）：
+  - `origin/feat/about-panel`（提交 5efeafa，「托盘『加密区』不再只弹出一个空面板」）：新增
+    `frontend/src/overlay-intent.ts` 的 `createOverlayGate`，面板每次被唤出的 focus 回调里，
+    浮层刚被点名要打开且「还新鲜」时跳过 `closeVault()` —— 原来 `openVault()` 与 focus
+    谁先到取决于平台事件循环，不豁免的话浮层刚打开就被收回，与「点了没功能」同貌。
+    附带 `tray-entries.test.ts` 6 例钉住托盘菜单项分发。
+  - `origin/fix/macos-file-pasteboard`（2 个提交）：把 `capture.rs` 的内联测试模块搬到
+    `app/src/capture_test.rs`（与 `pasteback_test.rs` / `winclip_test.rs` 同形），capture.rs
+    1301 → 779 行；把 `poll_filenames` 里「异质 NSArray → NSURL 数组」的 downcast 过滤抽成纯
+    函数 `urls_from_objects(&NSArray)` 并补 1 例 —— 真实粘贴板走
+    `readObjectsForClasses([NSURL.class])` 只回 NSURL，构造不出混入非 NSURL 的输入，过滤
+    分支此前无覆盖。被测试驱动的 helper 改 `pub(crate)`（sibling 测试模块看不到私有项，
+    glob 重导出也传不出，因为只重导出 pub 项）。
+  - **合并时的两处取舍**：① 该分支的 `capture_test.rs` 是 2026-10-15 的快照，早于 RTF 兜底
+    与 W1 性能优化 —— 直接用会编译失败（`Captured::rtf` 已改成双参数）。解法是以 main 的
+    测试模块为基准重建该文件，再补入分支新增的 `urls_from_objects` 用例，26 条测试一条不少。
+    ② `AGENTS.md` 的冲突里分支侧只有一行当时（217）的基线数字，早已过时，整行丢弃。
+  - **本版实测基线：后端 app 304 + core 45 = 349 passed + 1 ignored；前端 146 例（9 个测试
+    文件）**（上一版 348 + 1 ignored / 140 例 8 个文件）。`cargo fmt --check`、`cargo check
+    --workspace --all-targets`、`cargo clippy -- -D warnings`、`cargo test --workspace`、
+    `npm run build`、`npm test`、`packaging/check-windows.sh`（check + clippy）全绿；R13
+    网络出口审计仍为空。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：

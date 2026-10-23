@@ -29,6 +29,8 @@ pub mod watcher;
 pub mod winclip;
 
 #[cfg(test)]
+mod capture_test;
+#[cfg(test)]
 mod commands_test;
 #[cfg(test)]
 mod crypto_test;
