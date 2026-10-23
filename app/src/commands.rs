@@ -977,8 +977,16 @@ pub async fn get_entry_preview(id: i64, state: State<'_, AppState>) -> Result<Pr
 /// 命令名保留 `keychain_available`（前端已在用），但在 Windows 上它的语义是
 /// **Windows 凭据管理器是否可用** —— 二者是同一角色的两个平台实现
 /// （见 `crypto` 模块的 `CredentialKeyProvider`）。
+///
+/// **必须是 `async`**：读凭据库在缓存未命中时会阻塞调用线程最多
+/// `KEYCHAIN_TIMEOUT`（2 秒），而 Tauri 的**同步**命令就在主线程上内联执行。
+/// 异步命令的结果回传同样要主线程（wry 的 `evaluateJavaScript:completionHandler:`），
+/// 故同步声明下这条命令一卡就把所有在飞的 IPC 响应一起停摆 —— 面板上表现为
+/// 「唤出后列表停在上一次的旧数据、面板冻住约 2 秒后才刷新」。前端每次唤出面板
+/// 都会调它（`refreshKeychainBanner`），所以代价是每次唤出都付。守卫见
+/// `commands_test.rs` 的 `credential_store_commands_are_async`。
 #[tauri::command]
-pub fn keychain_available() -> bool {
+pub async fn keychain_available() -> bool {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
         crate::crypto::system_key_available()
