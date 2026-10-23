@@ -9,7 +9,8 @@
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::capture::*;
+    use clipvault_core::ContentKind;
 
     #[test]
     fn text_captured_round_trip() {
