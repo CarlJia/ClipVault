@@ -61,6 +61,25 @@ describe("托盘「加密区」入口的源码契约", () => {
   });
 });
 
+describe("面板唤出时的搜索框复位（#37）", () => {
+  // 与上面同一段 focus 处理器：面板收起只是 `window.hide()`，WebView 不重载，
+  // 所有「唤起时该复位什么」的契约都由这一个处理器承担，故放在同一文件里守。
+  it("focus 重置会清空搜索框，且清空发生在重新拉列表之前", () => {
+    // 上一次的查询词原样留在 `input.value` 里，而 `load()` 拿的正是这个值
+    // （main.ts 的 `searchEl.value.trim()`），于是再唤出时搜索框和列表都还停在
+    // 上次的查询上。只 `focus()` + `select()` 不够：全选只让下一次按键覆盖旧词，
+    // 旧词仍可见、仍参与过滤。必须显式写空，而且要写在这一轮 `load()` **之前**，
+    // 否则这次唤出先按旧词拉一遍、下一帧才纠正。
+    const handler = /window\.addEventListener\("focus"[\s\S]*?\n\}\);/.exec(mainTs)?.[0] ?? "";
+    expect(handler).not.toBe("");
+    const body = handler.replace(/\s+/g, "");
+    const cleared = body.indexOf('searchEl.value="";');
+    expect(cleared, "focus 处理器必须清空 searchEl.value").toBeGreaterThan(-1);
+    expect(cleared, "清空应在聚焦之前").toBeLessThan(body.indexOf("searchEl.focus()"));
+    expect(cleared, "清空应在这次 load() 之前").toBeLessThan(body.lastIndexOf("voidload();"));
+  });
+});
+
 describe("浮层豁免窗口（overlay-intent）", () => {
   it("托盘点名后紧接着的那次 focus 命中豁免", () => {
     const gate = createOverlayGate();

@@ -1044,8 +1044,11 @@ window.addEventListener("focus", () => {
   // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
   void closePreview();
   resetPreviewCache();
+  // 收起面板只是 `window.hide()`，WebView 不重载 —— 上一次的查询词原样留在
+  // `input.value` 里，而下面的 `load()` 拿的正是它。必须显式清空；`select()`
+  // 只是全选，旧词仍可见、仍参与过滤（#37：每次唤出都从空搜索框开始）。
+  searchEl.value = "";
   searchEl.focus();
-  searchEl.select();
   void refreshAccessibilityBanner(bannerEl);
   void refreshKeychainBanner(vaultBannerEl);
   void refreshGuestNotice();
