@@ -316,6 +316,24 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
     --workspace --all-targets`、`cargo clippy -- -D warnings`、`cargo test --workspace`、
     `npm run build`、`npm test`、`packaging/check-windows.sh`（check + clippy）全绿；R13
     网络出口审计仍为空。
+- **子串搜索修复（#38）：`entries_fts` 换 trigram tokenizer（schema V6）**。`unicode61` 只按整
+  token / token 前缀命中：`dsdf@asdf34Fx3%` 的 token 是 `dsdf` / `asdf34Fx3`，搜 `Fx3`
+  （token 中段）永远 0 行，违背 R5「子串精确匹配」。探针确认 bundled SQLite（libsqlite3-sys
+  0.30.1 / SQLite 3.46）本来就支持 trigram —— 原先 `#[ignore]` 的 `trigram_available` 测的是
+  SQLite **测试专用**的 `fts5_trigram()` 函数（受 `SQLITE_FTS5_TOKENIZER_TRIGRAMS` 控制），
+  不是 tokenizer 本身；KTD3 里「trigram 需编译标志」的降级前提不成立（已在 plan KTD3 处补记）。
+  V6 迁移 drop 旧表、按与触发器同源的 kind-aware 逻辑重建并回填（vault 条目不进 FTS，
+  `json_valid` 守卫挡住畸形 `metadata_json`），并**重建 entries 侧两个 FTS 触发器** ——
+  `CREATE TRIGGER IF NOT EXISTS` 只在全新库执行，U6 之前的老库会留着不认 `content_kind`
+  的旧触发器，回填的 file 路径会被下一次普通 UPDATE 改回空 content。查询侧多词按空白
+  拆成多个 trigram 短语、隐式 AND 连接（整条包一个短语会丢掉跨标点 / 换行的命中）；
+  任一词 <3 字符时整条退回逐词 LIKE；tokenizer 带 `remove_diacritics 1`（`cafe` 仍命中
+  `café`）。新增用例：core `migration_v6_rebuilds_fts_with_trigram`、
+  `migration_v6_tolerates_malformed_metadata`；app `search_finds_substring_inside_a_token`、
+  `multi_word_query_matches_across_punctuation`、`mixed_length_terms_fall_back_to_like`、
+  `accent_insensitive_search`（原 `trigram_available` 与 `unicode61_tokenizer_works` 删除，
+  无重命名替换；整词命中由 `fts5_hit_on_content` / `search_hits_content` 覆盖）。
+  **本版实测基线：后端 355 passed + 0 ignored（此前 1 例 trigram 测试 ignored）**；前端本分支未改。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：

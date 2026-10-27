@@ -1644,55 +1644,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "KTD3: trigram requires SQLITE_FTS5_TOKENIZER_TRIGRAMS compile flag; \
-                 rusqlite 0.32 bundled SQLite lacks trigram by default. \
-                 Set SQLITE_FTS5_TOKENIZER_TRIGRAMS when building libsqlite3-sys \
-                 from source, or upgrade to a rusqlite version with trigram support. \
-                 Until then, unicode61 tokenizer is used as FTS fallback."]
-    async fn trigram_available() {
-        // Verify trigram tokenizer is available (KTD3 build-flag check).
-        let db = open_test_db();
-        let result: String = db
-            .with_conn(|conn| {
-                let mut stmt = conn.prepare("SELECT fts5_trigram('hello')")?;
-                let mut rows = stmt.query([])?;
-                let mut tokens = String::new();
-                while let Some(row) = rows.next()? {
-                    tokens.push_str(&row.get::<_, String>(0).unwrap_or_default());
-                    tokens.push('\n');
-                }
-                Ok(tokens)
-            })
-            .await
-            .unwrap();
-        assert!(
-            !result.trim().is_empty(),
-            "trigram tokenizer should be available (SQLITE_FTS5_TOKENIZER_TRIGRAMS not set?)\nresult: {result}"
-        );
-    }
-
-    #[tokio::test]
-    async fn unicode61_tokenizer_works() {
-        // Verify FTS5 works with unicode61 (the default fallback when trigram unavailable).
-        let db = open_test_db();
-        db.insert_entry("u1", "hello world trigram test", "plain")
-            .await
-            .unwrap();
-        let results = db
-            .search_entries(crate::search::build_search_query(
-                "trigram",
-                &crate::search::parse_tab("all"),
-                10,
-            ))
-            .await
-            .unwrap();
-        assert!(
-            !results.is_empty(),
-            "FTS5 with unicode61 should find 'trigram' in content"
-        );
-    }
-
-    #[tokio::test]
     async fn vault_entry_excluded_from_fts() {
         let db = open_test_db();
 
@@ -1738,7 +1689,7 @@ mod tests {
         let uv: i32 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(uv, 5, "schema 已到 V5, 旧断言 4 与之一致更新");
+        assert_eq!(uv, 6, "schema 已到 V6（#38 trigram），旧断言与之一致更新");
 
         for table in &["entries", "tags", "settings", "entries_fts"] {
             let cnt: i32 = conn
