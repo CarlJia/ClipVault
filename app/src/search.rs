@@ -14,8 +14,11 @@
 //! - 空查询 → 不加匹配条件，退化为按 tab 的纯列表。
 //! - 查询 < 3 字符，或含 FTS5 敏感字符（冒号/引号等）→ 用
 //!   `LIKE '%q%'` 跨 content/note/tags 兜底，避免 FTS5 query
-//!   parser 崩溃（如 `tag:acme` 会被当成列过滤符）。
+//!   parser 崩溃（如 `tag:acme` 会被当成列过滤符），也覆盖 trigram
+//!   对 < 3 字符短语无从建 gram 的区间。
 //! - 其余 → FTS5 `MATCH`，命中 content/note/tags_text 三列。
+//!   `entries_fts` 用 `tokenize='trigram'`（V6 / #38）：任意 ≥3 字符的
+//!   子串都能命中（含 token 中段），不像 unicode61 只认整 token / 前缀。
 //!
 //! 加密区（`is_vault = 1`）条目在所有分支都被 `WHERE e.is_vault = 0`
 //! 排除，永不出现在普通搜索里（其专属视图由 U9 负责）。
@@ -110,9 +113,9 @@ pub fn sanitize_query(raw: &str) -> String {
 /// 带连字符的标签做子串命中。
 ///
 /// 性能优化 W1 / KTD1:把 `-` / `+` / `=` / `.` / `/` / `\` 从降级列表里
-/// 拿掉。它们不是 FTS5 的语法字符,但**仍是 token 的一部分**:unicode61
-/// tokenizer 在它们两侧会照常用作词边界,搜 `k=v` / `client-acme` /
-/// `https://example.com/path` 时走 FTS5 比走 LIKE 三表全表扫快几个数量级。
+/// 拿掉。它们不是 FTS5 的语法字符,且参与 3-gram 子串匹配(V6 / #38 换成
+/// trigram):搜 `k=v` / `client-acme` / 路径片段走倒排,比 LIKE 三表全表扫
+/// 快几个数量级。含 `:` 的完整 URL 仍会因冒号降级 —— 冒号是列过滤符。
 /// 真正会让 FTS5 报错的字符(`'` / `"` / `*` / `^` / `:` / `(` / `)` /
 /// `[` / `]` / `{` / `}` / `~` / `<` / `>`)保留降级。
 fn is_fts_hostile(q: &str) -> bool {
@@ -124,9 +127,17 @@ fn is_fts_hostile(q: &str) -> bool {
     })
 }
 
-/// 把已清洗、非敏感的查询包装成 FTS5 前缀短语匹配串。
+/// 把已清洗、非敏感的查询包装成 trigram 前缀短语串。
+///
+/// trigram 短语只匹配**连续**的三元组：整条查询包成一个短语会让
+/// `hello world` 搜不到 `hello, world` 或换行分隔的文本（unicode61 的
+/// 词短语能跨标点命中）。按空白拆词、每词一个短语、用 FTS5 的隐式 AND
+/// 连接，既保留子串语义，也不要求原样相邻。
 fn fts_match_string(q: &str) -> String {
-    format!("\"{q}\"*")
+    q.split_whitespace()
+        .map(|term| format!("\"{term}\"*"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// 构建搜索计划：拼装 `WHERE` / `ORDER BY` / `LIMIT` 与绑定参数。
@@ -170,17 +181,26 @@ fn build_search_query_impl(
 
     // 查询匹配（content / note / tags）。
     if !query.is_empty() {
-        let use_like = query.chars().count() < 3 || is_fts_hostile(&query);
+        let terms: Vec<&str> = query.split_whitespace().collect();
+        // 任一词 < 3 字符时 trigram 建不出 gram，整条查询退回 LIKE；
+        // 多词时每个词独立匹配、词之间 AND（不要求词序相邻）。
+        let use_like = terms.iter().any(|t| t.chars().count() < 3) || is_fts_hostile(&query);
         if use_like {
-            let pattern = format!("%{query}%");
-            filters.push(
-                "(e.content LIKE ? OR e.note LIKE ? \
-                 OR e.id IN (SELECT entry_id FROM tags WHERE tag LIKE ?))"
-                    .to_string(),
-            );
-            params.push(pattern.clone());
-            params.push(pattern.clone());
-            params.push(pattern);
+            let groups: Vec<String> = terms
+                .iter()
+                .map(|_| {
+                    "(e.content LIKE ? OR e.note LIKE ? \
+                     OR e.id IN (SELECT entry_id FROM tags WHERE tag LIKE ?))"
+                        .to_string()
+                })
+                .collect();
+            filters.push(format!("({})", groups.join(" AND ")));
+            for term in &terms {
+                let pattern = format!("%{term}%");
+                params.push(pattern.clone());
+                params.push(pattern.clone());
+                params.push(pattern);
+            }
         } else {
             filters.push(
                 "e.id IN (SELECT rowid FROM entries_fts WHERE entries_fts MATCH ?)".to_string(),

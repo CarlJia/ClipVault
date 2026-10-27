@@ -186,6 +186,73 @@ async fn short_query_like_fallback() {
 }
 
 #[tokio::test]
+async fn search_finds_substring_inside_a_token() {
+    // #38 / R5：token 中段的子串也必须命中（unicode61 曾只认整 token / 前缀）。
+    let db = open_test_db();
+    insert(&db, "h1", "dsdf@asdf34Fx3%", "", "plain", 0, None, 100, 0).await;
+    insert(&db, "h2", "unrelated", "", "plain", 0, None, 200, 0).await;
+
+    let prefix = run(&db, "asdf", "all", 50).await;
+    assert_eq!(prefix.len(), 1, "token 前缀应命中（FTS 路径正常）");
+
+    let results = run(&db, "Fx3", "all", 50).await;
+    assert_eq!(results.len(), 1, "token 中段的子串也必须命中（R5）");
+    assert!(results[0].content.contains("Fx3"));
+}
+
+#[tokio::test]
+async fn multi_word_query_matches_across_punctuation() {
+    // trigram 短语只匹配连续三元组：整条查询包成一个短语会让 `hello world`
+    // 搜不到 `hello, world` / 换行分隔的文本（unicode61 能跨标点）。
+    let db = open_test_db();
+    insert(&db, "h1", "hello, world", "", "plain", 0, None, 100, 0).await;
+    insert(&db, "h2", "hello\nworld", "", "plain", 0, None, 200, 0).await;
+    insert(&db, "h3", "hello world", "", "plain", 0, None, 300, 0).await;
+    insert(&db, "h4", "hello there", "", "plain", 0, None, 400, 0).await;
+
+    let results = run(&db, "hello world", "all", 50).await;
+    assert_eq!(results.len(), 3, "多词查询按词 AND，跨标点 / 换行都要命中");
+    assert!(results.iter().all(|e| e.content.contains("hello")));
+}
+
+#[tokio::test]
+async fn mixed_length_terms_fall_back_to_like() {
+    // 任一词 < 3 字符时 trigram 建不出 gram，整条查询退回逐词 LIKE。
+    let db = open_test_db();
+    insert(
+        &db,
+        "h1",
+        "unix path /usr/local",
+        "",
+        "path",
+        0,
+        None,
+        100,
+        0,
+    )
+    .await;
+    insert(&db, "h2", "windows path C:/", "", "path", 0, None, 200, 0).await;
+
+    let results = run(&db, "unix p", "all", 50).await;
+    assert_eq!(
+        results.len(),
+        1,
+        "含 1 字符词的多词查询应逐词 LIKE 命中 unix"
+    );
+    assert!(results[0].content.contains("unix"));
+}
+
+#[tokio::test]
+async fn accent_insensitive_search() {
+    // trigram + `remove_diacritics 1`：保留 unicode61 的变音符号折叠。
+    let db = open_test_db();
+    insert(&db, "h1", "café au lait", "", "plain", 0, None, 100, 0).await;
+
+    let results = run(&db, "cafe", "all", 50).await;
+    assert_eq!(results.len(), 1, "cafe 应命中 café（remove_diacritics 1）");
+}
+
+#[tokio::test]
 async fn fts_hostile_chars() {
     // `tag:acme` 与 `a"b` 不应导致 FTS parser 报错，降级为 LIKE。
     let db = open_test_db();
