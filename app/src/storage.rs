@@ -717,10 +717,14 @@ impl Storage {
 
     /// 列出所有加密区条目（`is_vault=1`），供 Settings「加密区管理」UI 使用。
     /// 密文不解密：返回的 `content` 是 base64 密文，UI 只按元数据展示。
+    ///
+    /// 走 `ENTRY_LIST_COLS`（不是 `ENTRY_COLS`）：加密区条目的 `payload` 是**密文
+    /// BLOB**，而这条路径根本不消费它（面板只按元数据展示，回贴另走 `get_by_id`），
+    /// 读进来只会白占一份内存 —— 与 `list_recent` 同样的道理。
     pub async fn list_vault_entries(&self) -> SqliteResult<Vec<Entry>> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(&format!(
-                "SELECT {ENTRY_COLS} FROM entries
+                "SELECT {ENTRY_LIST_COLS} FROM entries
                  WHERE is_vault = 1
                  ORDER BY is_decryptable ASC, created_at DESC"
             ))?;
@@ -882,7 +886,7 @@ pub mod test_helpers {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathBuf, resolve_data_dir, test_helpers::open_test_db};
+    use super::{PathBuf, params, resolve_data_dir, test_helpers::open_test_db};
 
     #[test]
     fn data_dir_uses_appdata_on_windows() {
@@ -1235,6 +1239,65 @@ mod tests {
         // 其他字段必须照常读出来——NULL AS 占位只针对 payload/payload_nonce。
         assert_eq!(entries[0].content_kind, "image");
         assert_eq!(entries[0].auto_category, "image");
+    }
+
+    /// 加密区列表同样走 `ENTRY_LIST_COLS`：加密区条目的 `payload` 是**密文 BLOB**，
+    /// 而这条路径根本不消费它（面板只按元数据展示，回贴另走 `get_by_id`），读进来
+    /// 只是白占一份内存 —— 与 `list_recent` 同样的道理。
+    ///
+    /// 这条用例钉住 `list_vault_entries` 的契约：返回的 `Entry::payload` 恒为
+    /// `None`，即便库里那一行有真实 BLOB；而列表要的元数据一个不少。
+    #[tokio::test]
+    async fn list_vault_entries_does_not_fetch_payload_blob() {
+        let db = open_test_db();
+        let big_payload = vec![0xABu8; 64 * 1024];
+        let payload_len = big_payload.len();
+        let nonce = vec![7u8; 12];
+        // 直接落一行 `is_vault = 1` 的条目（不经过 Keychain / 真加密）。
+        let vault_id: i64 = db
+            .with_conn(move |conn| {
+                conn.execute(
+                    "INSERT INTO entries
+                       (content_hash, content, note, auto_category, is_vault, is_decryptable,
+                        content_kind, mime_type, payload, payload_nonce)
+                     VALUES ('vaultlist', 'c2VjcmV0', 'vault note', 'text', 1, 1,
+                             'text', NULL, ?1, ?2)",
+                    params![big_payload, nonce],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .await
+            .unwrap();
+
+        // 直接 read 一次验证真实 BLOB 写入了。
+        let raw: Vec<u8> = db
+            .with_conn(move |conn| {
+                conn.query_row(
+                    "SELECT payload FROM entries WHERE id = ?1",
+                    [vault_id],
+                    |row| row.get(0),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(raw.len(), payload_len, "payload 列实际写入了 BLOB");
+
+        let entries = db.list_vault_entries().await.unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(
+            entries[0].payload.is_none(),
+            "list_vault_entries 走 ENTRY_LIST_COLS, payload 必须为 None（不 fetch 密文 BLOB）"
+        );
+        assert!(
+            entries[0].payload_nonce.is_none(),
+            "list_vault_entries payload_nonce 必须为 None"
+        );
+        // 元数据一个不少：面板按它们展示，搜索也只按它们匹配。
+        assert_eq!(entries[0].note, "vault note");
+        assert_eq!(entries[0].auto_category, "text");
+        assert_eq!(entries[0].content_kind, "text");
+        assert!(entries[0].is_vault);
+        assert!(entries[0].is_decryptable);
     }
 
     /// 性能优化 W4 / R16:`list_recent_with_tags` 用一次 `LEFT JOIN + GROUP_CONCAT`
