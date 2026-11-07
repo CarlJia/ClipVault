@@ -62,21 +62,29 @@ describe("托盘「加密区」入口的源码契约", () => {
 });
 
 describe("面板唤出时的搜索框复位（#37）", () => {
-  // 与上面同一段 focus 处理器：面板收起只是 `window.hide()`，WebView 不重载，
-  // 所有「唤起时该复位什么」的契约都由这一个处理器承担，故放在同一文件里守。
-  it("focus 重置会清空搜索框，且清空发生在重新拉列表之前", () => {
+  // 与上面同一段唤出重置逻辑：面板收起只是 `window.hide()`，WebView 不重载，
+  // 所有「唤起时该复位什么」的契约都由这一个函数承担，故放在同一文件里守。
+  //
+  // #42 起这段逻辑从 DOM `focus` 回调体搬进了 `resetPanelOnShow(fresh)` ——
+  // 唤出信号改成后端事件（`panel-shown`）为主、DOM focus 为兜底（见
+  // `panel-show.ts`），但**复位内容与顺序一字未改**，故断言改指新函数。
+  it("唤出重置会清空搜索框，且清空发生在重新拉列表之前", () => {
     // 上一次的查询词原样留在 `input.value` 里，而 `load()` 拿的正是这个值
     // （main.ts 的 `searchEl.value.trim()`），于是再唤出时搜索框和列表都还停在
     // 上次的查询上。只 `focus()` + `select()` 不够：全选只让下一次按键覆盖旧词，
     // 旧词仍可见、仍参与过滤。必须显式写空，而且要写在这一轮 `load()` **之前**，
     // 否则这次唤出先按旧词拉一遍、下一帧才纠正。
-    const handler = /window\.addEventListener\("focus"[\s\S]*?\n\}\);/.exec(mainTs)?.[0] ?? "";
-    expect(handler).not.toBe("");
-    const body = handler.replace(/\s+/g, "");
-    const cleared = body.indexOf('searchEl.value="";');
-    expect(cleared, "focus 处理器必须清空 searchEl.value").toBeGreaterThan(-1);
-    expect(cleared, "清空应在聚焦之前").toBeLessThan(body.indexOf("searchEl.focus()"));
-    expect(cleared, "清空应在这次 load() 之前").toBeLessThan(body.lastIndexOf("voidload();"));
+    const body =
+      /function resetPanelOnShow\(fresh: boolean\): void \{([\s\S]*?)\n\}/.exec(mainTs)?.[1] ??
+      "";
+    expect(body).not.toBe("");
+    const squeezedBody = body.replace(/\s+/g, "");
+    const cleared = squeezedBody.indexOf('searchEl.value="";');
+    expect(cleared, "唤出重置必须清空 searchEl.value").toBeGreaterThan(-1);
+    expect(cleared, "清空应在聚焦之前").toBeLessThan(squeezedBody.indexOf("searchEl.focus()"));
+    expect(cleared, "清空应在这次 load() 之前").toBeLessThan(
+      squeezedBody.lastIndexOf("voidload();"),
+    );
   });
 });
 

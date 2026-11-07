@@ -16,7 +16,8 @@
 //! 和用户刚做的选择对着干。Esc 关闭走的是那条路径（用户没有点任何东西，激活权该
 //! 还给它原来的主人），两条路径的语义不同，故不合并。
 
-use tauri::{AppHandle, Manager, Window};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter, Manager, Window};
 
 mod geometry;
 
@@ -183,6 +184,50 @@ pub fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
 // U2：唤出入口 + 定位适配层（KTD9）
 // ================================================================
 
+/// 前端「面板被唤出」信号的事件名。
+///
+/// **前端靠它刷新，不能只靠 WebView 的 DOM `focus` 事件**：面板收起只是
+/// `window.hide()`（`orderOut`），WebView 不重载；而 macOS 上隐藏时若 App 仍然
+/// 活跃，页面**不会**失焦，之后 `show()` + `set_focus()` 也不会让页面重新拿到
+/// DOM 焦点 —— 于是**不再派发 DOM `focus`**，前端收不到任何唤出信号，列表就停在
+/// 上一次的内容（用户报的现象：打开面板不刷新，鼠标点一下才刷新）。
+///
+/// 与前端 `frontend/src/panel-show.ts` 的 `PANEL_SHOWN_EVENT` 是同一个名字，
+/// 两边各写一份（前端用例会用 `?raw` 读本文件做跨语言对照）。
+pub const PANEL_SHOWN_EVENT: &str = "panel-shown";
+
+/// 「面板被唤出」信号的载荷。
+#[derive(Clone, Serialize)]
+pub struct PanelShownPayload {
+    /// 面板**此前是隐藏的**（一次真正的「唤出」）→ 前端才做破坏性复位
+    /// （收回浮层、清空搜索框）。面板本来就开着时（用户正搜着词、顺手按了
+    /// 一次热键），前端只刷新数据，不动用户正在用的输入。
+    pub fresh: bool,
+}
+
+/// 面板此刻是否隐藏着。**必须在 `show()` 之前取**。
+///
+/// `is_visible()` 只反映「窗口有没有被 orderOut」，不反映「有没有焦点」——
+/// 面板可见但 App 在后台时它照样是 `true`，那种情况下的 `show()` 不算一次
+/// 真正的唤出。取不到值时按「可见」处理（`fresh = false`）：状态不明时宁可
+/// 少做一次复位，也不要抹掉用户正在输入的搜索词。
+pub fn is_hidden(window: &tauri::WebviewWindow) -> bool {
+    !window.is_visible().unwrap_or(true)
+}
+
+/// 通知前端「面板已被显示」。
+///
+/// 只发给面板这一块 WebView（`window.emit`），不是广播（`app.emit`）—— 当前
+/// 只有一块画布，两者等价，但把发送目标写明确更收敛。
+///
+/// emit 失败（页面还没就绪、监听器还没注册）只留一条日志：面板已经显示出来了，
+/// 前端没收到信号最坏是这一次不刷新，不该因此影响唤出本身。
+pub fn notify_shown(window: &tauri::WebviewWindow, fresh: bool) {
+    if let Err(e) = window.emit(PANEL_SHOWN_EVENT, PanelShownPayload { fresh }) {
+        ::log::warn!(target: "panel", "通知面板已显示失败：{e}");
+    }
+}
+
 /// 显示并聚焦主面板 —— **全应用唯一的「唤出面板」入口**。
 ///
 /// 热键回调（`hotkey.rs`）与托盘的菜单 / 左键点击都走这里，从而保证
@@ -190,20 +235,28 @@ pub fn handle_window_event(window: &Window, event: &tauri::WindowEvent) {
 /// ClipVault 自己（见 [`crate::pasteback::capture_target_app`]），此后的回贴都会误判为
 /// 「目标窗口已切换」。
 ///
-/// 内部顺序固定为：取目标 App → 定位 → `show()` → `set_focus()`（R4）。把入口收进面板
-/// 模块、而不是留在托盘模块，是为了让「先定位、再显示」由模块边界保证，而不是只靠注释
-/// ——任何新唤出路径直接 `window.show()` 都会静默跳过定位。
+/// 内部顺序固定为：取目标 App → 定位 → `show()` → `set_focus()`（R4）→ 通知前端
+/// 「面板被唤出」（[`notify_shown`]）。把入口收进面板模块、而不是留在托盘模块，是
+/// 为了让「先定位、再显示」由模块边界保证，而不是只靠注释 —— 任何新唤出路径直接
+/// `window.show()` 都会静默跳过定位。
 ///
 /// 定位是「尽力而为」：解析不出目标屏时回退主屏，定位调用本身失败时保留原位置，
 /// 两者都不得阻止唤出（R3）。
+///
+/// 末尾的通知**不是**「唤出」的同义词：回贴降级分支（`commands::paste_entry` 的
+/// `window_switched` / `clipboard_only` / `no_accessibility`）也会把面板重新显示
+/// 出来给用户看提示，那三条路径同样要通知前端，否则面板会带着上一次的列表出现。
 pub(crate) fn show_panel(app: &AppHandle) {
     let Some(window) = app.get_webview_window(PANEL_LABEL) else {
         return;
     };
     crate::pasteback::capture_target_app();
+    // 「此前是否隐藏着」必须在 show() 之前取：show() 之后恒为可见。
+    let fresh = is_hidden(&window);
     place_panel(&window);
     let _ = window.show();
     let _ = window.set_focus();
+    notify_shown(&window, fresh);
 }
 
 /// 按焦点分档解析目标屏并把面板居中过去。macOS 实现见 [`macos`]，Windows 见
@@ -268,5 +321,26 @@ mod tests {
     #[test]
     fn keeps_hidden_and_focused_window() {
         assert!(!should_auto_hide(false, true));
+    }
+
+    #[test]
+    fn panel_shown_payload_carries_the_fresh_flag() {
+        // 载荷形状是跨语言契约：前端读 `fresh` 决定这次要不要做破坏性复位
+        // （收回浮层 / 清空搜索框）。字段名或类型一变，前端就静默地退回「总是复位」。
+        assert_eq!(
+            serde_json::to_string(&PanelShownPayload { fresh: true }).unwrap(),
+            r#"{"fresh":true}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&PanelShownPayload { fresh: false }).unwrap(),
+            r#"{"fresh":false}"#
+        );
+    }
+
+    #[test]
+    fn panel_shown_event_name_is_stable() {
+        // 事件名同样是契约：前端 `frontend/src/panel-show.ts` 的 `PANEL_SHOWN_EVENT`
+        // 必须与这里逐字一致（那边的用例会用 `?raw` 读本文件做对照）。
+        assert_eq!(PANEL_SHOWN_EVENT, "panel-shown");
     }
 }

@@ -36,6 +36,11 @@ import {
   renderVaultList,
 } from "./panel";
 import { createOverlayGate } from "./overlay-intent";
+import {
+  createShowResetGate,
+  PANEL_SHOWN_EVENT,
+  readFresh,
+} from "./panel-show";
 import { waitForKeyRelease } from "./gesture";
 import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
@@ -1027,32 +1032,63 @@ document.addEventListener("keydown", (ev) => {
   }
 });
 
-// 面板每次被唤出（窗口获得焦点）时：回到主列表、聚焦搜索框、复检权限、刷新列表。
+// 面板每次被唤出时的收尾：回到主列表、聚焦搜索框、复检权限、刷新列表。
+//
+// `fresh` = 面板此前是隐藏的（一次真正的「唤出」）。面板本来就开着时（用户正搜着
+// 词、顺手按了一次热键想让它刷新）只刷新数据，**不动**用户正在用的输入与焦点 ——
+// 「唤出」和「它已经开着」是两件事。
+//
 // 收起加密区模态：面板被隐藏（热键 / 托盘）时模态可能仍处于打开态，而搜索框已获焦点，
 // 保持模态会让「看得见的是加密区、敲进去的是搜索框」，故每次唤出都从主列表开始。
 // 收起编辑器模态：同上 —— `panel::handle_window_event` 只 hide 窗口、不动 WebView DOM，
 // 编辑器仍开着（备注 / 标签未提交 + `#editor` 仍显示）的话，焦点被拽回搜索框后用户按
 // Esc 收不到、且「编辑器模态挡住主列表」看着像 Esc 失灵（#30）。
-window.addEventListener("focus", () => {
-  // 托盘「加密区」刚点名要打开它时跳过这一次重置：`openVault()` 与这次 focus 谁先
-  // 到取决于平台事件循环，不豁免的话浮层刚打开就被收回 —— 与「点了没功能」同貌。
-  // 必须叠加 `isVaultOpen()`：focus 先到的顺序里浮层还没开，那时不需要豁免
-  // （关的只是空气），也不该把这份豁免借给之后不相干的 focus。
-  if (!(isVaultOpen() && overlayGate.isFresh())) closeVault();
-  if (isEditorOpen()) closeEditor();
-  // 面板重新被唤出（R12）：预览栏一律收起、窗口回 normal，图片缓存也清掉 ——
-  // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
-  void closePreview();
-  resetPreviewCache();
-  // 收起面板只是 `window.hide()`，WebView 不重载 —— 上一次的查询词原样留在
-  // `input.value` 里，而下面的 `load()` 拿的正是它。必须显式清空；`select()`
-  // 只是全选，旧词仍可见、仍参与过滤（#37：每次唤出都从空搜索框开始）。
-  searchEl.value = "";
-  searchEl.focus();
+function resetPanelOnShow(fresh: boolean): void {
+  if (fresh) {
+    // 托盘「加密区」刚点名要打开它时跳过这一次收回：`openVault()` 与这次重置谁先
+    // 到取决于平台事件循环，不豁免的话浮层刚打开就被收回 —— 与「点了没功能」同貌。
+    // 必须叠加 `isVaultOpen()`：重置先到的顺序里浮层还没开，那时不需要豁免
+    // （关的只是空气），也不该把这份豁免借给之后不相干的一次唤出。
+    if (!(isVaultOpen() && overlayGate.isFresh())) closeVault();
+    if (isEditorOpen()) closeEditor();
+    // 面板重新被唤出（R12）：预览栏一律收起、窗口回 normal，图片缓存也清掉 ——
+    // 用户离开又回来，看到的不该还是上次那份可能已经过期的图。
+    void closePreview();
+    resetPreviewCache();
+    // 收起面板只是 `window.hide()`，WebView 不重载 —— 上一次的查询词原样留在
+    // `input.value` 里，而下面的 `load()` 拿的正是它。必须显式清空；`select()`
+    // 只是全选，旧词仍可见、仍参与过滤（#37：每次唤出都从空搜索框开始）。
+    searchEl.value = "";
+    searchEl.focus();
+  }
+  // 横幅与数据：两种唤出都要刷新（访客模式可能在面板开着时被托盘切过）。
   void refreshAccessibilityBanner(bannerEl);
   void refreshKeychainBanner(vaultBannerEl);
   void refreshGuestNotice();
   void load();
+}
+
+// 面板唤出的两条信号，闸门保证同一次唤出只重置一次（见 `panel-show.ts`）：
+//
+// 1. 后端 `show_panel()` 发的 `panel-shown` 事件 —— **权威信号**，由唤出入口直接
+//    发出，不依赖任何平台焦点语义；面板本来就开着时它也会发，于是「按一次热键让
+//    它刷新」也成立。
+// 2. WebView 的 DOM `focus` —— 兜底：后端信号丢了（页面还没就绪）时补一次重置。
+//
+// 只靠第 2 条时，用户看到的现象是「打开面板不刷新，鼠标点一下才刷新」（#42）：
+// macOS 上隐藏面板（`orderOut`）时若 App 仍然活跃，页面不会失焦，重新显示也就不
+// 会再派发 DOM `focus`。
+const showGate = createShowResetGate();
+
+void listen(PANEL_SHOWN_EVENT, (event) => {
+  showGate.noteShown();
+  resetPanelOnShow(readFresh(event.payload));
+});
+
+window.addEventListener("focus", () => {
+  // 刚收到过后端信号 → 这次 focus 是同一次唤出的冗余信号，不再重置一遍。
+  if (!showGate.shouldRunOnFocus()) return;
+  resetPanelOnShow(true);
 });
 
 // ----------------------------------------------------------------

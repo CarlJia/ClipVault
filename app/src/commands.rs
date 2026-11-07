@@ -493,8 +493,11 @@ pub async fn paste_entry(
                 // （唤出时的定位与 `tauri.conf.json` 的 `center:true` 的关系：`center`
                 // 只在窗口创建时生效一次，每次都定位到焦点屏的重定位会覆盖它，故
                 // `center:true` 原样保留、不删。）
+                let fresh = crate::panel::is_hidden(&window);
                 let _ = window.show();
                 let _ = window.set_focus();
+                // 面板被重新显示出来 → 通知前端刷新（否则它带着上一次的列表出现）。
+                crate::panel::notify_shown(&window, fresh);
                 Ok(PasteResult {
                     status: "window_switched".to_string(),
                     message: window_switched_msg(IS_MACOS),
@@ -502,8 +505,11 @@ pub async fn paste_entry(
             }
             Ok(PasteOutcome::ClipboardOnly) => {
                 // 同 WindowSwitched：降级提示不是唤出，不重定位（KTD7 / R5）。
+                let fresh = crate::panel::is_hidden(&window);
                 let _ = window.show();
                 let _ = window.set_focus();
+                // 同 WindowSwitched：面板重新显示出来了，前端要刷新。
+                crate::panel::notify_shown(&window, fresh);
                 Ok(PasteResult {
                     status: "clipboard_only".to_string(),
                     message: cgevent_fail_msg(IS_MACOS),
@@ -513,8 +519,11 @@ pub async fn paste_entry(
                 // 未授权:内容已在剪贴板,但没能自动回贴。重新显示面板,
                 // 前端据 status 亮授权横幅并提示可手动 ⌘V。
                 // 同 WindowSwitched：降级提示不是唤出，不重定位（KTD7 / R5）。
+                let fresh = crate::panel::is_hidden(&window);
                 let _ = window.show();
                 let _ = window.set_focus();
+                // 同 WindowSwitched：面板重新显示出来了，前端要刷新。
+                crate::panel::notify_shown(&window, fresh);
                 Ok(PasteResult {
                     status: "no_accessibility".to_string(),
                     message: no_accessibility_msg(IS_MACOS),

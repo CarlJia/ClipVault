@@ -334,6 +334,33 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `accent_insensitive_search`（原 `trigram_available` 与 `unicode61_tokenizer_works` 删除，
   无重命名替换；整词命中由 `fts5_hit_on_content` / `search_hits_content` 覆盖）。
   **本版实测基线：后端 355 passed + 0 ignored（此前 1 例 trigram 测试 ignored）**；前端本分支未改。
+- **面板唤出必刷新（#42）**：面板唤出时前端要做的收尾（收回浮层、清空搜索框、重拉列表）
+  原来**只**挂在 WebView 的 DOM `focus` 事件上，而那条信号并不可靠 —— 面板收起只是
+  `window.hide()`（macOS 的 `orderOut`），隐藏发生时若 App 仍然活跃，页面**不会**失焦，
+  之后 `show()` + `set_focus()` 也不会再派发 DOM `focus`；面板本来就开着时这两个调用更是
+  空操作。于是用户看到「**打开面板不刷新，鼠标点一下才刷新**」（本仓库第一个由「焦点
+  语义」而非数据/时序引发的 bug）。
+  修法：后端在**唤出入口** `panel::show_panel()` 里 `emit("panel-shown")`（载荷
+  `{ fresh }` = 面板此前是否隐藏着），前端新模块 `frontend/src/panel-show.ts` 监听它并
+  做收尾；DOM `focus` 退居兜底 —— 只在「最近 1s 内没收到过后端信号」时才补一次重置
+  （闸门与 `overlay-intent.ts` 的 `DEFAULT_OVERLAY_GRACE_MS` 同值）。**按后端信号去重、
+  不按重置去重**：后端信号永不被吞（吞了就等于又回到「打开不刷新」），被吞的只有 DOM
+  focus 那条冗余路径。`fresh=false`（面板本来就开着）时**只刷新数据**、不做破坏性复位 ——
+  否则「按一次热键」会抹掉用户正在输入的搜索词、关掉开着的浮层。
+  回贴降级分支（`window_switched` / `clipboard_only` / `no_accessibility`）自己也
+  `window.show()`、不经 `show_panel`，同样要发信号（`panel::notify_shown`），否则面板会
+  带着上一次的列表重新出现（WebView 不重载）。
+  新增用例：app `panel_shown_payload_carries_the_fresh_flag` /
+  `panel_shown_event_name_is_stable`；前端 `panel-show.test.ts` 14 例（闸门语义 5 +
+  载荷语义 3 + **跨语言接线** 6：用 `?raw` 读 `app/src/panel/mod.rs` 与
+  `app/src/commands.rs` 做对照，后端改名或漏接线前端就会红）。`tray-entries.test.ts`
+  里 #37 那条源码契约随收尾逻辑搬进 `resetPanelOnShow(fresh)` 而改指新函数（复位内容与
+  顺序一字未改）。
+  **本轮实测基线：后端 357 passed + 0 ignored（此前 355）；前端 160 例（10 个测试文件，
+  此前 146 例 9 个文件）**。`cargo fmt --check`、`cargo check --workspace --all-targets`、
+  `cargo clippy -- -D warnings`、`cargo test --workspace`、`npm run build`、`npm test`、
+  `packaging/check-windows.sh`（check + clippy）全绿；R13 网络出口审计仍为空。
+  剩余：macOS 真机验收（收起后再唤出、面板开着时再按一次热键）。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：
