@@ -12,6 +12,11 @@
 // - 「查询变化」与「数据变化」两条路径的选中收敛规则不同。
 
 import { describe, expect, it } from "vitest";
+// 接线契约用例要读源码（`main.ts` 顶部就执行 document.querySelector，测试环境没有
+// DOM，导入不了它）。`?raw` 由 Vite 提供，运行时与 tsc 都认 —— 见 `keymap.test.ts`
+// 的同款用法。
+import indexHtml from "../index.html?raw";
+import mainTs from "./main.ts?raw";
 import {
   applyVaultQuery,
   filterVaultEntries,
@@ -25,6 +30,9 @@ import {
   vaultHaystack,
   type VaultSearchable,
 } from "./vault-search";
+
+/** 去掉所有空白后的源码：断言接线形状时不受换行 / 缩进（prettier 重排）影响。 */
+const squeezed = mainTs.replace(/\s+/g, "");
 
 /** 造一条参与匹配的条目（只填搜索用得到的字段）。 */
 function entry(over: Partial<VaultSearchable> & { id: number }): VaultSearchable {
@@ -199,5 +207,74 @@ describe("文案", () => {
   it("空态文案区分「没条目」与「没命中」", () => {
     expect(vaultEmptyStateText(false)).toBe("加密区暂无条目");
     expect(vaultEmptyStateText(true)).toBe("没有匹配的条目");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 接线契约（U2）
+//
+// 纯函数的行为上面钉完了；这里钉「接线对不对」—— 状态在 main.ts 里，而 main.ts
+// 在没有 DOM 的测试环境里导入不了，故只能读源码。
+// ---------------------------------------------------------------------------
+
+describe("加密区搜索的接线契约", () => {
+  it("面板里有这个搜索框", () => {
+    expect(indexHtml).toContain('id="vault-search"');
+    expect(indexHtml).toContain('placeholder="搜索备注、标签、类别、日期…"');
+  });
+
+  it("main.ts 取到了那个输入框", () => {
+    expect(squeezed).toContain(
+      'vaultSearchEl=document.querySelector<HTMLInputElement>("#vault-search")!;',
+    );
+  });
+
+  it("输入即过滤，且组字期间不按未上屏的拼音串过滤", () => {
+    const at = squeezed.indexOf('vaultSearchEl.addEventListener("input"');
+    expect(at, "必须有 input 监听").toBeGreaterThan(-1);
+    const body = squeezed.slice(at, at + 220);
+    // 组字闸门在过滤之前：拼音串不该把列表闪成「没有匹配的条目」。
+    expect(body).toContain("isComposing");
+    expect(body.indexOf("isComposing")).toBeLessThan(body.indexOf("applyVaultQueryNow()"));
+  });
+
+  it("组字结束后再过滤一次", () => {
+    expect(squeezed).toContain('vaultSearchEl.addEventListener("compositionend"');
+    expect(squeezed).toContain('vaultSearchEl.addEventListener("compositionend",()=>{applyVaultQueryNow();});');
+  });
+
+  it("打开面板时先清查询 + 聚焦，再取数", () => {
+    // 取数是 await 的：清空与聚焦必须排在它前面，否则取数的空窗期里用户敲的
+    // 字会落进被遮住的主搜索框。
+    const body =
+      /async function openVault\(\): Promise<void> \{([\s\S]*?)\n\}/.exec(mainTs)?.[1] ?? "";
+    expect(body).not.toBe("");
+    const s = body.replace(/\s+/g, "");
+    const cleared = s.indexOf('vaultSearchEl.value="";');
+    const focused = s.indexOf("vaultSearchEl.focus();");
+    const fetched = s.indexOf("awaitrefreshVaultEntries(");
+    expect(cleared).toBeGreaterThan(-1);
+    expect(focused).toBeGreaterThan(-1);
+    expect(fetched).toBeGreaterThan(-1);
+    expect(cleared).toBeLessThan(focused);
+    expect(focused).toBeLessThan(fetched);
+  });
+
+  it("「清除不可解密条目」走刷新路径，不重置查询", () => {
+    const body =
+      /vaultClearEl\.addEventListener\("click", \(\) => \{([\s\S]*?)\n\}\);/.exec(mainTs)?.[1] ??
+      "";
+    expect(body).not.toBe("");
+    const s = body.replace(/\s+/g, "");
+    expect(s).toContain("refreshVaultEntries(false)");
+    // 走 openVault 会把用户当前的过滤词清掉 —— 那是「重新打开」的语义。
+    expect(s).not.toContain("openVault(");
+  });
+
+  it("列表渲染的是派生视图，不是全量数组", () => {
+    // 视图 = 全量 + 当前查询，现算现用；不存在「上一次过滤结果」那种缓存。
+    expect(squeezed).toContain(
+      "functioncurrentVaultView():EntryDto[]{returnfilterVaultEntries(vaultEntries,vaultSearchEl.value);}",
+    );
   });
 });

@@ -41,6 +41,15 @@ import {
   PANEL_SHOWN_EVENT,
   readFresh,
 } from "./panel-show";
+import {
+  applyVaultQuery,
+  filterVaultEntries,
+  reapplyVaultFilter,
+  removeVaultEntry,
+  replaceVaultEntry,
+  vaultEmptyStateText,
+  vaultHeaderText,
+} from "./vault-search";
 import { waitForKeyRelease } from "./gesture";
 import { initPlatform, keys, whenPlatformReady } from "./platform";
 import {
@@ -125,11 +134,20 @@ const vaultListEl = document.querySelector<HTMLDivElement>("#vault-list")!;
 const vaultSubEl = document.querySelector<HTMLDivElement>("#vault-sub")!;
 const vaultCloseEl = document.querySelector<HTMLButtonElement>("#vault-close")!;
 const vaultClearEl = document.querySelector<HTMLButtonElement>("#vault-clear")!;
+// 加密区搜索框（纯前端的元数据过滤，见 `vault-search.ts`）。
+const vaultSearchEl = document.querySelector<HTMLInputElement>("#vault-search")!;
 // 加密区模态内的条目状态：列表 + 选中索引 + 选中行元素缓存。
 // 加密区条目同样要能选中回贴 / 编辑备注（AE5），故与主列表并列维护一套选中态。
+//
+// `vaultEntries` 是**唯一**状态：列表渲染的那份「视图」是派生值 —— 由
+// 「全量数组 + 搜索框里的查询」现算（`currentVaultView()`），不存在第二份
+// 需要各处手动刷新的缓存（漏一处就留下与全量不一致的旧视图）。
 let vaultEntries: EntryDto[] = [];
 let vaultSelected = 0;
 let vaultSelectedEl: HTMLElement | null = null;
+// 取数失败标记：加载失败的文案不能被空态覆盖 —— 否则用户敲一个字，
+// 「加载加密区失败」就变成了「加密区暂无条目」。
+let vaultLoadError = false;
 
 // 设置模态元素（U12）。⌘, 唤出,托盘菜单也可触发。
 const settingsEl = document.querySelector<HTMLDivElement>("#settings")!;
@@ -559,23 +577,36 @@ async function moveCurrentToVault(): Promise<void> {
   }
 }
 
-/** 按当前 `vaultEntries` 刷新模态头部（条数 / 不可解密数）与「清除不可解密」按钮可见性。 */
-function refreshVaultHeader(): void {
+/** 按当前 `vaultEntries` 刷新模态头部（条数 / 不可解密数 / 命中数）与「清除不可解密」按钮可见性。 */
+function refreshVaultHeader(view: EntryDto[]): void {
   const undec = vaultEntries.filter((x) => !x.is_decryptable).length;
+  const hasQuery = vaultSearchEl.value.trim().length > 0;
+  const text = vaultHeaderText(vaultEntries.length, undec, view.length, hasQuery);
+  // 总数为 0 时计数行是空串，那时的引导语含平台键位（⌘L / Ctrl+L），留在
+  // main.ts 里用 `keys()` 拼 —— 纯函数产不出平台文案。
   vaultSubEl.textContent =
-    vaultEntries.length === 0
-      ? `把敏感条目移入加密区（列表中按 ${keys("⌘L")}）后，内容以 AES-256-GCM 加密存储。`
-      : `共 ${vaultEntries.length} 条${undec > 0 ? ` · ${undec} 条无法解密` : ""}`;
+    text ||
+    `把敏感条目移入加密区（列表中按 ${keys("⌘L")}）后，内容以 AES-256-GCM 加密存储。`;
   vaultClearEl.classList.toggle("hidden", undec === 0);
 }
 
-/** 收敛加密区选中索引：列表变短后不要停在越界位置。 */
-function clampVaultSelection(): void {
-  if (vaultSelected >= vaultEntries.length) vaultSelected = vaultEntries.length - 1;
-  if (vaultSelected < 0) vaultSelected = 0;
+/**
+ * 当前视图：全量条目按搜索框里的查询过滤后的结果。
+ *
+ * 派生值，不单独存一份 —— 全量数组是唯一的状态（见 `vaultEntries` 处的说明）。
+ */
+function currentVaultView(): EntryDto[] {
+  return filterVaultEntries(vaultEntries, vaultSearchEl.value);
 }
 
-/** 打开加密区管理模态（⌘⇧V / 托盘「加密区」）：列出 vault 条目、按需暴露「清除不可解密」。 */
+/**
+ * 打开加密区管理模态（⌘⇧V / 托盘「加密区」）：列出 vault 条目、按需暴露「清除不可解密」。
+ *
+ * 「打开」与「刷新数据」是**两条路径**：打开时先显示模态、清空查询、把焦点交给
+ * 搜索框，然后才取数 —— 取数的空窗期里焦点已经在输入框上，用户敲的字不会落进
+ * 被遮住的主搜索框。「清除不可解密条目」走刷新路径，保留当前查询与选中（走这里
+ * 的话，点一下清除就把用户的过滤词无声抹掉了）。
+ */
 async function openVault(): Promise<void> {
   // 浮层互斥：托盘三个入口共用这一块面板画布，若底下还压着关于 / 设置 / 编辑器，
   // Esc 关掉的是被遮住的那层、`handleVaultKey` 的 ↩ / ⌘⌫ 还会落到看不见的地方。
@@ -584,28 +615,92 @@ async function openVault(): Promise<void> {
   if (isSettingsOpen()) closeSettings();
   if (isEditorOpen()) closeEditor();
   vaultEl.classList.remove("hidden");
+  // 每次打开都从空查询开始。
+  vaultSearchEl.value = "";
+  vaultSearchEl.focus();
+  await refreshVaultEntries(true);
+}
+
+/**
+ * 取数并重画加密区列表。
+ *
+ * `resetSelection` = true 表示这是一次「重新打开」（查询刚被清空，选中回到第一条）；
+ * false 表示「数据变了，查询与选中尽量保住」（清除不可解密条目后重画）。
+ */
+async function refreshVaultEntries(resetSelection: boolean): Promise<void> {
+  // 旧选中态必须在覆盖 vaultEntries **之前**取：之后拿到的就是新数组里的同一索引，
+  // 认不出「原来选的是哪一条」。
+  const prev = { id: currentVaultEntry()?.id ?? null, index: vaultSelected };
   try {
     const items = await listVault();
     vaultEntries = items;
-    clampVaultSelection();
-    paintVaultList();
-    refreshVaultHeader();
+    vaultLoadError = false;
+    const { view, selected } = resetSelection
+      ? applyVaultQuery(vaultEntries, vaultSearchEl.value)
+      : reapplyVaultFilter(vaultEntries, vaultSearchEl.value, prev);
+    vaultSelected = selected;
+    paintVaultList(view);
+    refreshVaultHeader(view);
   } catch (err) {
     vaultEntries = [];
+    vaultLoadError = true;
     vaultSelectedEl = null;
     vaultListEl.innerHTML = `<div class="empty">加载加密区失败：${String(err)}</div>`;
   }
 }
 
-/** 渲染加密区列表并重建选中行缓存。全量重画，仅在数据变化时调用。 */
-function paintVaultList(): void {
-  renderVaultList(vaultListEl, vaultEntries, vaultSelected);
+/**
+ * 渲染加密区列表并重建选中行缓存。全量重画，仅在数据 / 查询变化时调用。
+ *
+ * `view` 是当前视图（派生值），与 `vaultSelected` 的索引空间一致。
+ */
+function paintVaultList(view: EntryDto[]): void {
+  // 取数失败时保留错误文案：改写成空态会让用户以为自己的条目没了。
+  if (vaultLoadError) return;
+  if (view.length === 0) {
+    vaultListEl.innerHTML = `<div class="empty">${vaultEmptyStateText(
+      vaultSearchEl.value.trim().length > 0,
+    )}</div>`;
+    vaultSelectedEl = null;
+    return;
+  }
+  renderVaultList(vaultListEl, view, vaultSelected);
   vaultSelectedEl = vaultListEl.querySelector<HTMLElement>(".vault-row.selected");
+  // 选中已回到第一条，列表却停在底部会让人以为没生效 —— 重画后复位到顶部。
+  vaultListEl.scrollTop = 0;
+}
+
+/**
+ * 数据变化（改完备注 / 删掉条目）后重画：视图重算，选中按条目 id 收敛。
+ *
+ * 与「查询变化」不同：这里**不**归零 —— 该条目还命中的就保持选中（改完备注
+ * 还在结果里的那条不该跳走），已经不在结果里的按旧索引夹紧（删掉的那一行被
+ * 后一行顶上）。
+ */
+function repaintVaultAfterDataChange(affectedId: number): void {
+  const { view, selected } = reapplyVaultFilter(vaultEntries, vaultSearchEl.value, {
+    id: affectedId,
+    index: vaultSelected,
+  });
+  vaultSelected = selected;
+  paintVaultList(view);
+  refreshVaultHeader(view);
+}
+
+/** 查询变化 → 视图重算、选中回到第一条、计数更新。 */
+function applyVaultQueryNow(): void {
+  // 取数失败时不动列表也不动头部：保留「加载加密区失败」的提示。
+  if (vaultLoadError) return;
+  const { view, selected } = applyVaultQuery(vaultEntries, vaultSearchEl.value);
+  vaultSelected = selected;
+  paintVaultList(view);
+  refreshVaultHeader(view);
 }
 
 /** 加密区选中切换的增量路径：仅调整 .selected class，不重建 DOM。 */
 function applyVaultSelectionPatch(idx: number): void {
-  if (idx < 0 || idx >= vaultEntries.length) return;
+  const view = currentVaultView();
+  if (idx < 0 || idx >= view.length) return;
   const target = vaultListEl.children[idx] as HTMLElement | undefined;
   if (!target) return;
   if (vaultSelectedEl && vaultSelectedEl !== target) vaultSelectedEl.classList.remove("selected");
@@ -615,14 +710,16 @@ function applyVaultSelectionPatch(idx: number): void {
 }
 
 function moveVaultSelection(delta: number): void {
-  if (vaultEntries.length === 0) return;
-  const next = Math.min(Math.max(vaultSelected + delta, 0), vaultEntries.length - 1);
+  const view = currentVaultView();
+  if (view.length === 0) return;
+  const next = Math.min(Math.max(vaultSelected + delta, 0), view.length - 1);
   if (next === vaultSelected) return;
   vaultSelected = next;
   applyVaultSelectionPatch(vaultSelected);
 }
 
-const currentVaultEntry = (): EntryDto | undefined => vaultEntries[vaultSelected];
+/** 当前选中的加密区条目（视图里的第 `vaultSelected` 条）。 */
+const currentVaultEntry = (): EntryDto | undefined => currentVaultView()[vaultSelected];
 
 /**
  * 回贴当前选中的加密区条目（↩ / 双击）。后端 `paste_entry` 负责解密 +
@@ -645,11 +742,9 @@ function editVaultNote(): void {
   const e = currentVaultEntry();
   if (!e) return;
   openEditor(e, (dto) => {
-    const idx = vaultEntries.findIndex((x) => x.id === dto.id);
-    if (idx >= 0) {
-      vaultEntries[idx] = dto;
-      paintVaultList();
-    }
+    vaultEntries = replaceVaultEntry(vaultEntries, dto);
+    // 改完备注可能不再命中当前查询 → 视图重算、选中按 id 收敛（不跳回第一条）。
+    repaintVaultAfterDataChange(dto.id);
   });
 }
 
@@ -670,17 +765,26 @@ async function deleteVaultEntry(): Promise<void> {
     toast(removed > 0 ? "已删除该条目" : "该条目已不存在");
     // 按 id 摘行，不用 `splice(vaultSelected)`：`await` 期间选中可能已经移动，
     // 连按两次 ⌘⌫ 也会走到这里 —— 按 id 找才不会摘错行（摘不到说明已摘过）。
-    const idx = vaultEntries.findIndex((x) => x.id === e.id);
-    if (idx >= 0) vaultEntries.splice(idx, 1);
-    clampVaultSelection();
-    paintVaultList();
-    refreshVaultHeader();
+    vaultEntries = removeVaultEntry(vaultEntries, e.id);
+    // 视图重算 + 选中按 id 收敛：删掉的那一行被后一行顶上，不跳回第一条。
+    repaintVaultAfterDataChange(e.id);
   } catch (err) {
     toast(`删除失败：${String(err)}`);
   }
 }
 
 vaultCloseEl.addEventListener("click", closeVault);
+// 加密区搜索：输入即过滤。纯前端内存过滤（不发 IPC），几百条是亚毫秒级 ——
+// 不像主搜索框那样要防抖（那是为了少发一次 IPC）。
+vaultSearchEl.addEventListener("input", (ev) => {
+  // 组字期间不按未上屏的拼音串过滤：列表不该在选词之前闪成「没有匹配的条目」。
+  if ((ev as InputEvent).isComposing) return;
+  applyVaultQueryNow();
+});
+// 组字结束后再过滤一次（compositionend 之后未必再触发一次 input）。
+vaultSearchEl.addEventListener("compositionend", () => {
+  applyVaultQueryNow();
+});
 // 加密区条目选中 / 双击回贴：与主列表同样的鼠标语义（单击选中，双击回贴）。
 vaultListEl.addEventListener("click", (ev) => {
   const row = (ev.target as HTMLElement).closest<HTMLElement>(".vault-row");
@@ -689,6 +793,9 @@ vaultListEl.addEventListener("click", (ev) => {
   if (!Number.isInteger(idx)) return;
   vaultSelected = idx;
   applyVaultSelectionPatch(idx);
+  // 焦点交回搜索输入框：列表行不是可聚焦元素，不交回去的话用户接下来的按键
+  // 会落进空处（焦点门的整个前提就是焦点在输入框上）。
+  vaultSearchEl.focus();
 });
 vaultListEl.addEventListener("dblclick", (ev) => {
   // 单击已把 vaultSelected 指向被双击的行，这里直接回贴当前选中项。
@@ -702,7 +809,8 @@ vaultClearEl.addEventListener("click", () => {
     try {
       const n = await clearUndecryptable();
       toast(`已清除 ${n} 条不可解密条目`);
-      await openVault(); // 重新渲染。
+      // 走刷新路径：保留当前查询与选中（走 openVault 会把用户的过滤词清掉）。
+      await refreshVaultEntries(false);
     } catch (err) {
       toast(`清除失败：${String(err)}`);
     }
