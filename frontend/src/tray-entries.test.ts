@@ -81,7 +81,11 @@ describe("面板唤出时的搜索框复位（#37）", () => {
     const squeezedBody = body.replace(/\s+/g, "");
     const cleared = squeezedBody.indexOf('searchEl.value="";');
     expect(cleared, "唤出重置必须清空 searchEl.value").toBeGreaterThan(-1);
-    expect(cleared, "清空应在聚焦之前").toBeLessThan(squeezedBody.indexOf("searchEl.focus()"));
+    // 聚焦走 `focusActiveSurface()`（焦点归当前最上层模态：加密区开着就聚焦
+    // 加密区的搜索框，否则聚焦主搜索框），不再直接 `searchEl.focus()`。
+    expect(cleared, "清空应在聚焦之前").toBeLessThan(
+      squeezedBody.indexOf("focusActiveSurface()"),
+    );
     expect(cleared, "清空应在这次 load() 之前").toBeLessThan(
       squeezedBody.lastIndexOf("voidload();"),
     );

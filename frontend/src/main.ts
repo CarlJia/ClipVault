@@ -183,6 +183,21 @@ const isVaultOpen = (): boolean => !vaultEl.classList.contains("hidden");
 const isSettingsOpen = (): boolean => !settingsEl.classList.contains("hidden");
 const isAboutOpen = (): boolean => !aboutEl.classList.contains("hidden");
 
+/**
+ * 焦点归当前最上层模态：加密区面板开着时，焦点在加密区的搜索框；否则在主搜索框。
+ *
+ * 为什么不靠事件先后顺序：托盘点「加密区」时，「面板被唤出」的收尾与 openVault
+ * 的取数是两条异步链，谁先到取决于平台事件循环 —— 焦点被抢走的话，用户敲的字
+ * 会落进主搜索框，而加密区面板正盖在上面（看得见的是加密区、敲进去的是主搜索框）。
+ */
+function focusActiveSurface(): void {
+  if (isVaultOpen()) {
+    vaultSearchEl.focus();
+    return;
+  }
+  searchEl.focus();
+}
+
 // 托盘浮层入口（加密区 / 设置… / 关于）的「刚被点名」豁免闸门。
 // `show_panel()` 会先让窗口拿到焦点，而下面的 focus 处理器一律「回到主列表」
 // （收回加密区）。两件事都在异步事件里，谁先到取决于平台事件循环 —— 见
@@ -751,7 +766,7 @@ function editVaultNote(): void {
 function closeVault(): void {
   vaultEl.classList.add("hidden");
   vaultSelectedEl = null;
-  searchEl.focus();
+  focusActiveSurface();
 }
 
 /** ⌘⌫：删除加密区里选中的条目，然后就地重绘（不重拉整表，保持模态与选中位置）。 */
@@ -1091,6 +1106,9 @@ document.addEventListener("keydown", (ev) => {
         pasteVaultEntry,
         editVaultNote,
         deleteVaultEntry,
+        // 焦点门的前提：焦点在加密区的搜索框吗？框里有内容吗？
+        searchFocused: () => document.activeElement === vaultSearchEl,
+        hasQuery: () => vaultSearchEl.value.length > 0,
       })
     )
       return;
@@ -1167,7 +1185,7 @@ function resetPanelOnShow(fresh: boolean): void {
     // `input.value` 里，而下面的 `load()` 拿的正是它。必须显式清空；`select()`
     // 只是全选，旧词仍可见、仍参与过滤（#37：每次唤出都从空搜索框开始）。
     searchEl.value = "";
-    searchEl.focus();
+    focusActiveSurface();
   }
   // 横幅与数据：两种唤出都要刷新（访客模式可能在面板开着时被托盘切过）。
   void refreshAccessibilityBanner(bannerEl);
@@ -1206,11 +1224,11 @@ window.addEventListener("focus", () => {
 renderTabs();
 bindPreviewPane(document.querySelector<HTMLElement>("#preview")!);
 searchEl.focus();
-// 编辑器 Esc 关闭后把焦点交还搜索框 / 列表。
-// 若编辑器是从加密区模态内唤起的（⌘⇧V → ⌘E），焦点留在模态里：搜索框在模态之下。
+// 编辑器 Esc 关闭后把焦点交还当前最上层模态的输入框。
+// 若编辑器是从加密区模态内唤起的（⌘⇧V → ⌘E），焦点要回到加密区的搜索框 ——
+// 主搜索框在模态之下，焦点落在那儿的话用户接着打字没反应。
 setEditorCloseHandler(() => {
-  if (isVaultOpen()) return;
-  searchEl.focus();
+  focusActiveSurface();
 });
 // U12：托盘「设置…」菜单触发后端 `emit("open-settings")`，前端转呼 openSettings()。
 // listen 返回的 Promise unhandled rejection 静默丢弃：失败属异常路径，丢给 window 错误兜底。

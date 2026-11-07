@@ -20,7 +20,7 @@ import coreKeymapRs from "../../clipvault-core/src/keymap.rs?raw";
 type EvInit = Partial<
   Pick<
     KeyboardEvent,
-    "key" | "code" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey" | "repeat"
+    "key" | "code" | "metaKey" | "ctrlKey" | "shiftKey" | "altKey" | "repeat" | "isComposing"
   >
 > & { key: string };
 
@@ -32,6 +32,7 @@ function ev(init: EvInit): KeyboardEvent {
     shiftKey: false,
     altKey: false,
     repeat: false,
+    isComposing: false,
     // handleVaultKey 会 preventDefault；matches / parseKeyCombo 不碰它。
     preventDefault: () => undefined,
     ...init,
@@ -453,7 +454,7 @@ describe("actionOwningCombo：找出已经占着这个组合的 action", () => {
 
 describe("handleVaultKey：加密区模态内的快捷键", () => {
   /** 记录 handler 调用序与 `preventDefault` 次数的最小 ctx。 */
-  function vaultCtx() {
+  function vaultCtx(opts: { focused?: boolean; hasQuery?: boolean } = {}) {
     const calls: string[] = [];
     return {
       calls,
@@ -463,6 +464,9 @@ describe("handleVaultKey：加密区模态内的快捷键", () => {
         pasteVaultEntry: async () => void calls.push("paste"),
         editVaultNote: () => void calls.push("edit"),
         deleteVaultEntry: async () => void calls.push("delete"),
+        // 焦点门的两个前提，默认都不满足（旧行为：按键照常派发）。
+        searchFocused: () => opts.focused ?? false,
+        hasQuery: () => opts.hasQuery ?? false,
       },
     };
   }
@@ -554,6 +558,83 @@ describe("handleVaultKey：加密区模态内的快捷键", () => {
     const { calls, ctx } = vaultCtx();
     expect(km.handleVaultKey(ev({ key: "Escape", code: "Escape" }), ctx)).toBe(true);
     expect(calls).toEqual(["close"]);
+  });
+
+  // -------------------------------------------------------------------------
+  // 焦点门与 IME（加密区搜索，plan R9 / R10 / R12）
+  // -------------------------------------------------------------------------
+
+  it("组字期间按 Esc 不关闭面板（Esc 交给输入法）", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx();
+    expect(
+      km.handleVaultKey(ev({ key: "Escape", code: "Escape", isComposing: true }), ctx),
+    ).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("组字期间不派发任何动作", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx();
+    km.handleVaultKey(ev({ key: "Enter", code: "Enter", isComposing: true }), ctx);
+    km.handleVaultKey(
+      ev({ key: "Backspace", code: "Backspace", metaKey: true, isComposing: true }),
+      ctx,
+    );
+    expect(calls).toEqual([]);
+  });
+
+  it("焦点在搜索框时裸字符键（含空格）归输入框", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: true });
+    expect(km.handleVaultKey(ev({ key: "a", code: "KeyA" }), ctx)).toBe(false);
+    expect(km.handleVaultKey(ev({ key: " ", code: "Space" }), ctx)).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("焦点在搜索框且有内容时，↩ 与 ⌘⌫ 让位给原生输入", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: true, hasQuery: true });
+    expect(km.handleVaultKey(ev({ key: "Enter", code: "Enter" }), ctx)).toBe(false);
+    expect(
+      km.handleVaultKey(ev({ key: "Backspace", code: "Backspace", metaKey: true }), ctx),
+    ).toBe(false);
+    expect(calls).toEqual([]);
+  });
+
+  it("焦点在搜索框但没内容时，↩ 与 ⌘⌫ 照旧派发（旧行为不变）", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: true, hasQuery: false });
+    expect(km.handleVaultKey(ev({ key: "Enter", code: "Enter" }), ctx)).toBe(true);
+    expect(
+      km.handleVaultKey(ev({ key: "Backspace", code: "Backspace", metaKey: true }), ctx),
+    ).toBe(true);
+    expect(calls).toEqual(["paste", "delete"]);
+  });
+
+  it("焦点不在搜索框时旧行为不变：↩ / ⌘⌫ / ⌘E / ↓ 都照常派发", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: false, hasQuery: true });
+    km.handleVaultKey(ev({ key: "Enter", code: "Enter" }), ctx);
+    km.handleVaultKey(ev({ key: "Backspace", code: "Backspace", metaKey: true }), ctx);
+    km.handleVaultKey(ev({ key: "e", code: "KeyE", metaKey: true }), ctx);
+    km.handleVaultKey(ev({ key: "ArrowDown", code: "ArrowDown" }), ctx);
+    expect(calls).toEqual(["paste", "delete", "edit", "move:1"]);
+  });
+
+  it("焦点在搜索框且有内容时按 Esc，仍然关闭面板", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: true, hasQuery: true });
+    expect(km.handleVaultKey(ev({ key: "Escape", code: "Escape" }), ctx)).toBe(true);
+    expect(calls).toEqual(["close"]);
+  });
+
+  it("带修饰键的组合键照常派发（裸字符判据看的是修饰键，不是键名长度）", async () => {
+    const km = await freshKeymap();
+    const { calls, ctx } = vaultCtx({ focused: true, hasQuery: false });
+    // ⌘E 的 ev.key 只有一个字符，但它带修饰键 → 不是裸字符键 → 照常编辑备注。
+    expect(km.handleVaultKey(ev({ key: "e", code: "KeyE", metaKey: true }), ctx)).toBe(true);
+    expect(calls).toEqual(["edit"]);
   });
 });
 

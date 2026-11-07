@@ -716,6 +716,30 @@ export function textFieldOwnsSpace(target: EventTarget | null): boolean {
 // 走与主面板同一张 keymap（含用户重绑），语义 = 该动作作用在当前选中的加密区条目上。
 // ---------------------------------------------------------------------------
 
+/**
+ * 加密区内的「焦点门」：这次按键该不该让位给搜索输入框。
+ *
+ * 三档（plan KTD5 / R9 / R10）：
+ * 1. 焦点在输入框 + **裸字符键**（含空格）→ 让位：用户正在打字，一个字都不该被
+ *    面板吃掉。判据是「键本身就是一个字符」且没有修饰键 —— 组合键的 `ev.key`
+ *    也可能只有一个字符（`⌘⇧V` 的 `ev.key` 是 `"V"`），但它带修饰键，不算裸字符。
+ * 2. 焦点在输入框 + 输入框**有内容** + 动作是回贴 / 删除 → 让位：单行输入里
+ *    `⌘⌫` 的原生语义是「删到行首」，`↩` 也没有原生含义可做，两者都不该被面板抢走。
+ * 3. 其余 → 不让位，照常派发。
+ *
+ * 三档都以「焦点在输入框」为前提 —— 焦点不在（Tab 走开等）时按键照常派发。
+ */
+export function vaultKeyYieldsToInput(
+  ev: KeyboardEvent,
+  st: { focused: boolean; hasQuery: boolean },
+): boolean {
+  if (!st.focused) return false;
+  if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey) return true;
+  if (!st.hasQuery) return false;
+  const action = matches(ev);
+  return action === "paste" || action === "delete_entry";
+}
+
 export function handleVaultKey(
   ev: KeyboardEvent,
   ctx: {
@@ -724,14 +748,29 @@ export function handleVaultKey(
     pasteVaultEntry: () => Promise<void>;
     editVaultNote: () => void;
     deleteVaultEntry: () => Promise<void>;
+    /** 焦点是否在加密区的搜索输入框（焦点门的前提）。 */
+    searchFocused: () => boolean;
+    /** 搜索框当前是否有内容（焦点门的第二档前提）。 */
+    hasQuery: () => boolean;
   },
 ): boolean {
+  // 组字期间一律不派发：输入法正在编辑候选词，任何动作派发都会打断组字；
+  // Esc 也交给输入法处理（plan R12 / AE8）。这一道闸门排在 Esc 之前 ——
+  // 组字中的 Esc 是「取消候选词」，不是「关闭面板」。
+  if (ev.isComposing) return false;
+
   // Esc 是无条件的逃生口：模态必须永远关得掉，与 keymap 是否加载完、`close` 被
   // 重绑到哪个键都无关。
   if (ev.key === "Escape") {
     ev.preventDefault();
     ctx.closeVault();
     return true;
+  }
+
+  // 焦点门：用户正在搜索框里打字时，裸字符键与「有内容时的回贴 / 删除」让位给
+  // 原生输入。不 preventDefault —— 让输入框自己处理这个键。
+  if (vaultKeyYieldsToInput(ev, { focused: ctx.searchFocused(), hasQuery: ctx.hasQuery() })) {
+    return false;
   }
 
   // 其余按键一律查 keymap —— 不再硬编码默认键。原先这里写死 `⌘⌫` / `⌘E`，用户在
