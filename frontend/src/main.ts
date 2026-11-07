@@ -44,6 +44,7 @@ import {
 import {
   applyVaultQuery,
   filterVaultEntries,
+  hasVaultQuery,
   reapplyVaultFilter,
   removeVaultEntry,
   replaceVaultEntry,
@@ -598,7 +599,7 @@ async function moveCurrentToVault(): Promise<void> {
 /** 按当前 `vaultEntries` 刷新模态头部（条数 / 不可解密数 / 命中数）与「清除不可解密」按钮可见性。 */
 function refreshVaultHeader(view: EntryDto[]): void {
   const undec = vaultEntries.filter((x) => !x.is_decryptable).length;
-  const hasQuery = vaultSearchEl.value.trim().length > 0;
+  const hasQuery = hasVaultQuery(vaultSearchEl.value);
   const text = vaultHeaderText(vaultEntries.length, undec, view.length, hasQuery);
   // 总数为 0 时计数行是空串，那时的引导语含平台键位（⌘L / Ctrl+L），留在
   // main.ts 里用 `keys()` 拼 —— 纯函数产不出平台文案。
@@ -678,7 +679,7 @@ function paintVaultList(view: EntryDto[]): void {
     vaultListEl,
     view,
     vaultSelected,
-    vaultEmptyStateText(vaultSearchEl.value.trim().length > 0),
+    vaultEmptyStateText(hasVaultQuery(vaultSearchEl.value), vaultEntries.length),
   );
   vaultSelectedEl = vaultListEl.querySelector<HTMLElement>(".vault-row.selected");
   lastPaintedQuery = vaultSearchEl.value;
@@ -798,6 +799,15 @@ async function deleteVaultEntry(): Promise<void> {
 }
 
 vaultCloseEl.addEventListener("click", closeVault);
+// 点标题栏 / 计数行 / 底部提示这类非可聚焦区域，浏览器会把焦点从输入框挪到
+// `body` —— 而加密区分支对任何按键都是「处理不了也 return」，焦点一丢，用户
+// 接着敲的字就无处可去（既进不了输入框，也不触发动作）。按 rolodex 式面板的
+// 通行做法在这些区域按下鼠标时阻止默认的取焦行为；输入框与按钮仍照常拿焦点。
+vaultEl.addEventListener("mousedown", (ev) => {
+  const target = ev.target as HTMLElement | null;
+  if (target?.closest("input, button")) return;
+  ev.preventDefault();
+});
 // 加密区搜索：输入即过滤。纯前端内存过滤（不发 IPC），几百条是亚毫秒级 ——
 // 不像主搜索框那样要防抖（那是为了少发一次 IPC）。
 vaultSearchEl.addEventListener("input", (ev) => {
@@ -829,6 +839,11 @@ vaultListEl.addEventListener("dblclick", (ev) => {
   void pasteVaultEntry();
 });
 vaultClearEl.addEventListener("click", () => {
+  // 按钮点击会把焦点从输入框挪到按钮上（WebView2 尤其如此）。加密区分支对任何
+  // 按键都是「处理不了也 return」，焦点一旦不在输入框，用户接着敲的字既不进
+  // 输入框也不触发动作 —— 看起来就是搜索框坏了。与「点列表行」同一做法：收工
+  // 就交回焦点（R13：面板打开期间焦点始终在加密区搜索框）。
+  vaultSearchEl.focus();
   void (async () => {
     try {
       const n = await clearUndecryptable();
@@ -1119,9 +1134,9 @@ document.addEventListener("keydown", (ev) => {
         editVaultNote,
         deleteVaultEntry,
         searchFocused: () => document.activeElement === vaultSearchEl,
-        // 与列表/计数同一口径（trim）：只敲空格不算「有查询」，否则焦点门会把
-        // ↩ 让给原生输入、而输入框其实什么都不会发生。
-        hasQuery: () => vaultSearchEl.value.trim().length > 0,
+        // 与列表/计数/空态共用同一个判据（`hasVaultQuery`）：只敲空格不算「有查询」，
+        // 否则焦点门会把 ↩ 让给原生输入、而输入框其实什么都不会发生。
+        hasQuery: () => hasVaultQuery(vaultSearchEl.value),
       })
     )
       return;

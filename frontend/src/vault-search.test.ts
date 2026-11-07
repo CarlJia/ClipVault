@@ -20,6 +20,7 @@ import mainTs from "./main.ts?raw";
 import {
   applyVaultQuery,
   filterVaultEntries,
+  hasVaultQuery,
   localDateString,
   matchesVaultQuery,
   reapplyVaultFilter,
@@ -98,6 +99,16 @@ describe("查询拆词与匹配", () => {
     expect(localDateString(midnightish(23, 30))).toBe("2026-10-16");
   });
 
+  it("月份与日期补零到两位（1–9 月按 YYYY-MM-DD 也搜得到）", () => {
+    // 其余用例的夹具都是 10 月 16 日（本身就是两位），零填充被删掉也照样通过 ——
+    // 而 1–9 月的条目一旦变成 `2026-1-5`，README 里写的 `2026-01-05` / `01-05`
+    // 两种搜法会同时失效。
+    const e = entry({ id: 1, created_at: localNoon(2026, 1, 5) });
+    expect(localDateString(e.created_at)).toBe("2026-01-05");
+    expect(matchesVaultQuery(e, "2026-01-05")).toBe(true);
+    expect(matchesVaultQuery(e, "01-05")).toBe(true);
+  });
+
   it("词间是「与」：两个词都命中才算命中", () => {
     const e = entry({ id: 1, note: "服务器密码" });
     expect(matchesVaultQuery(e, "服务器 密码")).toBe(true);
@@ -131,6 +142,26 @@ describe("查询拆词与匹配", () => {
     expect(hay).toContain("c");
     expect(hay).toContain("t");
     expect(hay).toContain("2026-10-16");
+  });
+});
+
+describe("有没有查询", () => {
+  it("拆得出词才算有查询，只敲空白不算", () => {
+    expect(hasVaultQuery("")).toBe(false);
+    expect(hasVaultQuery("   ")).toBe(false);
+    expect(hasVaultQuery("\t\n")).toBe(false);
+    expect(hasVaultQuery("密")).toBe(true);
+    expect(hasVaultQuery(" 密 码 ")).toBe(true);
+  });
+
+  it("与过滤口径同源：判为「没有查询」时过滤不过滤", () => {
+    // 焦点门、计数行、空态文案都用这一个判据；它一旦与过滤分家，用户就会看到
+    // 「列表说匹配 0 条，按 ↩ 却仍然回贴」这种自相矛盾。
+    const list = [entry({ id: 1, note: "密码" })];
+    for (const q of ["", "   ", "\t\n"]) {
+      expect(hasVaultQuery(q)).toBe(false);
+      expect(filterVaultEntries(list, q)).toEqual(list);
+    }
   });
 });
 
@@ -211,8 +242,15 @@ describe("文案", () => {
   });
 
   it("空态文案区分「没条目」与「没命中」", () => {
-    expect(vaultEmptyStateText(false)).toBe("加密区暂无条目");
-    expect(vaultEmptyStateText(true)).toBe("没有匹配的条目");
+    expect(vaultEmptyStateText(false, 12)).toBe("加密区暂无条目");
+    expect(vaultEmptyStateText(true, 12)).toBe("没有匹配的条目");
+  });
+
+  it("加密区本来就空时，敲了字也不会说「没有匹配的条目」", () => {
+    // 空加密区 + 非空查询：列表说「没有匹配的条目」、上方的计数行却是「把敏感
+    // 条目移入加密区…」的引导语 —— 两句话自相矛盾，用户会以为条目丢了。
+    expect(vaultEmptyStateText(true, 0)).toBe("加密区暂无条目");
+    expect(vaultEmptyStateText(false, 0)).toBe("加密区暂无条目");
   });
 });
 
@@ -275,6 +313,39 @@ describe("加密区搜索的接线契约", () => {
     expect(s).toContain("refreshVaultEntries(false)");
     // 走 openVault 会把用户当前的过滤词清掉 —— 那是「重新打开」的语义。
     expect(s).not.toContain("openVault(");
+  });
+
+  it("「清除不可解密条目」收工后把焦点交回搜索框", () => {
+    // 按钮点击本身会拿走焦点。加密区分支对任何按键都是「处理不了也 return」，
+    // 焦点不在输入框时用户接着敲的字既不进输入框也不触发动作。
+    const body =
+      /vaultClearEl\.addEventListener\("click", \(\) => \{([\s\S]*?)\n\}\);/.exec(mainTs)?.[1] ??
+      "";
+    expect(body).not.toBe("");
+    const s = body.replace(/\s+/g, "");
+    const focused = s.indexOf("vaultSearchEl.focus();");
+    expect(focused, "清除按钮必须交回焦点").toBeGreaterThan(-1);
+    expect(focused, "交回焦点应在清除取数之前").toBeLessThan(s.indexOf("clearUndecryptable()"));
+  });
+
+  it("点非可聚焦区域不把焦点从搜索框挪走", () => {
+    // 标题栏 / 计数行 / 底部提示按下鼠标时浏览器会把焦点丢给 body。守卫只对
+    // 非 input / button 的区域生效 —— 否则清除按钮与关闭按钮自己也按不动。
+    const at = squeezed.indexOf('vaultEl.addEventListener("mousedown"');
+    expect(at, "必须监听 #vault 的 mousedown").toBeGreaterThan(-1);
+    const body = squeezed.slice(at, at + 160);
+    expect(body).toContain('closest("input,button")');
+    expect(body).toContain("preventDefault();");
+  });
+
+  it("编辑器关闭后焦点回到当前最上层模态，不写死主搜索框", () => {
+    const body = /setEditorCloseHandler\(\(\) => \{([\s\S]*?)\n\}\);/.exec(mainTs)?.[1] ?? "";
+    expect(body).not.toBe("");
+    expect(body.replace(/\s+/g, "")).toContain("focusActiveSurface();");
+    // 写死 `searchEl.focus()` 就会把焦点交给被加密区盖住的主搜索框（R13）。
+    expect(body).not.toContain("searchEl.focus()");
+    const closeBody = /function closeVault\(\): void \{([\s\S]*?)\n\}/.exec(mainTs)?.[1] ?? "";
+    expect(closeBody.replace(/\s+/g, "")).toContain("focusActiveSurface();");
   });
 
   it("列表渲染的是派生视图，不是全量数组", () => {

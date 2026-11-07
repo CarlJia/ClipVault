@@ -375,15 +375,26 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   先清查询并聚焦再取数，「清除不可解密条目」走刷新路径、保留查询与选中。
   顺带把 `list_vault_entries` 切到 `ENTRY_LIST_COLS` —— 加密区条目的密文 payload
   此前被整块读进内存再丢掉（面板只按元数据展示，回贴另走 `get_by_id`）。
+  `hasVaultQuery` 是「有没有查询」的**唯一**判据（焦点门 / 计数行 / 空态文案共用），
+  与过滤同源（拆得出词才算有查询）。
+  代码评审后的收尾：**焦点**由 `#vault` 的 `mousedown` 守卫（非 `input` / `button`
+  处 `preventDefault`）+ 清除按钮收工后的 `vaultSearchEl.focus()` 兜住 —— 否则点
+  标题栏 / 计数行 / 清除按钮会把焦点丢给 `body`，而加密区分支对任何按键都是
+  「处理不了也 return」，用户接着敲的字无处可去。**空态**区分三态：加密区本来就空
+  时敲字仍说「加密区暂无条目」，只有「共有条目且没命中」才说「没有匹配的条目」。
+  `panel.ts` 的 `renderVaultList` 不再给 `emptyText` 默认值（那会让通用渲染器反向
+  依赖 `vault-search.ts`），文案由调用方传入。
   新增用例：app `list_vault_entries_does_not_fetch_payload_blob`（1 例）；前端
-  `vault-search.test.ts` 27 例（纯函数 20 + 接线契约 7）、`keymap.test.ts` 8 例
+  `vault-search.test.ts` 34 例（纯函数 24 + 接线契约 10）、`keymap.test.ts` 8 例
   （组字闸门 2 + 焦点门 6）；`tray-entries.test.ts` 的既有断言改指 `focusActiveSurface()`。
-  **本轮实测基线：后端 358 passed + 0 ignored（此前 357）；前端 195 例（11 个测试文件，
-  此前 160 例 10 个文件）**。`cargo fmt --check`、`cargo check --workspace --all-targets`、
+  焦点门那条用例用**自定义 keymap** 把 `paste` / `move_down` 绑成裸字母 —— 默认表里
+  没有任何裸字符绑定，拿默认表断言的话把整道门删掉也照样绿。
+  **本轮实测基线：后端 358 passed + 0 ignored（此前 357）；前端 202 例（11 个测试文件，
+  此前 195 例）**。`cargo fmt --check`、`cargo check --workspace --all-targets`、
   `cargo clippy -- -D warnings`、`cargo test --workspace`、`npm run build`、`npm test`、
   `packaging/check-windows.sh`（check + clippy）全绿；R13 网络出口审计仍为空。
-  剩余：macOS 真机验收（搜索、组字、打字时快捷键让位、点行后继续打字）与 Windows
-  真机复跑。
+  剩余：macOS 真机验收（搜索、组字、打字时快捷键让位、点行后继续打字、点非行区域
+  后继续打字）与 Windows 真机复跑。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：

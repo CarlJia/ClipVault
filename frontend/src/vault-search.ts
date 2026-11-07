@@ -68,6 +68,20 @@ function queryTerms(query: string): string[] {
     .filter((t) => t.length > 0);
 }
 
+/**
+ * 这次查询算不算「有查询」。
+ *
+ * 这是「查询是否为空」的**唯一**定义，与过滤共用同一份拆词规则。焦点门、计数行、
+ * 空态文案都调它 —— 各处自己写 `value.trim().length > 0` 的话，将来改口径
+ * （例如把全角空格也算空白）必然漏改一处，而漏改的后果是用户可见的矛盾：
+ * 列表说「匹配 0 条」，按 ↩ 却仍然回贴（焦点门以为没有查询）。
+ *
+ * 判据是「拆得出词」而不是「非空」：只敲空格不算有查询。
+ */
+export function hasVaultQuery(query: string): boolean {
+  return queryTerms(query).length > 0;
+}
+
 /** 这条条目是否命中已拆好的词（词间「与」，大小写不敏感子串）。 */
 function matchTerms(e: VaultSearchable, terms: string[]): boolean {
   if (terms.length === 0) return true;
@@ -164,12 +178,15 @@ export const VAULT_EMPTY_TEXT = "加密区暂无条目";
 export const VAULT_NO_MATCH_TEXT = "没有匹配的条目";
 
 /**
- * 加密区空态文案：有查询没命中 → 「没有匹配的条目」；无查询 → 「加密区暂无条目」。
+ * 加密区空态文案：有查询没命中 → 「没有匹配的条目」；其余 → 「加密区暂无条目」。
  *
  * 两者必须区分：把「搜不到」说成「没有条目」，用户会以为自己的条目丢了。
+ * 反过来也要分开：**加密区本来就空**的时候，随手敲一个字不该被说成「没有匹配的
+ * 条目」—— 那会与同一屏上方的「把敏感条目移入加密区…」引导语自相矛盾。所以
+ * 「没有匹配的条目」只在**确实有条目**（`total > 0`）且查询非空时出现。
  */
-export function vaultEmptyStateText(hasQuery: boolean): string {
-  return hasQuery ? VAULT_NO_MATCH_TEXT : VAULT_EMPTY_TEXT;
+export function vaultEmptyStateText(hasQuery: boolean, total: number): string {
+  return hasQuery && total > 0 ? VAULT_NO_MATCH_TEXT : VAULT_EMPTY_TEXT;
 }
 
 /**

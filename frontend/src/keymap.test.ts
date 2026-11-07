@@ -585,9 +585,24 @@ describe("handleVaultKey：加密区模态内的快捷键", () => {
   });
 
   it("焦点在搜索框时裸字符键（含空格）归输入框", async () => {
-    const km = await freshKeymap();
+    // 必须用一份**自定义** keymap：默认表里没有任何裸字符绑定（`a` 的 `matches`
+    // 返回 null），默认绑到空格的 `preview` 在 `handleVaultKey` 的 switch 里又
+    // 没有 case、走 `default: return false` —— 拿默认表做断言的话，把整道焦点门
+    // 删掉也照样通过，这条用例就起不到任何护栏作用。
+    // 用 `paste` 与 `move_down` 两条真正有 case 的动作，堵住「只覆盖一条路径」。
+    const km = await freshKeymap({
+      wire: {
+        ...DEFAULT_WIRE,
+        actions: {
+          ...DEFAULT_WIRE.actions,
+          paste: { mods: [], key: "a" },
+          move_down: { mods: [], key: "j" },
+        },
+      },
+    });
     const { calls, ctx } = vaultCtx({ focused: true });
     expect(km.handleVaultKey(ev({ key: "a", code: "KeyA" }), ctx)).toBe(false);
+    expect(km.handleVaultKey(ev({ key: "j", code: "KeyJ" }), ctx)).toBe(false);
     expect(km.handleVaultKey(ev({ key: " ", code: "Space" }), ctx)).toBe(false);
     expect(calls).toEqual([]);
   });
