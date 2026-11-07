@@ -361,6 +361,29 @@ powershell -ExecutionPolicy Bypass -File packaging\build-windows.ps1
   `cargo clippy -- -D warnings`、`cargo test --workspace`、`npm run build`、`npm test`、
   `packaging/check-windows.sh`（check + clippy）全绿；R13 网络出口审计仍为空。
   剩余：macOS 真机验收（收起后再唤出、面板开着时再按一次热键）。
+- **加密区面板搜索**（见 `docs/plans/2026-11-07-1533-feat-vault-panel-search-plan.md`）：
+  加密区攒到几十条以后，用户只能逐行肉眼翻 —— 加密区条目整体被排除在 FTS 之外
+  （MVP plan U9），主面板的搜索框对它们永远无效。加密区模态内新增一个自带输入框，
+  按**元数据**（备注 / 标签 / 类别 / 本地 `YYYY-MM-DD` 日期）过滤条目。
+  **纯前端内存过滤**：不解密、不查库、不改索引、不新增 IPC（元数据本来就随
+  `listVault` 整批下发到前端）。视图是**派生值**（全量数组 + 当前查询 → 视图），
+  不存第二份缓存；选中收敛分两条路径 —— 查询变化归零、数据变化按条目 id 收敛
+  （改完备注仍命中就保持选中，不再命中按旧索引夹紧，不跳回第一条）。
+  焦点门三档：焦点在搜索框时裸字符键（含空格）归输入框；框里有内容时 ↩ 与 ⌘⌫
+  让位给原生输入；Esc 无条件关面板。IME 组字期间既不派发也不按未上屏的拼音过滤
+  （`compositionend` 再过滤一次）。「打开面板」与「刷新数据」是两条路径：打开时
+  先清查询并聚焦再取数，「清除不可解密条目」走刷新路径、保留查询与选中。
+  顺带把 `list_vault_entries` 切到 `ENTRY_LIST_COLS` —— 加密区条目的密文 payload
+  此前被整块读进内存再丢掉（面板只按元数据展示，回贴另走 `get_by_id`）。
+  新增用例：app `list_vault_entries_does_not_fetch_payload_blob`（1 例）；前端
+  `vault-search.test.ts` 27 例（纯函数 20 + 接线契约 7）、`keymap.test.ts` 8 例
+  （组字闸门 2 + 焦点门 6）；`tray-entries.test.ts` 的既有断言改指 `focusActiveSurface()`。
+  **本轮实测基线：后端 358 passed + 0 ignored（此前 357）；前端 195 例（11 个测试文件，
+  此前 160 例 10 个文件）**。`cargo fmt --check`、`cargo check --workspace --all-targets`、
+  `cargo clippy -- -D warnings`、`cargo test --workspace`、`npm run build`、`npm test`、
+  `packaging/check-windows.sh`（check + clippy）全绿；R13 网络出口审计仍为空。
+  剩余：macOS 真机验收（搜索、组字、打字时快捷键让位、点行后继续打字）与 Windows
+  真机复跑。
 - **Windows 分支的本地检查与 CI 分工**：`cfg(target_os = "windows")` 的分支在 macOS 上**不参与**
   本地 `cargo check`，所以改到它时必须跑 `packaging/check-windows.sh`（桩掉 C 侧后拿到整树类型检查
   与 clippy，几秒；**不链接、不执行**，边界写在脚本头部注释里）。**构建与执行**仍然只有 CI 能验：
