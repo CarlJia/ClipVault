@@ -11,23 +11,18 @@
 // 查询 → 视图，现算现用；不存在「上一次过滤结果」那种需要各处手动刷新的缓存。
 // 少了它，改备注 / 删除条目之后就会出现「列表还留着旧行」的幽灵状态。
 
+import type { EntryDto } from "./panel";
+
 /**
- * 参与匹配的条目字段（结构化子集）。
+ * 参与匹配的条目字段（`EntryDto` 的结构化子集）。
  *
- * 与 `panel.ts` 的 `EntryDto` 结构兼容，故 `EntryDto` 可以直接传进来；这里只声明
- * 用得到的字段，是为了本模块不必 import `panel.ts`（那会多出一条依赖边）。
+ * 从 `EntryDto` 派生而不是重抄一遍字段：`EntryDto` 增删字段时这里跟着走，不会
+ * 静默漂移。`import type` 编译期即被擦除，不产生运行时的模块依赖边。
  */
-export interface VaultSearchable {
-  id: number;
-  /** 备注。 */
-  note: string;
-  /** 自动分类。 */
-  auto_category: string;
-  /** 标签。 */
-  tags: string[];
-  /** 创建时间（秒级 Unix 时间戳）。 */
-  created_at: number;
-}
+export type VaultSearchable = Pick<
+  EntryDto,
+  "id" | "note" | "auto_category" | "tags" | "created_at"
+>;
 
 /**
  * 字段分隔符：NUL。
@@ -64,12 +59,20 @@ export function vaultHaystack(e: VaultSearchable): string {
     .toLowerCase();
 }
 
-/** 查询拆词：按空白拆分。全空白 → 空数组（= 不过滤）。 */
+/** 查询拆词并小写：按空白拆分。全空白 → 空数组（= 不过滤）。 */
 function queryTerms(query: string): string[] {
   return query
     .trim()
+    .toLowerCase()
     .split(/\s+/)
     .filter((t) => t.length > 0);
+}
+
+/** 这条条目是否命中已拆好的词（词间「与」，大小写不敏感子串）。 */
+function matchTerms(e: VaultSearchable, terms: string[]): boolean {
+  if (terms.length === 0) return true;
+  const hay = vaultHaystack(e);
+  return terms.every((t) => hay.includes(t));
 }
 
 /**
@@ -78,23 +81,22 @@ function queryTerms(query: string): string[] {
  * 空查询命中一切（没有查询就没有过滤）。
  */
 export function matchesVaultQuery(e: VaultSearchable, query: string): boolean {
-  const terms = queryTerms(query);
-  if (terms.length === 0) return true;
-  const hay = vaultHaystack(e);
-  return terms.every((t) => hay.includes(t.toLowerCase()));
+  return matchTerms(e, queryTerms(query));
 }
 
 /**
  * 过滤出命中项，顺序与输入一致。
  *
  * 空查询直接返回全量的一份拷贝（视图是独立的一份数组，不与全量共享引用）。
+ * 查询只在这里拆一次、小写一次 —— 否则每个条目都要把同一份查询重拆一遍。
  */
 export function filterVaultEntries<T extends VaultSearchable>(
   entries: T[],
   query: string,
 ): T[] {
-  if (queryTerms(query).length === 0) return entries.slice();
-  return entries.filter((e) => matchesVaultQuery(e, query));
+  const terms = queryTerms(query);
+  if (terms.length === 0) return entries.slice();
+  return entries.filter((e) => matchTerms(e, terms));
 }
 
 /** 一次状态转移的结果：视图 + 选中索引。 */
@@ -158,10 +160,7 @@ export function replaceVaultEntry<T extends VaultSearchable>(entries: T[], updat
   return entries.map((e) => (e.id === updated.id ? updated : e));
 }
 
-/** 加密区空态文案（无条目）。 */
 export const VAULT_EMPTY_TEXT = "加密区暂无条目";
-
-/** 加密区空态文案（有查询但没命中）。 */
 export const VAULT_NO_MATCH_TEXT = "没有匹配的条目";
 
 /**

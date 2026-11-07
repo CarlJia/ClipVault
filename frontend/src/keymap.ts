@@ -729,14 +729,17 @@ export function textFieldOwnsSpace(target: EventTarget | null): boolean {
  *
  * 三档都以「焦点在输入框」为前提 —— 焦点不在（Tab 走开等）时按键照常派发。
  */
-export function vaultKeyYieldsToInput(
+function vaultKeyYieldsToInput(
   ev: KeyboardEvent,
+  action: HotkeyAction | null,
   st: { focused: boolean; hasQuery: boolean },
 ): boolean {
   if (!st.focused) return false;
-  if (ev.key.length === 1 && !ev.metaKey && !ev.ctrlKey && !ev.altKey) return true;
+  // 修饰键走 `eventMods`：Windows 上 Ctrl ≡ meta 的等价规则只有那里维护，
+  // 各处自己判 `metaKey/ctrlKey` 迟早与匹配侧对不上。
+  const mods = eventMods(ev);
+  if (ev.key.length === 1 && !mods.meta && !mods.ctrl && !mods.alt) return true;
   if (!st.hasQuery) return false;
-  const action = matches(ev);
   return action === "paste" || action === "delete_entry";
 }
 
@@ -748,9 +751,7 @@ export function handleVaultKey(
     pasteVaultEntry: () => Promise<void>;
     editVaultNote: () => void;
     deleteVaultEntry: () => Promise<void>;
-    /** 焦点是否在加密区的搜索输入框（焦点门的前提）。 */
     searchFocused: () => boolean;
-    /** 搜索框当前是否有内容（焦点门的第二档前提）。 */
     hasQuery: () => boolean;
   },
 ): boolean {
@@ -767,19 +768,21 @@ export function handleVaultKey(
     return true;
   }
 
-  // 焦点门：用户正在搜索框里打字时，裸字符键与「有内容时的回贴 / 删除」让位给
-  // 原生输入。不 preventDefault —— 让输入框自己处理这个键。
-  if (vaultKeyYieldsToInput(ev, { focused: ctx.searchFocused(), hasQuery: ctx.hasQuery() })) {
-    return false;
-  }
-
   // 其余按键一律查 keymap —— 不再硬编码默认键。原先这里写死 `⌘⌫` / `⌘E`，用户在
   // 设置里把 `delete_entry` / `edit_note` 重绑到别的键后，模态里按新键毫无反应、
   // 按旧键反而生效（review finding：重绑不传导进模态）。
   //
   // keymap 还没加载完时 `matches` 返回 null：模态里除 Esc 外都不响应 —— 与主面板
   // 此时的行为一致（两侧一起失效，而不是一边可用一边不可用）。
-  switch (matches(ev)) {
+  const action = matches(ev);
+
+  // 焦点门：用户正在搜索框里打字时，裸字符键与「有内容时的回贴 / 删除」让位给
+  // 原生输入。不 preventDefault —— 让输入框自己处理这个键。
+  if (vaultKeyYieldsToInput(ev, action, { focused: ctx.searchFocused(), hasQuery: ctx.hasQuery() })) {
+    return false;
+  }
+
+  switch (action) {
     // `⌘⇧V`（`open_vault`）再按一次 = 收起模态，与唤出是同一个动作；
     // `close`（默认 Esc，可能被重绑）在模态里也是收起。
     case "open_vault":

@@ -87,9 +87,15 @@ describe("查询拆词与匹配", () => {
   });
 
   it("本地日期取本地时区（不是 UTC）", () => {
-    // 用本地正午构造：无论机器在哪个时区，本地日期都必须是那一天。
-    // UTC 实现会在这里差一天（UTC+8 的机器上会返回 10-15）。
-    expect(localDateString(localNoon(2026, 10, 16))).toBe("2026-10-16");
+    // 探针必须贴在本地午夜两侧：本地**正午**换算成 UTC 永远落在同一天（UTC-11 至
+    // UTC+12 都成立），拿它做断言的话把实现换成 toISOString() 也照样通过 ——
+    // 那就测不出这条用例声称的契约。00:30 与 23:30 在任一非零偏移的时区上，
+    // 至少有一个与 UTC 日期不同。UTC 机器上本地日期本就等于 UTC 日期，没有任何
+    // 断言能区分两种实现 —— 那条边界只能是「换个时区再跑」。
+    const midnightish = (h: number, m: number) =>
+      new Date(2026, 9, 16, h, m, 0).getTime() / 1000;
+    expect(localDateString(midnightish(0, 30))).toBe("2026-10-16");
+    expect(localDateString(midnightish(23, 30))).toBe("2026-10-16");
   });
 
   it("词间是「与」：两个词都命中才算命中", () => {

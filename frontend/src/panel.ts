@@ -6,6 +6,7 @@
 // ⌘1–9 换成 Windows 的 Ctrl+1–9。）
 
 import { keys } from "./platform";
+import { VAULT_EMPTY_TEXT } from "./vault-search";
 
 /** 单条剪贴板记录 DTO（对应 Rust `commands::EntryDto`）。 */
 export interface EntryDto {
@@ -315,9 +316,11 @@ export function renderVaultList(
   container: HTMLElement,
   entries: EntryDto[],
   selected = 0,
+  /** 空列表时的文案。加密区有搜索框，「没有匹配的条目」与「暂无条目」要分开说。 */
+  emptyText: string = VAULT_EMPTY_TEXT,
 ): void {
   if (entries.length === 0) {
-    container.innerHTML = `<div class="empty">加密区暂无条目</div>`;
+    container.innerHTML = `<div class="empty">${emptyText}</div>`;
     return;
   }
   container.innerHTML = entries
