@@ -827,6 +827,27 @@ body {
   max-width: 520px;
   max-height: 80%;
 }
+/* 加密区搜索框：有边框与底色的实体输入框（`#search` 是无边框的透明输入，
+   但那是面板顶栏的整条拖拽区充当标题栏，形式上没法照搬），字号小一号。 */
+.vault-search-row {
+  padding: 2px 0 8px;
+}
+#vault-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  outline: none;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 14px;
+  font-family: var(--font-ui);
+  padding: 6px 10px;
+  border-radius: 8px;
+  user-select: text;
+}
+#vault-search::placeholder {
+  color: var(--muted);
+}
 .vault-sub {
   font-size: 12px;
   color: var(--muted);

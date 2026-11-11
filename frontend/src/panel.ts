@@ -315,9 +315,15 @@ export function renderVaultList(
   container: HTMLElement,
   entries: EntryDto[],
   selected = 0,
+  /**
+   * 空列表时的文案。加密区有搜索框，「没有匹配的条目」与「暂无条目」要分开说，
+   * 所以由调用方决定，这里不给默认值 —— 默认值只会让 panel.ts 反向依赖
+   * `vault-search.ts`（通用渲染器不该知道加密区搜索的存在）。
+   */
+  emptyText: string,
 ): void {
   if (entries.length === 0) {
-    container.innerHTML = `<div class="empty">加密区暂无条目</div>`;
+    container.innerHTML = `<div class="empty">${emptyText}</div>`;
     return;
   }
   container.innerHTML = entries

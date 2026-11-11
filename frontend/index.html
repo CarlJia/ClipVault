@@ -106,6 +106,19 @@
               <span class="editor-title">加密区管理</span>
               <button id="vault-close" class="banner-btn">关闭</button>
             </div>
+            <!-- 加密区搜索框：按备注 / 标签 / 类别 / 日期过滤条目（纯前端，不解密正文）。
+                 放在标题栏正下方，与主面板「标题栏下就是搜索行」的层次一致。 -->
+            <div class="vault-search-row">
+              <input
+                id="vault-search"
+                type="text"
+                placeholder="搜索备注、标签、类别、日期…"
+                autocomplete="off"
+                autocorrect="off"
+                autocapitalize="off"
+                spellcheck="false"
+              />
+            </div>
             <div class="vault-sub" id="vault-sub"></div>
             <div class="vault-list" id="vault-list"></div>
             <div class="editor-foot">

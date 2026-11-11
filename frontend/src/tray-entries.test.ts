@@ -81,7 +81,9 @@ describe("面板唤出时的搜索框复位（#37）", () => {
     const squeezedBody = body.replace(/\s+/g, "");
     const cleared = squeezedBody.indexOf('searchEl.value="";');
     expect(cleared, "唤出重置必须清空 searchEl.value").toBeGreaterThan(-1);
-    expect(cleared, "清空应在聚焦之前").toBeLessThan(squeezedBody.indexOf("searchEl.focus()"));
+    expect(cleared, "清空应在聚焦之前").toBeLessThan(
+      squeezedBody.indexOf("focusActiveSurface()"),
+    );
     expect(cleared, "清空应在这次 load() 之前").toBeLessThan(
       squeezedBody.lastIndexOf("voidload();"),
     );
